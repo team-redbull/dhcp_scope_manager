@@ -494,13 +494,13 @@ sites/<site>/values.yaml
 
 ### What it validates
 
-| Layer         | Checks                                                                                  |
-| ------------- | --------------------------------------------------------------------------------------- |
-| Global        | `sites/` exists; `configValues.yaml` present, valid YAML, non-empty                    |
-| Site          | Directory has `values.yaml` (valid, non-empty) and `mces/`                             |
-| MCE           | Directory has `values.yaml` (valid, non-empty) and `hostedClusters/`                   |
-| Hosted cluster | `.yaml`/`.yml` extension; valid YAML; non-empty                                        |
-| DHCP content  | Required fields, IP validity, subnet consistency, range ordering, exclusion overlaps, gateway-in-range guard, failover mode fields, exclusion sort order |
+| Layer          | Checks                                                                                  |
+| -------------- | --------------------------------------------------------------------------------------- |
+| Global         | `sites/` exists; `configValues.yaml` present and valid YAML (may be empty)             |
+| Site           | Directory has `values.yaml` (valid YAML, **may be empty**) and `mces/`                 |
+| MCE            | Directory has `values.yaml` (valid YAML, **may be empty**) and `hostedClusters/`       |
+| Hosted cluster | `.yaml`/`.yml` extension; valid YAML; **must not be empty**                            |
+| DHCP content   | Required fields, IP validity, subnet consistency, range ordering, exclusion overlaps, gateway-in-range guard, failover mode fields, exclusion sort order |
 
 ### Local usage
 

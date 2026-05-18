@@ -174,7 +174,7 @@ def validate_global_config(sites_dir: Path) -> list[ValError]:
     if not config.exists():
         errors.append(ValError(config, "Missing required global config file: configValues.yaml"))
     else:
-        errors.extend(validate_yaml_file(config, allow_empty=False))
+        errors.extend(validate_yaml_file(config, allow_empty=True))
     return errors
 
 
@@ -184,7 +184,7 @@ def validate_site(site_path: Path) -> list[ValError]:
     if not values.exists():
         errors.append(ValError(values, "Missing required site values file: values.yaml"))
     else:
-        errors.extend(validate_yaml_file(values, allow_empty=False))
+        errors.extend(validate_yaml_file(values, allow_empty=True))
     mces = site_path / "mces"
     if not mces.exists():
         errors.append(ValError(mces, "Missing required directory: mces/"))
@@ -199,7 +199,7 @@ def validate_mce(mce_path: Path) -> list[ValError]:
     if not values.exists():
         errors.append(ValError(values, "Missing required MCE values file: values.yaml"))
     else:
-        errors.extend(validate_yaml_file(values, allow_empty=False))
+        errors.extend(validate_yaml_file(values, allow_empty=True))
     hc_dir = mce_path / "hostedClusters"
     if not hc_dir.exists():
         errors.append(ValError(hc_dir, "Missing required directory: hostedClusters/"))

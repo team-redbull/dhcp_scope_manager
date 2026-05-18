@@ -123,12 +123,12 @@ class TestGlobalConfig:
         errors = vdv.validate_global_config(sites_dir)
         assert any("configValues.yaml" in e.message for e in errors)
 
-    def test_empty_config_values_fails(self, tmp_path):
+    def test_empty_config_values_is_allowed(self, tmp_path):
         sites_dir = tmp_path / "sites"
         sites_dir.mkdir()
         (sites_dir / "configValues.yaml").write_text("")
         errors = vdv.validate_global_config(sites_dir)
-        assert any("empty" in e.message.lower() for e in errors)
+        assert errors == []
 
     def test_invalid_yaml_config_values(self, tmp_path):
         sites_dir = tmp_path / "sites"
@@ -164,11 +164,11 @@ class TestValidateSite:
         errors = vdv.validate_site(site)
         assert any("mces" in e.message for e in errors)
 
-    def test_empty_values_yaml_fails(self, tmp_path):
+    def test_empty_values_yaml_is_allowed(self, tmp_path):
         site = self._make_site(tmp_path, with_values=False)
         (site / "values.yaml").write_text("")
         errors = vdv.validate_site(site)
-        assert any("empty" in e.message.lower() for e in errors)
+        assert errors == []
 
     def test_invalid_values_yaml(self, tmp_path):
         site = self._make_site(tmp_path, with_values=False)
@@ -202,6 +202,12 @@ class TestValidateMCE:
         mce = self._make_mce(tmp_path, with_hc=False)
         errors = vdv.validate_mce(mce)
         assert any("hostedClusters" in e.message for e in errors)
+
+    def test_empty_values_yaml_is_allowed(self, tmp_path):
+        mce = self._make_mce(tmp_path, with_values=False)
+        (mce / "values.yaml").write_text("")
+        errors = vdv.validate_mce(mce)
+        assert errors == []
 
     def test_invalid_values_yaml(self, tmp_path):
         mce = self._make_mce(tmp_path, with_values=False)
