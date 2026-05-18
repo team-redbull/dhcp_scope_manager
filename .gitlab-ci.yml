@@ -1,0 +1,43 @@
+stages:
+  - validate
+  - test
+
+# ─── DHCP Values Structure & Content Validation ───────────────────────────────
+#
+# Validates:
+#   - sites/ folder structure (sites, MCEs, hostedClusters)
+#   - Every values.yaml and hosted-cluster YAML file is valid YAML and non-empty
+#   - DHCP business rules (IP ranges, subnet consistency, failover, DNS)
+#
+# Runs on MR when any sites/**/*.yaml file changes.
+validate_dhcp_values:
+  stage: validate
+  image: python:3.12-slim
+  before_script:
+    - pip install --quiet -r scripts/requirements.txt
+  script:
+    - python3 scripts/validate_dhcp_values.py --sites-dir sites
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - sites/**/*.yaml
+
+# ─── Unit Tests ───────────────────────────────────────────────────────────────
+#
+# Runs the full pytest suite (existing tests + new validate_dhcp_values tests).
+# Triggers on MR when Python source, scripts, or tests change.
+unit_tests:
+  stage: test
+  image: python:3.12-slim
+  before_script:
+    - pip install --quiet -r requirements.txt -r scripts/requirements.txt
+  script:
+    - pytest tests/ -v --tb=short
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - app/**/*.py
+        - scripts/**/*.py
+        - tests/**/*.py
+        - requirements.txt
+        - scripts/requirements.txt

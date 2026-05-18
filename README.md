@@ -66,28 +66,28 @@ helm/
     _dhcp-helpers.tpl        Canonical payload rendering for provider-http
 
 scripts/
-  validate_values.py         Self-contained CI validator — discovers all clusters, merges inheritance
-                             chains, and runs full DHCP + API + Crossplane + Kubernetes validation
+  validate_dhcp_values.py    CI validator — walks sites/ structure, validates folder layout,
+                             YAML content, and DHCP business rules on the merged inheritance chain
   requirements.txt           Minimal CI dependencies (pydantic, PyYAML)
 
 tests/
   conftest.py
-  test_async_runtime.py      Async subprocess execution, locks, timeout, and concurrency basics
-  test_concurrency_stress.py High-concurrency observe/write workload behavior
-  test_decorators_and_locks.py  log_call and ScopeLockManager unit tests
-  test_endpoints.py          HTTP endpoint contracts and status codes
-  test_models.py             Pydantic field ordering and serialization
-  test_validation.py         IP validation, subnet consistency, failover mode enforcement
-  test_parsers.py            Single-process GET parsing, normalization, and injection safety
-  test_ps_executor_unit.py   Focused ps_executor command construction and sanitization tests
-  test_diff.py               Diff-based update logic
-  test_dhcp_service.py       Runtime environment guard behavior
-  test_parity.py             GET/PUT parity — the main guard against Crossplane reconciliation loops
-  test_edge_cases.py         Edge cases and boundary conditions
-  test_helm.py               Helm-rendered Crossplane Request contract
-  test_security.py           PowerShell escaping and response sanitization
-  test_service_unit.py       Focused scope_service create/get/delete/list behavior
-  test_validate_values.py    CI validator — validators, discovery, YAML merge, JSON output
+  test_async_runtime.py          Async subprocess execution, locks, timeout, and concurrency basics
+  test_concurrency_stress.py     High-concurrency observe/write workload behavior
+  test_decorators_and_locks.py   log_call and ScopeLockManager unit tests
+  test_endpoints.py              HTTP endpoint contracts and status codes
+  test_models.py                 Pydantic field ordering and serialization
+  test_validation.py             IP validation, subnet consistency, failover mode enforcement
+  test_parsers.py                Single-process GET parsing, normalization, and injection safety
+  test_ps_executor_unit.py       Focused ps_executor command construction and sanitization tests
+  test_diff.py                   Diff-based update logic
+  test_dhcp_service.py           Runtime environment guard behavior
+  test_parity.py                 GET/PUT parity — the main guard against Crossplane reconciliation loops
+  test_edge_cases.py             Edge cases and boundary conditions
+  test_helm.py                   Helm-rendered Crossplane Request contract
+  test_security.py               PowerShell escaping and response sanitization
+  test_service_unit.py           Focused scope_service create/get/delete/list behavior
+  test_validate_dhcp_values.py   CI validator — structure, YAML checks, filtering, deep merge
 ```
 
 ## Runtime Requirements
@@ -455,100 +455,98 @@ Rules that must hold to prevent infinite reconciliation loops:
 **Removing failover with layered values files:** use `failover: null` — not `failover: {}`.
 Helm deep-merges `{}` with the parent map, leaving failover intact. Only `null` removes it.
 
-## CI Validation
+## DHCP Values Validation
 
-`scripts/validate_values.py` is a self-contained validator that mirrors the FastAPI/Pydantic
-validation logic. It runs in CI before any values file reaches Crossplane.
+`scripts/validate_dhcp_values.py` is a self-contained validator. It checks the `sites/` folder
+structure and the DHCP business rules on every hosted-cluster values file before anything reaches
+Crossplane.
+
+### Required folder structure
+
+```text
+sites/
+├── configValues.yaml              ← global config (required, must not be empty)
+├── telAviv/
+│   ├── values.yaml                ← site-level defaults
+│   └── mces/
+│       ├── prep-mce-tlv-a/
+│       │   ├── values.yaml        ← MCE-level overrides
+│       │   └── hostedClusters/
+│       │       ├── prep-tlv-gpu.yaml
+│       │       └── prod-tlv-generic.yaml
+│       └── prod-mce-tlv-b/
+│           ├── values.yaml
+│           └── hostedClusters/
+│               └── ...
+├── newYork/
+│   ├── values.yaml
+│   └── mces/
+│       └── ...
+```
+
+Inheritance chain per cluster (last file wins — mirrors Helm `-f` merge semantics):
+
+```
+sites/<site>/values.yaml
+  → sites/<site>/mces/<mce>/values.yaml
+    → sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml
+```
 
 ### What it validates
 
-| Area               | Checks                                                                            |
-| ------------------ | --------------------------------------------------------------------------------- |
-| Required fields    | All mandatory `dhcp_values` and `apiServer` fields present                        |
-| DHCP scope (Pydantic) | IP address validity, subnet consistency, range ordering, exclusion overlaps, gateway-in-range guard, failover mode enforcement |
-| Exclusion order    | Warns if exclusions are not in ascending IP order (would cause Crossplane PUT loop) |
-| DNS servers        | Warns on duplicate entries                                                        |
-| DNS domain         | No spaces, max 256 chars                                                          |
-| API server         | URL scheme, hostname, trailing slash (warns — double slash causes 404)            |
-| Secret ref names   | `tokenSecretRef` fields are valid Kubernetes DNS labels                           |
-| Crossplane names   | `namespace` and `providerConfigName` are valid Kubernetes DNS labels              |
-| CR name length     | Ensures `dhcp-scope-{network}` is within the 63-char Kubernetes name limit        |
-| Parity risks       | Warns on `failover: {}`, missing `description`, missing `gateway`                 |
+| Layer         | Checks                                                                                  |
+| ------------- | --------------------------------------------------------------------------------------- |
+| Global        | `sites/` exists; `configValues.yaml` present, valid YAML, non-empty                    |
+| Site          | Directory has `values.yaml` (valid, non-empty) and `mces/`                             |
+| MCE           | Directory has `values.yaml` (valid, non-empty) and `hostedClusters/`                   |
+| Hosted cluster | `.yaml`/`.yml` extension; valid YAML; non-empty                                        |
+| DHCP content  | Required fields, IP validity, subnet consistency, range ordering, exclusion overlaps, gateway-in-range guard, failover mode fields, exclusion sort order |
 
-### Usage
+### Local usage
 
 ```bash
 pip install -r scripts/requirements.txt
 
-# Main CI mode — discover and validate all hosted clusters under sites/
-python scripts/validate_values.py --repo-root . --warnings-as-errors
+# Validate everything under sites/
+python3 scripts/validate_dhcp_values.py
 
-# Manual layered validation (site → MCE → hosted-cluster)
-python scripts/validate_values.py \
-  --site-values           sites/site-a/values.yaml \
-  --mce-values            sites/site-a/mce-1/values.yaml \
-  --hosted-cluster-values sites/site-a/mce-1/hc-workers.yaml
+# Explicit sites directory
+python3 scripts/validate_dhcp_values.py --sites-dir sites
 
-# Single-file validation (no inheritance)
-python scripts/validate_values.py --values helm/values.yaml
+# Filter to one site, MCE, or cluster
+python3 scripts/validate_dhcp_values.py --site telAviv
+python3 scripts/validate_dhcp_values.py --mce prep-mce-tlv-a
+python3 scripts/validate_dhcp_values.py --cluster prep-tlv-gpu
+python3 scripts/validate_dhcp_values.py --cluster prep-tlv-gpu.yaml  # full filename also works
 
-# JSON output (useful for downstream tooling)
-python scripts/validate_values.py --repo-root . --output json
+# Extra flags
+python3 scripts/validate_dhcp_values.py --verbose
+python3 scripts/validate_dhcp_values.py --fail-fast
+python3 scripts/validate_dhcp_values.py --format json
 ```
 
-Exit codes: `0` = pass, `1` = errors (or warnings with `--warnings-as-errors`), `2` = script error.
-
-### Directory layout
-
-Each hosted cluster is a single YAML file inside its MCE folder.
-Site- and MCE-level `values.yaml` files provide defaults that each HC file can override.
-
-```text
-sites/
-  {site}/
-    values.yaml          ← site-level defaults (DNS, crossplane providerConfig, apiServer URL)
-    {mce}/
-      values.yaml        ← MCE-level overrides (failover relationship, partner server)
-      {hc-name}.yaml     ← HC-specific values (network, scopeName, ranges, exclusions)
-      {hc-name}.yaml
-    {mce}/
-      values.yaml
-      {hc-name}.yaml
-  {site}/
-    values.yaml
-    ...
-```
-
-Helm merge order (later file wins):
-
-```bash
-helm template dhcp-scope-{hc} ./helm \
-  -f sites/{site}/values.yaml \
-  -f sites/{site}/{mce}/values.yaml \
-  -f sites/{site}/{mce}/{hc}.yaml
-```
-
-The CI validator discovers all HC files automatically and applies the same merge order.
+Exit codes: `0` = pass, `1` = validation errors, `2` = script/IO error.
 
 ### GitLab CI
 
-The `.gitlab-ci.yml` at the repo root includes the validation job:
+The `.gitlab-ci.yml` at the repo root runs the validation job on every MR that touches a YAML
+file inside `sites/`:
 
 ```yaml
-validate-dhcp-values:
+validate_dhcp_values:
   stage: validate
   image: python:3.12-slim
   before_script:
-    - pip install --quiet -r scripts/requirements.txt
+    - pip install -r scripts/requirements.txt
   script:
-    - python scripts/validate_values.py --repo-root . --warnings-as-errors
+    - python3 scripts/validate_dhcp_values.py --sites-dir sites
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
         - sites/**/*.yaml
-        - helm/**/*.yaml
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 ```
+
+Dependencies are installed with `pip install -r scripts/requirements.txt` (pydantic + PyYAML).
 
 ## Security and Safety
 
