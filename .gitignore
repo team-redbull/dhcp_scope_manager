@@ -38,8 +38,6 @@ dist/
 
 .claude-flow/
 
-CLAUDE.md
-
 .claude/
 
 graphify-out/
