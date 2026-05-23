@@ -23,36 +23,10 @@ import asyncio
 import time
 
 from app.config import settings
+from app.errors import DhcpEnvReason, DhcpEnvironmentError
 from app.utils.decorators import log_call
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Error taxonomy
-# ---------------------------------------------------------------------------
-
-class DhcpEnvReason:
-    """Machine-readable reason codes returned in API error responses."""
-    UNSUPPORTED_OS = "unsupported_os"
-    WSL_DETECTED = "wsl_detected"
-    POWERSHELL_NOT_FOUND = "powershell_not_found"
-    POWERSHELL_EXEC_FAILED = "powershell_exec_failed"
-    DHCP_CMDLETS_UNAVAILABLE = "dhcp_cmdlets_unavailable"
-
-
-class DhcpEnvironmentError(Exception):
-    """Runtime environment cannot support DHCP automation via PowerShell.
-
-    Attributes:
-        reason: Machine-readable code from DhcpEnvReason.
-        detail: Human-readable explanation suitable for API responses.
-    """
-
-    def __init__(self, reason: str, detail: str) -> None:
-        self.reason = reason
-        self.detail = detail
-        super().__init__(detail)
 
 
 # ---------------------------------------------------------------------------

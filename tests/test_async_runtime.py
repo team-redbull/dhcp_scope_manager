@@ -5,11 +5,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.config import settings
-from app.services.ps_executor import (
-    PowerShellExecutionError,
-    PowerShellTimeoutError,
-    run_ps,
-)
+from app.errors import PowerShellExecutionError, PowerShellTimeoutError
+from app.services.ps_executor import run_ps
 from app.utils.decorators import log_call
 from app.utils.locks import ScopeLockManager
 

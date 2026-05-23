@@ -4,7 +4,8 @@ from typing import Optional
 
 from app.errors import ScopeNotFoundError
 from app.models import DhcpFailover, DhcpScopeListError, DhcpScopeListResponse, DhcpScopePayload
-from app.services.ps_executor import PowerShellError, is_already_exists_error, is_not_found_error, run_ps
+from app.errors import PowerShellError
+from app.services.ps_executor import is_already_exists_error, is_not_found_error, run_ps
 from app.services.ps_parsers import (
     assemble_scope_state,
     build_get_all_scopes_script,

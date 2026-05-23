@@ -1,7 +1,7 @@
 from unittest.mock import AsyncMock, patch
 import pytest
 from app.errors import DhcpConflictError, InvalidScopeIdError
-from app.services.ps_executor import PowerShellError
+from app.errors import PowerShellError
 from app.services.ps_parsers import (
     build_get_all_scopes_script,
     build_get_scope_state_script,

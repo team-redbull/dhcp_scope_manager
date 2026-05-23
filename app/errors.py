@@ -1,8 +1,99 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import status
+
+_WIN_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s,;]+")
+_MAX_STDERR_PREVIEW_LEN = 500
+
+
+def sanitize_powershell_text(value: str, *, max_len: int = _MAX_STDERR_PREVIEW_LEN) -> str:
+    """Remove high-risk infrastructure details from log/client text."""
+    redacted = _WIN_PATH_RE.sub("<path>", value)
+    return redacted[:max_len]
+
+
+class DhcpEnvReason:
+    """Machine-readable reason codes returned in API error responses."""
+    UNSUPPORTED_OS = "unsupported_os"
+    WSL_DETECTED = "wsl_detected"
+    POWERSHELL_NOT_FOUND = "powershell_not_found"
+    POWERSHELL_EXEC_FAILED = "powershell_exec_failed"
+    DHCP_CMDLETS_UNAVAILABLE = "dhcp_cmdlets_unavailable"
+
+
+class DhcpEnvironmentError(Exception):
+    """Runtime environment cannot support DHCP automation via PowerShell.
+
+    Attributes:
+        reason: Machine-readable code from DhcpEnvReason.
+        detail: Human-readable explanation suitable for API responses.
+    """
+
+    def __init__(self, reason: str, detail: str) -> None:
+        self.reason = reason
+        self.detail = detail
+        super().__init__(detail)
+
+
+class PowerShellError(Exception):
+    def __init__(
+        self,
+        command: str,
+        stderr: str,
+        returncode: int,
+        *,
+        operation: str | None = None,
+        scope_id: str | None = None,
+    ):
+        self.command = command
+        self.stderr = stderr
+        self.returncode = returncode
+        self.operation = operation
+        self.scope_id = scope_id
+        super().__init__(self.safe_message)
+
+    @property
+    def safe_stderr_preview(self) -> str:
+        return sanitize_powershell_text(self.stderr)
+
+    @property
+    def safe_message(self) -> str:
+        operation = self.operation or "unknown"
+        return (
+            f"PowerShell command failed "
+            f"(operation={operation}, rc={self.returncode}): {self.safe_stderr_preview}"
+        )
+
+    def __str__(self) -> str:
+        return self.safe_message
+
+
+class PowerShellExecutionError(PowerShellError):
+    """PowerShell exited non-zero or produced unusable output."""
+
+
+class PowerShellTimeoutError(PowerShellError):
+    """PowerShell process exceeded the configured timeout."""
+
+    def __init__(
+        self,
+        command: str,
+        timeout_seconds: int,
+        *,
+        operation: str | None = None,
+        scope_id: str | None = None,
+    ):
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            command,
+            f"PowerShell command timed out after {timeout_seconds} seconds",
+            -1,
+            operation=operation,
+            scope_id=scope_id,
+        )
 
 
 class ErrorCode:

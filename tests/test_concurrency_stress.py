@@ -25,10 +25,7 @@ import pytest
 
 from app.errors import ScopeNotFoundError
 from app.models import DhcpScopePayload
-from app.services.ps_executor import (
-    PowerShellExecutionError,
-    PowerShellTimeoutError,
-)
+from app.errors import PowerShellExecutionError, PowerShellTimeoutError
 from app.utils.locks import ScopeLockManager
 from httpx import ASGITransport, AsyncClient
 from app.main import app

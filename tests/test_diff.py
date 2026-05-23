@@ -2,7 +2,7 @@
 from unittest.mock import patch
 import pytest
 from app.models import DhcpExclusion, DhcpFailover, DhcpScopePayload
-from app.services.ps_executor import PowerShellError
+from app.errors import PowerShellError
 
 pytestmark = pytest.mark.asyncio
 
@@ -305,7 +305,7 @@ async def test_failover_partner_server_change_triggers_recreate():
 async def test_scope_exists_reraises_on_permission_error():
     """scope_exists must not return False on permission errors — it must propagate."""
     from app.services.scope_service import scope_exists
-    from app.services.ps_executor import PowerShellError
+    from app.errors import PowerShellError
 
     with patch(
         "app.services.scope_service.run_ps",
@@ -318,7 +318,7 @@ async def test_scope_exists_reraises_on_permission_error():
 async def test_scope_exists_returns_false_on_not_found():
     """scope_exists returns False for legitimate not-found errors."""
     from app.services.scope_service import scope_exists
-    from app.services.ps_executor import PowerShellError
+    from app.errors import PowerShellError
 
     with patch(
         "app.services.scope_service.run_ps",

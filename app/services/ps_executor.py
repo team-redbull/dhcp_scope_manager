@@ -1,84 +1,13 @@
 import json
 import logging
-import re
 import asyncio
 import time
 
 from app.config import settings
+from app.errors import PowerShellError, PowerShellExecutionError, PowerShellTimeoutError, sanitize_powershell_text
 from app.services import dhcp_service
 
 logger = logging.getLogger(__name__)
-
-_WIN_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s,;]+")
-_MAX_STDERR_PREVIEW_LEN = 500
-
-
-def sanitize_powershell_text(value: str, *, max_len: int = _MAX_STDERR_PREVIEW_LEN) -> str:
-    """Remove high-risk infrastructure details from log/client text."""
-    redacted = _WIN_PATH_RE.sub("<path>", value)
-    return redacted[:max_len]
-
-
-def _sanitize_stderr_for_log(stderr: str) -> str:
-    return sanitize_powershell_text(stderr)
-
-
-class PowerShellError(Exception):
-    def __init__(
-        self,
-        command: str,
-        stderr: str,
-        returncode: int,
-        *,
-        operation: str | None = None,
-        scope_id: str | None = None,
-    ):
-        self.command = command
-        self.stderr = stderr
-        self.returncode = returncode
-        self.operation = operation
-        self.scope_id = scope_id
-        super().__init__(self.safe_message)
-
-    @property
-    def safe_stderr_preview(self) -> str:
-        return sanitize_powershell_text(self.stderr)
-
-    @property
-    def safe_message(self) -> str:
-        operation = self.operation or "unknown"
-        return (
-            f"PowerShell command failed "
-            f"(operation={operation}, rc={self.returncode}): {self.safe_stderr_preview}"
-        )
-
-    def __str__(self) -> str:
-        return self.safe_message
-
-
-class PowerShellExecutionError(PowerShellError):
-    """PowerShell exited non-zero or produced unusable output."""
-
-
-class PowerShellTimeoutError(PowerShellError):
-    """PowerShell process exceeded the configured timeout."""
-
-    def __init__(
-        self,
-        command: str,
-        timeout_seconds: int,
-        *,
-        operation: str | None = None,
-        scope_id: str | None = None,
-    ):
-        self.timeout_seconds = timeout_seconds
-        super().__init__(
-            command,
-            f"PowerShell command timed out after {timeout_seconds} seconds",
-            -1,
-            operation=operation,
-            scope_id=scope_id,
-        )
 
 
 _semaphore: asyncio.Semaphore | None = None
@@ -198,7 +127,7 @@ async def run_ps(
                 "duration_ms": duration_ms,
                 "status": "failed",
                 "returncode": process.returncode,
-                "stderr_preview": _sanitize_stderr_for_log(stderr.strip()),
+                "stderr_preview": sanitize_powershell_text(stderr.strip()),
             },
         )
         raise PowerShellExecutionError(

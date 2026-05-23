@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from app.errors import ScopeNotFoundError
 from app.models import DhcpExclusion, DhcpFailover, DhcpScopePayload
-from app.services.ps_executor import PowerShellError
+from app.errors import PowerShellError
 
 pytestmark = pytest.mark.asyncio
 

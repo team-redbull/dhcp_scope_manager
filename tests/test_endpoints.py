@@ -5,7 +5,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from app.main import app
 from app.models import DhcpExclusion, DhcpScopePayload
-from app.services.ps_executor import PowerShellError
+from app.errors import PowerShellError
 
 pytestmark = pytest.mark.asyncio
 

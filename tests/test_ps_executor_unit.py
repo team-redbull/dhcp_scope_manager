@@ -10,11 +10,8 @@ Covers behavior not already tested in test_async_runtime.py:
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from app.services.ps_executor import (
-    PowerShellExecutionError,
-    is_not_found_error,
-    run_ps,
-)
+from app.errors import PowerShellExecutionError
+from app.services.ps_executor import is_not_found_error, run_ps
 
 
 class _FakeProcess:

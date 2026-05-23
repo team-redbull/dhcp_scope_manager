@@ -12,9 +12,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+from app.errors import DhcpEnvironmentError, DhcpEnvReason
 from app.services.dhcp_service import (
-    DhcpEnvironmentError,
-    DhcpEnvReason,
     _check_dhcp_cmdlets,
     _check_os,
     _check_powershell_binary,

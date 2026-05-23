@@ -18,7 +18,7 @@ from app.errors import InvalidScopeIdError
 from app.exception_handlers import _sanitize_text
 from app.services.ps_executor import is_already_exists_error as _is_already_exists_error
 from app.logging_config import _SafeJsonFormatter
-from app.services.ps_executor import PowerShellError, PowerShellTimeoutError
+from app.errors import PowerShellError, PowerShellTimeoutError
 from app.services.ps_parsers import build_get_scope_state_script, ps_single_quote
 
 
