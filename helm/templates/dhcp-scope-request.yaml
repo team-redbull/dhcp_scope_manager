@@ -1,4 +1,4 @@
-{{- if .Values.dhcp_values }}
+{{- if and .Values.dhcp_values .Values.dhcp_values.scopeName }}
 apiVersion: http.crossplane.io/v1alpha2
 kind: Request
 metadata:

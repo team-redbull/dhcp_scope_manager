@@ -423,6 +423,156 @@ class TestFullTreeIntegration:
             assert vdv.validate_site(sites_dir / site_name) == []
 
 
+# ─── DHCP opt-in behavior ────────────────────────────────────────────────────
+#
+# A cluster opts into DHCP management by defining dhcp_values in its own file.
+# Clusters without dhcp_values are silently skipped even if a parent defines it.
+
+def _no_dhcp_cluster_yaml() -> str:
+    """A cluster YAML with content but no dhcp_values — not yet DHCP-managed."""
+    return (
+        "someOtherConfig:\n"
+        "  key: value\n"
+    )
+
+
+class TestDhcpOptIn:
+    def _run_validation(self, sites_dir: Path, tmp_path: Path) -> tuple[int, list]:
+        """Run validation and return (exit_code, cluster_results)."""
+        import argparse
+        args = argparse.Namespace(
+            sites_dir=str(sites_dir),
+            repo_root=str(tmp_path),
+            site=None, mce=None, cluster=None,
+            verbose=False, fail_fast=False, no_color=True,
+            strict=False, format="text",
+        )
+        import io
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            rc = vdv.run_validation(args)
+        return rc
+
+    def test_cluster_without_dhcp_values_passes(self, tmp_path):
+        """Cluster with no dhcp_values key is silently skipped — no errors."""
+        sites_dir = _build_tree(tmp_path, {
+            "telAviv": {
+                "_values": "site: true\n",
+                "mces": {
+                    "mce-a": {
+                        "_values": "mce: true\n",
+                        "hostedClusters": {
+                            "no-dhcp-cluster.yaml": _no_dhcp_cluster_yaml(),
+                        },
+                    },
+                },
+            },
+        })
+        rc = self._run_validation(sites_dir, tmp_path)
+        assert rc == 0
+
+    def test_cluster_with_dhcp_values_is_validated(self, tmp_path):
+        """Cluster that defines dhcp_values IS validated normally."""
+        sites_dir = _build_tree(tmp_path, {
+            "telAviv": {
+                "_values": "site: true\n",
+                "mces": {
+                    "mce-a": {
+                        "_values": "mce: true\n",
+                        "hostedClusters": {
+                            "dhcp-cluster.yaml": _minimal_cluster_yaml(),
+                        },
+                    },
+                },
+            },
+        })
+        rc = self._run_validation(sites_dir, tmp_path)
+        assert rc == 0
+
+    def test_cluster_without_dhcp_values_skipped_even_if_parent_has_it(self, tmp_path):
+        """If a parent values.yaml defines dhcp_values defaults but the cluster
+        file does not define dhcp_values, the cluster is skipped — not failed."""
+        parent_dhcp = (
+            "dhcp_values:\n"
+            "  network: 10.20.30.0\n"
+            "  subnetMask: 255.255.255.0\n"
+        )
+        sites_dir = _build_tree(tmp_path, {
+            "telAviv": {
+                "_values": parent_dhcp,
+                "mces": {
+                    "mce-a": {
+                        "_values": "mce: true\n",
+                        "hostedClusters": {
+                            "not-ready.yaml": _no_dhcp_cluster_yaml(),
+                        },
+                    },
+                },
+            },
+        })
+        rc = self._run_validation(sites_dir, tmp_path)
+        assert rc == 0
+
+    def test_mixed_cluster_only_dhcp_one_validated(self, tmp_path):
+        """One cluster with dhcp_values passes validation, one without is skipped."""
+        sites_dir = _build_tree(tmp_path, {
+            "telAviv": {
+                "_values": "site: true\n",
+                "mces": {
+                    "mce-a": {
+                        "_values": "mce: true\n",
+                        "hostedClusters": {
+                            "dhcp-ready.yaml": _minimal_cluster_yaml(),
+                            "not-ready.yaml": _no_dhcp_cluster_yaml(),
+                        },
+                    },
+                },
+            },
+        })
+        rc = self._run_validation(sites_dir, tmp_path)
+        assert rc == 0
+
+    def test_cluster_with_invalid_dhcp_values_fails(self, tmp_path):
+        """Cluster that defines dhcp_values with invalid content is caught."""
+        bad_dhcp = (
+            "dhcp_values:\n"
+            "  scopeName: bad-cluster\n"
+            "  network: not-an-ip\n"
+        )
+        sites_dir = _build_tree(tmp_path, {
+            "telAviv": {
+                "_values": "site: true\n",
+                "mces": {
+                    "mce-a": {
+                        "_values": "mce: true\n",
+                        "hostedClusters": {
+                            "bad-cluster.yaml": bad_dhcp,
+                        },
+                    },
+                },
+            },
+        })
+        rc = self._run_validation(sites_dir, tmp_path)
+        assert rc == 1
+
+    def test_validate_dhcp_content_skips_when_no_cluster_key(self, tmp_path):
+        """Unit test: _validate_dhcp_content returns [] when cluster file has no dhcp_values."""
+        cluster_file = tmp_path / "cluster.yaml"
+        cluster_file.write_text("other: value\n")
+        merged = {"dhcp_values": {"network": "10.0.0.0"}}  # parent has it — irrelevant
+        result = vdv._validate_dhcp_content(cluster_file, merged)
+        assert result == []
+
+    def test_validate_dhcp_content_runs_when_cluster_has_key(self, tmp_path):
+        """Unit test: _validate_dhcp_content returns errors when cluster defines dhcp_values
+        but the merged content is invalid."""
+        cluster_file = tmp_path / "cluster.yaml"
+        cluster_file.write_text("dhcp_values:\n  network: not-an-ip\n")
+        merged = {"dhcp_values": {"network": "not-an-ip"}}
+        result = vdv._validate_dhcp_content(cluster_file, merged)
+        assert len(result) > 0
+
+
 # ─── YAML helpers ────────────────────────────────────────────────────────────
 
 class TestYamlHelpers:

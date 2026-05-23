@@ -66,9 +66,11 @@ helm/
     _dhcp-helpers.tpl        Canonical payload rendering for provider-http
 
 scripts/
-  validate_dhcp_values.py    CI validator — walks sites/ structure, validates folder layout,
-                             YAML content, and DHCP business rules on the merged inheritance chain
-  requirements.txt           Minimal CI dependencies (pydantic, PyYAML)
+  validate_changed_clusters.py  CI entry point — detects changed files via git diff, resolves
+                                affected clusters (inheritance-aware), validates only those clusters
+  validate_dhcp_values.py       Full validator — walks sites/ structure, validates folder layout,
+                                YAML content, and DHCP business rules on the merged inheritance chain
+  requirements.txt              Minimal CI dependencies (pydantic, PyYAML)
 
 tests/
   conftest.py
@@ -87,7 +89,8 @@ tests/
   test_helm.py                   Helm-rendered Crossplane Request contract
   test_security.py               PowerShell escaping and response sanitization
   test_service_unit.py           Focused scope_service create/get/delete/list behavior
-  test_validate_dhcp_values.py   CI validator — structure, YAML checks, filtering, deep merge
+  test_validate_dhcp_values.py        CI validator — structure, YAML checks, filtering, deep merge
+  test_validate_changed_clusters.py   Changed-file detection, inheritance resolution, git integration
 ```
 
 ## Runtime Requirements
@@ -222,11 +225,12 @@ Returns all scopes sorted by network address (ascending). Uses **one PowerShell 
 
 ```json
 {
-  "scopes": [
-    { "scopeName": "...", "network": "10.20.30.0", "..." : "..." }
-  ],
+  "scopes": [{ "scopeName": "...", "network": "10.20.30.0", "...": "..." }],
   "errors": [
-    { "scopeId": "10.20.31.0", "error": "No DNS servers configured for this scope" }
+    {
+      "scopeId": "10.20.31.0",
+      "error": "No DNS servers configured for this scope"
+    }
   ]
 }
 ```
@@ -427,18 +431,18 @@ helm template dhcp-scope-hc-workers ./helm \
 
 Quick reference — see the per-endpoint tables above for the exact set each route can return.
 
-| Code  | Meaning               | Error code examples                                                                    |
-| ----- | --------------------- | -------------------------------------------------------------------------------------- |
+| Code  | Meaning               | Error code examples                                                                  |
+| ----- | --------------------- | ------------------------------------------------------------------------------------ |
 | `200` | OK                    | Success response: `DhcpScopePayload`, `DhcpScopeListResponse`, or `{"status": "ok"}` |
-| `204` | No Content            | Success response with empty body — DELETE only                                         |
-| `400` | Bad Request           | `INVALID_SCOPE_ID`, `SCOPE_ID_MISMATCH`                                                |
-| `401` | Unauthorized          | `UNAUTHORIZED`                                                                         |
-| `404` | Not Found             | `SCOPE_NOT_FOUND` — GET and PUT only                                                   |
-| `409` | Conflict              | `DHCP_CONFLICT`                                                                        |
-| `422` | Unprocessable Entity  | `VALIDATION_ERROR`                                                                     |
-| `500` | Internal Server Error | `POWERSHELL_COMMAND_FAILED`, `INTERNAL_ERROR`                                          |
-| `503` | Service Unavailable   | `DHCP_ENVIRONMENT_UNAVAILABLE`                                                         |
-| `504` | Gateway Timeout       | `POWERSHELL_TIMEOUT`                                                                   |
+| `204` | No Content            | Success response with empty body — DELETE only                                       |
+| `400` | Bad Request           | `INVALID_SCOPE_ID`, `SCOPE_ID_MISMATCH`                                              |
+| `401` | Unauthorized          | `UNAUTHORIZED`                                                                       |
+| `404` | Not Found             | `SCOPE_NOT_FOUND` — GET and PUT only                                                 |
+| `409` | Conflict              | `DHCP_CONFLICT`                                                                      |
+| `422` | Unprocessable Entity  | `VALIDATION_ERROR`                                                                   |
+| `500` | Internal Server Error | `POWERSHELL_COMMAND_FAILED`, `INTERNAL_ERROR`                                        |
+| `503` | Service Unavailable   | `DHCP_ENVIRONMENT_UNAVAILABLE`                                                       |
+| `504` | Gateway Timeout       | `POWERSHELL_TIMEOUT`                                                                 |
 
 ## Reconciliation Contract
 
@@ -494,12 +498,12 @@ sites/<site>/values.yaml
 
 ### What it validates
 
-| Layer          | Checks                                                                                  |
-| -------------- | --------------------------------------------------------------------------------------- |
-| Global         | `sites/` exists; `configValues.yaml` present and valid YAML (may be empty)             |
-| Site           | Directory has `values.yaml` (valid YAML, **may be empty**) and `mces/`                 |
-| MCE            | Directory has `values.yaml` (valid YAML, **may be empty**) and `hostedClusters/`       |
-| Hosted cluster | `.yaml`/`.yml` extension; valid YAML; **must not be empty**                            |
+| Layer          | Checks                                                                                                                                                   |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Global         | `sites/` exists; `configValues.yaml` present and valid YAML (may be empty)                                                                               |
+| Site           | Directory has `values.yaml` (valid YAML, **may be empty**) and `mces/`                                                                                   |
+| MCE            | Directory has `values.yaml` (valid YAML, **may be empty**) and `hostedClusters/`                                                                         |
+| Hosted cluster | `.yaml`/`.yml` extension; valid YAML; **must not be empty**                                                                                              |
 | DHCP content   | Required fields, IP validity, subnet consistency, range ordering, exclusion overlaps, gateway-in-range guard, failover mode fields, exclusion sort order |
 
 ### Local usage
@@ -529,21 +533,45 @@ Exit codes: `0` = pass, `1` = validation errors, `2` = script/IO error.
 
 ### GitLab CI
 
-The `.gitlab-ci.yml` at the repo root runs the validation job on every MR that touches a YAML
-file inside `sites/`:
+The `.gitlab-ci.yml` at the repo root runs on every MR that touches a YAML file inside `sites/`.
+It uses `validate_changed_clusters.py` so only the clusters affected by the diff are validated —
+not the entire repo:
 
 ```yaml
 validate_dhcp_values:
   stage: validate
   image: python:3.12-slim
   before_script:
-    - pip install -r scripts/requirements.txt
+    - pip install --quiet -r scripts/requirements.txt
+    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
   script:
-    - python3 scripts/validate_dhcp_values.py --sites-dir sites
+    - >
+      python3 scripts/validate_changed_clusters.py
+      --base-ref origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+      --sites-dir sites
+      --verbose
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
         - sites/**/*.yaml
+```
+
+The `git fetch` is required because GitLab MR pipelines use a shallow clone — without it,
+`git diff origin/<target>...HEAD` has nothing to compare against.
+
+**What gets validated per change:**
+
+| Changed file                                      | Clusters validated          |
+| ------------------------------------------------- | --------------------------- |
+| `sites/<site>/mces/<mce>/hostedClusters/<c>.yaml` | Only `<c>`                  |
+| `sites/<site>/mces/<mce>/values.yaml`             | All clusters under `<mce>`  |
+| `sites/<site>/values.yaml`                        | All clusters under `<site>` |
+| `sites/configValues.yaml`                         | Full repo scan              |
+
+To run the same check locally against `main`:
+
+```bash
+python3 scripts/validate_changed_clusters.py --base-ref origin/main --verbose
 ```
 
 Dependencies are installed with `pip install -r scripts/requirements.txt` (pydantic + PyYAML).

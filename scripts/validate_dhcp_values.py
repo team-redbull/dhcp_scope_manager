@@ -432,7 +432,15 @@ _REQUIRED_PATHS: list[tuple[str, ...]] = [
 
 
 def _validate_dhcp_content(cluster_path: Path, merged: dict) -> list[str]:
-    """Run DHCP business validation on merged values. Returns list of error strings."""
+    """Run DHCP business validation on merged values. Returns list of error strings.
+
+    A cluster opts into DHCP management by defining dhcp_values in its own file.
+    Clusters that do not define dhcp_values are silently skipped — even if a parent
+    values.yaml defines dhcp_values defaults for other clusters.
+    """
+    cluster_data, _ = load_yaml_file(cluster_path)
+    if not isinstance(cluster_data, dict) or "dhcp_values" not in cluster_data:
+        return []
     if "dhcp_values" not in merged:
         return []
 
@@ -641,10 +649,13 @@ def run_validation(args: argparse.Namespace) -> int:
                 result.errors.extend(struct_errors)
 
                 # DHCP content validation on merged chain
+                dhcp_skipped = False
                 if not struct_errors:
                     chain = [p for p in (site_values_path, mce_values_path, cluster_path)
                              if p.exists()]
                     merged = merge_yaml_files(*chain)
+                    cluster_data, _ = load_yaml_file(cluster_path)
+                    dhcp_skipped = not (isinstance(cluster_data, dict) and "dhcp_values" in cluster_data)
                     content_errs = _validate_dhcp_content(cluster_path, merged)
                     if strict or True:  # always validate content when schema is present
                         result.content_errors.extend(content_errs)
@@ -655,7 +666,10 @@ def run_validation(args: argparse.Namespace) -> int:
                 if output_fmt == "text":
                     label = cluster_path.name
                     if result.ok:
-                        print(f"      {_ok(label, use_color)}")
+                        if dhcp_skipped:
+                            print(f"      {_ok(label, use_color)} {_c('(dhcp skipped)', _DIM, use_color=use_color)}")
+                        else:
+                            print(f"      {_ok(label, use_color)}")
                     else:
                         print(f"      {_fail(label, use_color)}")
                         for e in result.errors:

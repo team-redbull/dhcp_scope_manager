@@ -4,10 +4,10 @@ stages:
 
 # ─── DHCP Values Structure & Content Validation ───────────────────────────────
 #
-# Validates:
-#   - sites/ folder structure (sites, MCEs, hostedClusters)
-#   - Every values.yaml and hosted-cluster YAML file is valid YAML and non-empty
-#   - DHCP business rules (IP ranges, subnet consistency, failover, DNS)
+# Validates only the clusters affected by the current MR diff.
+# Inheritance-aware: a change to sites/<site>/values.yaml re-validates
+# every cluster under that site; a single hostedClusters/*.yaml change
+# validates only that cluster.
 #
 # Runs on MR when any sites/**/*.yaml file changes.
 validate_dhcp_values:
@@ -15,8 +15,13 @@ validate_dhcp_values:
   image: python:3.12-slim
   before_script:
     - pip install --quiet -r scripts/requirements.txt
+    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
   script:
-    - python3 scripts/validate_dhcp_values.py --sites-dir sites
+    - >
+      python3 scripts/validate_changed_clusters.py
+      --base-ref origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+      --sites-dir sites
+      --verbose
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
