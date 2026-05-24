@@ -509,6 +509,7 @@ async def _handle_failover_diff(
         return False
 
     if current is None:
+        assert desired is not None
         await _setup_failover(scope_id, desired)
         return True
 
