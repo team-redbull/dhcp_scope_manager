@@ -167,7 +167,7 @@ async def test_failover_add_new_relationship():
         mock_assemble.side_effect = [current, desired]
         # First run_ps in _setup_failover (Get-DhcpServerv4Failover) raises → new relationship
         mock_ps.side_effect = [
-            PowerShellError("Get-DhcpServerv4Failover", "Not found", 1),  # relationship check
+            None,  # _fetch_failover_by_name → no existing relationship
             None,  # Add-DhcpServerv4Failover
             None,  # Invoke-DhcpServerv4FailoverReplication
         ]
@@ -223,7 +223,7 @@ async def test_failover_remove():
         mock_assemble.side_effect = [current, desired]
         mock_ps.side_effect = [
             None,  # Remove-DhcpServerv4FailoverScope
-            PowerShellError("Get-DhcpServerv4Failover", "gone", 1),  # check remaining
+            None,  # _fetch_failover_by_name → relationship gone → None → no Remove-Failover
         ]
         await scope_service.update_scope(current.network, desired)
 
@@ -316,14 +316,10 @@ async def test_scope_exists_reraises_on_permission_error():
 
 
 async def test_scope_exists_returns_false_on_not_found():
-    """scope_exists returns False for legitimate not-found errors."""
+    """scope_exists returns False when the aggregate scope filter finds no match."""
     from app.services.scope_service import scope_exists
-    from app.errors import PowerShellError
 
-    with patch(
-        "app.services.scope_service.run_ps",
-        side_effect=PowerShellError("Get-DhcpServerv4Scope", "No DHCP scope found", 1),
-    ):
+    with patch("app.services.scope_service.run_ps", return_value=False):
         assert await scope_exists("10.20.30.0") is False
 
 
@@ -352,7 +348,7 @@ async def test_create_failover_loadbalance_excludes_server_role():
     ):
         mock_assemble.side_effect = [_make_scope(failover=None), desired]
         mock_ps.side_effect = [
-            PowerShellError("Get-DhcpServerv4Failover", "Not found", 1),  # relationship check
+            None,  # _fetch_failover_by_name → no existing relationship
             None,  # Add-DhcpServerv4Failover
             None,  # Invoke-DhcpServerv4FailoverReplication
         ]
@@ -382,7 +378,7 @@ async def test_create_failover_hotstandby_includes_server_role():
     ):
         mock_assemble.side_effect = [_make_scope(failover=None), desired]
         mock_ps.side_effect = [
-            PowerShellError("Get-DhcpServerv4Failover", "Not found", 1),
+            None,  # _fetch_failover_by_name → no existing relationship
             None,  # Add-DhcpServerv4Failover
             None,  # Invoke-DhcpServerv4FailoverReplication
         ]

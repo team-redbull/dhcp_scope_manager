@@ -74,8 +74,8 @@ class TestCreateScope:
              patch("app.services.scope_service.assemble_scope_state", return_value=result):
             # scope_exists returns truthy → scope exists
             mock_ps.side_effect = [
-                {"ScopeId": "10.20.30.0"},  # scope_exists check → scope found
-                None,                         # Set-DhcpServerv4OptionValue
+                True,  # scope_exists check → scope found
+                None,  # Set-DhcpServerv4OptionValue
             ]
             from app.services import scope_service
             await scope_service.create_scope(payload)
@@ -91,8 +91,8 @@ class TestCreateScope:
         with patch("app.services.scope_service.run_ps") as mock_ps, \
              patch("app.services.scope_service.assemble_scope_state", return_value=result):
             mock_ps.side_effect = [
-                {"ScopeId": "10.20.30.0"},  # scope_exists: exists
-                None,                         # Set-DhcpServerv4OptionValue
+                True,  # scope_exists: exists
+                None,  # Set-DhcpServerv4OptionValue
             ]
             from app.services import scope_service
             await scope_service.create_scope(payload)
@@ -151,13 +151,12 @@ class TestCreateScope:
         with patch("app.services.scope_service.run_ps") as mock_ps, \
              patch("app.services.scope_service.assemble_scope_state", return_value=result):
             mock_ps.side_effect = [
-                None,  # scope_exists → not found
-                None,  # Add-DhcpServerv4Scope
-                None,  # Set-DhcpServerv4OptionValue
-                # _setup_failover → Get-DhcpServerv4Failover → not found
-                PowerShellError("Get-DhcpServerv4Failover", "not found", 1),
-                None,  # Add-DhcpServerv4Failover
-                None,  # Invoke-DhcpServerv4FailoverReplication
+                False,  # scope_exists → not found
+                None,   # Add-DhcpServerv4Scope
+                None,   # Set-DhcpServerv4OptionValue
+                None,   # _setup_failover: _fetch_failover_by_name → no existing relationship
+                None,   # Add-DhcpServerv4Failover (create_failover_relationship)
+                None,   # Invoke-DhcpServerv4FailoverReplication
             ]
             from app.services import scope_service
             await scope_service.create_scope(payload)
@@ -231,7 +230,7 @@ class TestCreateScope:
         with patch("app.services.scope_service.run_ps") as mock_ps, \
              patch("app.services.scope_service.assemble_scope_state", return_value=result):
             mock_ps.side_effect = [
-                PowerShellError("Get-DhcpServerv4Scope", "No DHCP scope found", 1),
+                False,  # scope_exists → not found
                 PowerShellError("Add-DhcpServerv4Scope", "scope already exists", 1),
                 None,
             ]
@@ -249,7 +248,7 @@ class TestCreateScope:
         with patch("app.services.scope_service.run_ps") as mock_ps, \
              patch("app.services.scope_service.assemble_scope_state"):
             mock_ps.side_effect = [
-                PowerShellError("Get-DhcpServerv4Scope", "No DHCP scope found", 1),
+                False,  # scope_exists → not found
                 PowerShellError("Add-DhcpServerv4Scope", "Access denied", 5),
             ]
             from app.services import scope_service
@@ -363,10 +362,7 @@ class TestDeleteScope:
     async def test_delete_scope_not_found_is_idempotent(self):
         """If scope doesn't exist, delete must return silently without any PS commands."""
         with patch("app.services.scope_service.run_ps") as mock_ps:
-            # scope_exists: run_ps raises not-found
-            mock_ps.side_effect = PowerShellError(
-                "Get-DhcpServerv4Scope", "No DHCP scope found", 1
-            )
+            mock_ps.return_value = False  # scope_exists → not found
             from app.services import scope_service
             await scope_service.delete_scope("10.20.30.0")
 
@@ -381,8 +377,8 @@ class TestDeleteScope:
         with patch("app.services.scope_service.run_ps") as mock_ps, \
              patch("app.services.scope_service.assemble_scope_state", return_value=scope):
             mock_ps.side_effect = [
-                {"ScopeId": "10.20.30.0"},  # scope_exists → found
-                None,                         # Remove-DhcpServerv4Scope
+                True,  # scope_exists → found
+                None,  # Remove-DhcpServerv4Scope
             ]
             from app.services import scope_service
             await scope_service.delete_scope("10.20.30.0")
@@ -409,10 +405,10 @@ class TestDeleteScope:
         with patch("app.services.scope_service.run_ps") as mock_ps, \
              patch("app.services.scope_service.assemble_scope_state", return_value=scope):
             mock_ps.side_effect = [
-                {"ScopeId": "10.20.30.0"},      # scope_exists → found
-                None,                             # Remove-DhcpServerv4FailoverScope
-                PowerShellError("Get-DhcpServerv4Failover", "not found", 1),  # check remaining
-                None,                             # Remove-DhcpServerv4Scope
+                True,  # scope_exists → found
+                None,  # Remove-DhcpServerv4FailoverScope
+                None,  # _fetch_failover_by_name: relationship gone → None → no Remove-Failover
+                None,  # Remove-DhcpServerv4Scope
             ]
             from app.services import scope_service
             await scope_service.delete_scope("10.20.30.0")
@@ -433,9 +429,9 @@ class TestDeleteScope:
         with patch("app.services.scope_service.run_ps") as mock_ps, \
              patch("app.services.scope_service.assemble_scope_state", return_value=scope):
             mock_ps.side_effect = [
-                {"ScopeId": "10.20.30.0"},  # scope_exists → found
-                None,                         # Remove-DhcpServerv4ExclusionRange
-                None,                         # Remove-DhcpServerv4Scope
+                True,  # scope_exists → found
+                None,  # Remove-DhcpServerv4ExclusionRange
+                None,  # Remove-DhcpServerv4Scope
             ]
             from app.services import scope_service
             await scope_service.delete_scope("10.20.30.0")
@@ -452,7 +448,7 @@ class TestDeleteScope:
                 "app.services.scope_service.assemble_scope_state",
                 side_effect=PowerShellError("Get-DhcpServerv4Scope", "not found", 1),
              ):
-            mock_ps.return_value = {"ScopeId": "10.20.30.0"}  # scope_exists: found
+            mock_ps.return_value = True  # scope_exists: found
             from app.services import scope_service
             # Must not raise — scope already gone is acceptable
             await scope_service.delete_scope("10.20.30.0")
@@ -468,7 +464,7 @@ class TestDeleteScope:
                 "app.services.scope_service.assemble_scope_state",
                 side_effect=PowerShellError("Get-DhcpServerv4Scope", "Access denied", 5),
              ):
-            mock_ps.return_value = {"ScopeId": "10.20.30.0"}  # scope_exists: found
+            mock_ps.return_value = True  # scope_exists: found
             from app.services import scope_service
             with pytest.raises(PowerShellError):
                 await scope_service.delete_scope("10.20.30.0")

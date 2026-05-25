@@ -345,9 +345,20 @@ def test_get_scope_state_script_contains_depth_10_and_single_scope_literal():
 
 def test_get_scope_state_script_rethrows_unexpected_optional_errors():
     script = build_get_scope_state_script("10.20.30.0")
+    assert "Test-DhcpNoOptions" in script
     assert "Test-DhcpNoExclusions" in script
-    assert "Test-DhcpNoFailover" in script
+    # Aggregate failover approach does not need Test-DhcpNoFailover
+    assert "Test-DhcpNoFailover" not in script
     assert script.count("throw") == 2
+
+
+def test_get_scope_state_script_uses_aggregate_failover_lookup():
+    """Failover must be resolved via server-level aggregate, never per-scope -ScopeId flag."""
+    script = build_get_scope_state_script("10.20.30.0")
+    # Aggregate fetch (no -ScopeId on failover cmdlet)
+    assert "Get-DhcpServerv4Failover -ErrorAction Stop" in script
+    # No per-scope failover lookup that would throw for scopes without failover
+    assert "Get-DhcpServerv4Failover -ScopeId" not in script
 
 
 # ─── build_get_all_scopes_script ──────────────────────────────────────────────
@@ -369,11 +380,19 @@ def test_all_scopes_script_has_no_scope_id_literal():
 
 
 def test_all_scopes_script_handles_missing_optional_objects():
-    """The all-scopes script must use Test-DhcpNoExclusions/Failover helpers for optional data."""
+    """Options and exclusions use pattern-matched helpers; failover uses aggregate lookup."""
     script = build_get_all_scopes_script()
+    assert "Test-DhcpNoOptions" in script
     assert "Test-DhcpNoExclusions" in script
-    assert "Test-DhcpNoFailover" in script
+    assert "Test-DhcpNoFailover" not in script
     assert script.count("throw") == 2
+
+
+def test_all_scopes_script_uses_aggregate_failover_lookup():
+    """Failover must be fetched once before the loop (O(1) PS process for fleet)."""
+    script = build_get_all_scopes_script()
+    assert "Get-DhcpServerv4Failover -ErrorAction Stop" in script
+    assert "Get-DhcpServerv4Failover -ScopeId" not in script
 
 
 def test_all_scopes_script_uses_list_accumulator():
@@ -381,3 +400,285 @@ def test_all_scopes_script_uses_list_accumulator():
     script = build_get_all_scopes_script()
     assert "foreach" in script
     assert "$result" in script
+
+
+# ─── parse_failover robustness ────────────────────────────────────────────────
+
+def test_parse_failover_nominal(mock_ps_failover_raw):
+    """Nominal HotStandby failover parses without error."""
+    result = parse_failover(mock_ps_failover_raw)
+    assert result.relationshipName == "mce1-failover"
+    assert result.partnerServer == "dhcp02.lab.local"
+    assert result.mode == "HotStandby"
+    assert result.serverRole == "Active"
+    assert result.reservePercent == 5
+    assert result.maxClientLeadTimeMinutes == 60
+
+
+def test_parse_failover_maxclientleadtime_as_dict():
+    """MaxClientLeadTime serialized as a JSON TimeSpan object is parsed via TotalMinutes."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": 5,
+        "LoadBalancePercent": 0,
+        "MaxClientLeadTime": {
+            "Ticks": 36000000000,
+            "Days": 0,
+            "Hours": 1,
+            "Minutes": 0,
+            "Seconds": 0,
+            "TotalMinutes": 60.0,
+            "TotalSeconds": 3600.0,
+        },
+    }
+    result = parse_failover(raw)
+    assert result.maxClientLeadTimeMinutes == 60
+
+
+def test_parse_failover_maxclientleadtime_dict_fallback_without_totalminutes():
+    """If TotalMinutes is absent, Days/Hours/Minutes are used."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": 5,
+        "LoadBalancePercent": 0,
+        "MaxClientLeadTime": {"Days": 0, "Hours": 1, "Minutes": 30},
+    }
+    result = parse_failover(raw)
+    assert result.maxClientLeadTimeMinutes == 90
+
+
+def test_parse_failover_maxclientleadtime_as_numeric():
+    """MaxClientLeadTime as a bare integer (minutes) is parsed directly."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": 5,
+        "LoadBalancePercent": 0,
+        "MaxClientLeadTime": 90,
+    }
+    result = parse_failover(raw)
+    assert result.maxClientLeadTimeMinutes == 90
+
+
+def test_parse_failover_maxclientleadtime_none_uses_default():
+    """Absent MaxClientLeadTime defaults to 60 minutes (1 hour)."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": 5,
+        "LoadBalancePercent": None,
+        "MaxClientLeadTime": None,
+    }
+    result = parse_failover(raw)
+    assert result.maxClientLeadTimeMinutes == 60
+
+
+def test_parse_failover_null_reserve_percent_becomes_zero():
+    """None ReservePercent must not raise TypeError — normalizes to 0."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": None,
+        "LoadBalancePercent": None,
+        "MaxClientLeadTime": "1:00:00",
+    }
+    result = parse_failover(raw)
+    assert result.reservePercent == 0
+
+
+def test_parse_failover_null_server_role_hotstandby_raises():
+    """None serverRole for HotStandby must raise (model enforces it) — invalid DHCP state."""
+    from pydantic import ValidationError
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": None,
+        "ReservePercent": 5,
+        "LoadBalancePercent": 0,
+        "MaxClientLeadTime": "1:00:00",
+    }
+    with pytest.raises(ValidationError, match="serverRole"):
+        parse_failover(raw)
+
+
+def test_parse_failover_loadbalance_mode():
+    """LoadBalance failover parses correctly; serverRole is normalized to 'Active'."""
+    raw = {
+        "Name": "lb-rel",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "LoadBalance",
+        "ServerRole": None,
+        "ReservePercent": 0,
+        "LoadBalancePercent": 60,
+        "MaxClientLeadTime": "1:00:00",
+    }
+    result = parse_failover(raw)
+    assert result.mode == "LoadBalance"
+    assert result.serverRole == "Active"
+    assert result.loadBalancePercent == 60
+    assert result.reservePercent == 0
+
+
+# ─── TimeSpan helpers ─────────────────────────────────────────────────────────
+
+def test_parse_timespan_as_days_with_string():
+    from app.services.ps_parsers import _parse_timespan_as_days
+    assert _parse_timespan_as_days("8.00:00:00") == 8
+
+
+def test_parse_timespan_as_days_with_dict():
+    from app.services.ps_parsers import _parse_timespan_as_days
+    assert _parse_timespan_as_days({"Days": 14, "Hours": 0}) == 14
+
+
+def test_parse_timespan_as_days_with_int():
+    from app.services.ps_parsers import _parse_timespan_as_days
+    assert _parse_timespan_as_days(8) == 8
+
+
+def test_parse_timespan_as_days_with_none_returns_default():
+    from app.services.ps_parsers import _parse_timespan_as_days
+    assert _parse_timespan_as_days(None, default=8) == 8
+
+
+def test_parse_timespan_as_minutes_with_string():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes("1:30:00") == 90
+
+
+def test_parse_timespan_as_minutes_with_dict_totalminutes():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes({"TotalMinutes": 90.0}) == 90
+
+
+def test_parse_timespan_as_minutes_with_dict_components():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes({"Days": 1, "Hours": 0, "Minutes": 0}) == 1440
+
+
+def test_parse_timespan_as_minutes_with_int():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes(90) == 90
+
+
+def test_parse_timespan_as_minutes_with_none_returns_default():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes(None, default=60) == 60
+
+
+# ─── LeaseDuration as JSON object in build_payload_from_scope_state ───────────
+
+def test_build_payload_leaseduration_as_dict(mock_ps_scope_raw, mock_ps_options_raw):
+    """LeaseDuration serialized as a JSON TimeSpan dict is parsed via Days field."""
+    scope_with_dict_lease = dict(mock_ps_scope_raw)
+    scope_with_dict_lease["LeaseDuration"] = {"Days": 14, "Hours": 0, "Minutes": 0}
+    state = normalize_get_scope_state(
+        {"scope": scope_with_dict_lease, "options": mock_ps_options_raw,
+         "exclusions": [], "failover": None}
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.leaseDurationDays == 14
+
+
+def test_build_payload_leaseduration_as_int(mock_ps_scope_raw, mock_ps_options_raw):
+    """LeaseDuration as a bare integer is parsed directly as days."""
+    scope_with_int_lease = dict(mock_ps_scope_raw)
+    scope_with_int_lease["LeaseDuration"] = 8
+    state = normalize_get_scope_state(
+        {"scope": scope_with_int_lease, "options": mock_ps_options_raw,
+         "exclusions": [], "failover": None}
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.leaseDurationDays == 8
+
+
+def test_build_payload_leaseduration_none_uses_default(mock_ps_scope_raw, mock_ps_options_raw):
+    """Absent LeaseDuration defaults to 8 days."""
+    scope_no_lease = {k: v for k, v in mock_ps_scope_raw.items() if k != "LeaseDuration"}
+    state = normalize_get_scope_state(
+        {"scope": scope_no_lease, "options": mock_ps_options_raw,
+         "exclusions": [], "failover": None}
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.leaseDurationDays == 8
+
+
+# ─── options absent (scope with no DHCP options configured) ───────────────────
+
+@pytest.mark.asyncio
+async def test_assemble_scope_no_options_raises_conflict_for_missing_dns(mock_ps_scope_raw):
+    """A scope with zero options configured → empty options → DhcpConflictError for DNS."""
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(
+            return_value={"scope": mock_ps_scope_raw, "options": [], "exclusions": [], "failover": None}
+        ),
+    ):
+        with pytest.raises(DhcpConflictError, match="DNS servers"):
+            await assemble_scope_state("10.20.30.0")
+
+
+@pytest.mark.asyncio
+async def test_assemble_scope_options_missing_gateway_returns_null_gateway(mock_ps_scope_raw):
+    """Scope missing only the gateway option returns gateway: null — not an error."""
+    options_no_gateway = [
+        {"OptionId": 6, "Value": ["10.0.0.53"]},
+        {"OptionId": 15, "Value": ["lab.local"]},
+    ]
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(
+            return_value={"scope": mock_ps_scope_raw, "options": options_no_gateway,
+                          "exclusions": [], "failover": None}
+        ),
+    ):
+        result = await assemble_scope_state("10.20.30.0")
+    assert result.gateway is None
+
+
+@pytest.mark.asyncio
+async def test_assemble_scope_options_missing_domain_returns_empty_string(mock_ps_scope_raw):
+    """Scope missing domain option (15) returns dnsDomain: '' — not an error."""
+    options_no_domain = [
+        {"OptionId": 3, "Value": ["10.20.30.1"]},
+        {"OptionId": 6, "Value": ["10.0.0.53"]},
+    ]
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(
+            return_value={"scope": mock_ps_scope_raw, "options": options_no_domain,
+                          "exclusions": [], "failover": None}
+        ),
+    ):
+        result = await assemble_scope_state("10.20.30.0")
+    assert result.dnsDomain == ""
+
+
+# ─── script wraps options fetch with error handling ───────────────────────────
+
+def test_get_scope_state_script_has_options_try_catch():
+    """The get-scope script must guard Get-DhcpServerv4OptionValue with try/catch."""
+    script = build_get_scope_state_script("10.20.30.0")
+    assert "Test-DhcpNoOptions" in script
+    # The options fetch must be inside a try block
+    assert "Get-DhcpServerv4OptionValue -ScopeId $ScopeId -ErrorAction Stop" in script
+
+
+def test_all_scopes_script_has_options_try_catch():
+    """The all-scopes script must guard Get-DhcpServerv4OptionValue with try/catch."""
+    script = build_get_all_scopes_script()
+    assert "Test-DhcpNoOptions" in script
+    assert "Get-DhcpServerv4OptionValue -ScopeId $s.ScopeId -ErrorAction Stop" in script

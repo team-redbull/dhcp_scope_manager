@@ -12,6 +12,27 @@ from app.utils.powershell import ps_single_quote
 
 logger = logging.getLogger(__name__)
 
+# PowerShell helper functions shared by both per-scope and all-scopes scripts.
+# Inline rather than defined once server-side because each run_ps call is a
+# fresh pwsh process with no shared state.
+_PS_ABSENCE_HELPERS = r"""
+function Test-DhcpNoOptions($ErrorRecord) {
+    $message = [string]$ErrorRecord.Exception.Message
+    return (
+        $message -match '(?i)(option|value)' -and
+        $message -match '(?i)(not found|cannot find|does not exist|not set|none|no .*option)'
+    )
+}
+
+function Test-DhcpNoExclusions($ErrorRecord) {
+    $message = [string]$ErrorRecord.Exception.Message
+    return (
+        $message -match '(?i)exclusion' -and
+        $message -match '(?i)(not found|cannot find|does not exist|no .*exclusion)'
+    )
+}
+""".strip()
+
 
 def normalize_list(result) -> list:
     """Normalize PowerShell JSON None/scalar/object/list output into a list."""
@@ -22,6 +43,45 @@ def normalize_list(result) -> list:
     if isinstance(result, tuple):
         return list(result)
     return [result]
+
+
+def _parse_timespan_as_minutes(val: object, default: int = 60) -> int:
+    """Parse a PowerShell TimeSpan value to total minutes.
+
+    Handles three serialization formats that Windows DHCP can produce:
+      str   — "1:00:00" or "1.00:00:00"  (CIM string properties)
+      dict  — {"TotalMinutes": 60.0, ...} (ConvertTo-Json of a .NET TimeSpan)
+      int/float — interpret directly as minutes (edge-case fallback)
+
+    A None input returns `default` (1 hour) so callers do not need to guard.
+    """
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, dict):
+        total = val.get("TotalMinutes")
+        if total is not None:
+            return int(total)
+        days = int(val.get("Days") or 0)
+        hours = int(val.get("Hours") or 0)
+        minutes = int(val.get("Minutes") or 0)
+        return days * 24 * 60 + hours * 60 + minutes
+    return parse_timespan_minutes(str(val))
+
+
+def _parse_timespan_as_days(val: object, default: int = 8) -> int:
+    """Parse a PowerShell TimeSpan value to total days.
+
+    Same format handling as _parse_timespan_as_minutes.
+    """
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, dict):
+        return int(val.get("Days") or default)
+    return parse_timespan_days(str(val))
 
 
 def _validated_scope_id(scope_id: str) -> str:
@@ -39,36 +99,34 @@ def build_get_all_scopes_script() -> str:
     The output structure is identical to build_get_scope_state_script — an array
     where each element is {scope, options, exclusions, failover}.
 
+    Failover is resolved by fetching all relationships once before the loop and
+    matching by ScopeId inside Python/PowerShell — this avoids treating a scope
+    that is not in any failover relationship as a PowerShell error.
+
     PowerShell collapses a single-element array to a plain object in ConvertTo-Json.
     normalize_list() on the parsed result handles both cases transparently.
     """
-    return r"""
-function Test-DhcpNoExclusions($ErrorRecord) {
-    $message = [string]$ErrorRecord.Exception.Message
-    return (
-        $message -match '(?i)exclusion' -and
-        $message -match '(?i)(not found|cannot find|does not exist|no .*exclusion)'
-    )
-}
-
-function Test-DhcpNoFailover($ErrorRecord) {
-    $message = [string]$ErrorRecord.Exception.Message
-    return (
-        $message -match '(?i)(failover|relationship)' -and
-        $message -match '(?i)(not found|cannot find|does not exist|not configured|not associated|no .*failover)'
-    )
-}
+    return _PS_ABSENCE_HELPERS + r"""
 
 $allScopes = @(Get-DhcpServerv4Scope -ErrorAction Stop)
+$allFailovers = @(Get-DhcpServerv4Failover -ErrorAction Stop)
 $result = New-Object System.Collections.Generic.List[Object]
 
 foreach ($s in $allScopes) {
-    $sid = $s.ScopeId
-
-    $options = @(Get-DhcpServerv4OptionValue -ScopeId $sid -ErrorAction Stop)
+    $sid = $s.ScopeId.ToString()
 
     try {
-        $exclusions = @(Get-DhcpServerv4ExclusionRange -ScopeId $sid -ErrorAction Stop)
+        $options = @(Get-DhcpServerv4OptionValue -ScopeId $s.ScopeId -ErrorAction Stop)
+    } catch {
+        if (Test-DhcpNoOptions $_) {
+            $options = @()
+        } else {
+            throw
+        }
+    }
+
+    try {
+        $exclusions = @(Get-DhcpServerv4ExclusionRange -ScopeId $s.ScopeId -ErrorAction Stop)
     } catch {
         if (Test-DhcpNoExclusions $_) {
             $exclusions = @()
@@ -77,13 +135,12 @@ foreach ($s in $allScopes) {
         }
     }
 
-    try {
-        $failover = Get-DhcpServerv4Failover -ScopeId $sid -ErrorAction Stop
-    } catch {
-        if (Test-DhcpNoFailover $_) {
-            $failover = $null
-        } else {
-            throw
+    $failover = $null
+    foreach ($fo in $allFailovers) {
+        $foScopes = @($fo.ScopeId) | ForEach-Object { $_.ToString() }
+        if ($foScopes -contains $sid) {
+            $failover = $fo
+            break
         }
     }
 
@@ -100,29 +157,29 @@ $result | ConvertTo-Json -Depth 10 -Compress
 
 
 def build_get_scope_state_script(scope_id: str) -> str:
-    """Build a single PowerShell script that emits all scope state as JSON."""
+    """Build a single PowerShell script that emits all scope state as JSON.
+
+    Failover is resolved via an aggregate Get-DhcpServerv4Failover call (no -ScopeId)
+    so that a scope not participating in any failover relationship is never treated as
+    a PowerShell error — the filter simply yields $null, which normalizes to failover: null.
+    """
     scope_literal = ps_single_quote(_validated_scope_id(scope_id))
-    return f"""
-$ScopeId = {scope_literal}
-
-function Test-DhcpNoExclusions($ErrorRecord) {{
-    $message = [string]$ErrorRecord.Exception.Message
     return (
-        $message -match '(?i)exclusion' -and
-        $message -match '(?i)(not found|cannot find|does not exist|no .*exclusion)'
-    )
-}}
-
-function Test-DhcpNoFailover($ErrorRecord) {{
-    $message = [string]$ErrorRecord.Exception.Message
-    return (
-        $message -match '(?i)(failover|relationship)' -and
-        $message -match '(?i)(not found|cannot find|does not exist|not configured|not associated|no .*failover)'
-    )
-}}
+        f"$ScopeId = {scope_literal}\n\n"
+        + _PS_ABSENCE_HELPERS
+        + f"""
 
 $scope = Get-DhcpServerv4Scope -ScopeId $ScopeId -ErrorAction Stop
-$options = @(Get-DhcpServerv4OptionValue -ScopeId $ScopeId -ErrorAction Stop)
+
+try {{
+    $options = @(Get-DhcpServerv4OptionValue -ScopeId $ScopeId -ErrorAction Stop)
+}} catch {{
+    if (Test-DhcpNoOptions $_) {{
+        $options = @()
+    }} else {{
+        throw
+    }}
+}}
 
 try {{
     $exclusions = @(Get-DhcpServerv4ExclusionRange -ScopeId $ScopeId -ErrorAction Stop)
@@ -134,13 +191,13 @@ try {{
     }}
 }}
 
-try {{
-    $failover = Get-DhcpServerv4Failover -ScopeId $ScopeId -ErrorAction Stop
-}} catch {{
-    if (Test-DhcpNoFailover $_) {{
-        $failover = $null
-    }} else {{
-        throw
+$allFailovers = @(Get-DhcpServerv4Failover -ErrorAction Stop)
+$failover = $null
+foreach ($fo in $allFailovers) {{
+    $foScopes = @($fo.ScopeId) | ForEach-Object {{ $_.ToString() }}
+    if ($foScopes -contains $ScopeId) {{
+        $failover = $fo
+        break
     }}
 }}
 
@@ -152,7 +209,8 @@ $result = [PSCustomObject]@{{
 }}
 
 $result | ConvertTo-Json -Depth 10 -Compress
-""".strip()
+"""
+    ).strip()
 
 
 def extract_option(options: list, option_id: int) -> str:
@@ -184,16 +242,24 @@ def extract_option_list(options: list, option_id: int) -> list[str]:
 
 
 def parse_failover(raw: dict) -> DhcpFailover:
-    """Parse a PowerShell Get-DhcpServerv4Failover result into DhcpFailover."""
+    """Parse a PowerShell Get-DhcpServerv4Failover result into DhcpFailover.
+
+    Defensive against three edge cases:
+    - None for ReservePercent / LoadBalancePercent (int(None) would TypeError)
+    - serverRole absent from PS output (must not silently default to 'Active' for HotStandby
+      because the actual standby server would report wrong parity; let model validator enforce)
+    - MaxClientLeadTime as a JSON TimeSpan object (ConvertTo-Json of a .NET TimeSpan)
+      rather than the usual CIM string "1:00:00"
+    """
     return DhcpFailover(
-        partnerServer=str(raw.get("PartnerServer", "")),
-        relationshipName=str(raw.get("Name", "")),
+        partnerServer=str(raw.get("PartnerServer") or ""),
+        relationshipName=str(raw.get("Name") or ""),
         mode=raw.get("Mode", "HotStandby"),
-        serverRole=raw.get("ServerRole", "Active"),
-        reservePercent=int(raw.get("ReservePercent", 0)),
-        loadBalancePercent=int(raw.get("LoadBalancePercent", 0)),
-        maxClientLeadTimeMinutes=parse_timespan_minutes(
-            str(raw.get("MaxClientLeadTime", "1:00:00"))
+        serverRole=raw.get("ServerRole") or None,
+        reservePercent=int(raw.get("ReservePercent") or 0),
+        loadBalancePercent=int(raw.get("LoadBalancePercent") or 0),
+        maxClientLeadTimeMinutes=_parse_timespan_as_minutes(
+            raw.get("MaxClientLeadTime"), default=60
         ),
     )
 
@@ -224,8 +290,8 @@ def build_payload_from_scope_state(scope_id: str, state: dict[str, Any]) -> Dhcp
         if failover_entries:
             failover_obj = parse_failover(failover_entries[0])
 
-    # Parse lease duration: "8.00:00:00" → 8
-    lease_days = parse_timespan_days(str(scope.get("LeaseDuration", "8.00:00:00")))
+    # Parse lease duration: handles string "8.00:00:00", JSON TimeSpan dict, or int
+    lease_days = _parse_timespan_as_days(scope.get("LeaseDuration"), default=8)
     dns_servers = extract_option_list(options, 6)
     if not dns_servers:
         raise DhcpConflictError(
@@ -236,24 +302,25 @@ def build_payload_from_scope_state(scope_id: str, state: dict[str, Any]) -> Dhcp
     exclusions = sorted(
         [
             DhcpExclusion(
-                startAddress=str(e["StartRange"]),
-                endAddress=str(e["EndRange"]),
+                startAddress=IPv4Address(str(e["StartRange"])),
+                endAddress=IPv4Address(str(e["EndRange"])),
             )
             for e in exclusions_list
         ],
         key=lambda x: (ip_to_int(x.startAddress), ip_to_int(x.endAddress)),
     )
 
+    raw_gateway = extract_optional_option(options, 3)
     return DhcpScopePayload(
         scopeName=str(scope.get("Name") or ""),
-        network=scope_id,
-        subnetMask=str(scope.get("SubnetMask", "")),
-        startRange=str(scope.get("StartRange", "")),
-        endRange=str(scope.get("EndRange", "")),
+        network=IPv4Address(scope_id),
+        subnetMask=IPv4Address(str(scope.get("SubnetMask", ""))),
+        startRange=IPv4Address(str(scope.get("StartRange", ""))),
+        endRange=IPv4Address(str(scope.get("EndRange", ""))),
         leaseDurationDays=lease_days,
         description=str(scope.get("Description") or ""),
-        gateway=extract_optional_option(options, 3),
-        dnsServers=dns_servers,
+        gateway=IPv4Address(raw_gateway) if raw_gateway else None,
+        dnsServers=[IPv4Address(s) for s in dns_servers],
         dnsDomain=extract_option(options, 15),
         exclusions=exclusions,
         failover=failover_obj,

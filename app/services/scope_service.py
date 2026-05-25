@@ -46,7 +46,6 @@ async def _run_ps(
     parse_json: bool = False,
     ignore_not_found: bool = False,
     ignore_already_exists: bool = False,
-    best_effort: bool = False,
     warn_prefix: str | None = None,
     scope_id: str | None = None,
     operation: str | None = None,
@@ -56,11 +55,9 @@ async def _run_ps(
 
     Policy flags (set exactly one per call to keep intent unambiguous):
         ignore_not_found      – return None on not-found errors; re-raise all others.
-                                Use for: existence checks, optional lookups.
+                                Use for: optional removals where absence is expected.
         ignore_already_exists – silently accept "already exists/added/in use" errors.
                                 Use for: idempotent create operations.
-        best_effort           – return None on any PowerShellError.
-                                Use for: best-effort cleanup where any failure is OK.
         warn_prefix           – log a warning with this prefix instead of raising.
                                 Use for: per-item cleanup where partial failure is tolerable.
     """
@@ -73,12 +70,6 @@ async def _run_ps(
             relationship_name=relationship_name,
         )
     except PowerShellError as exc:
-        if best_effort:
-            logger.warning(
-                "Ignoring best-effort PowerShell failure",
-                extra=_scope_extra(scope_id or "", operation or "powershell", status="ignored"),
-            )
-            return None
         if warn_prefix is not None:
             logger.warning(
                 "%s: %s",
@@ -185,13 +176,22 @@ async def list_scopes() -> DhcpScopeListResponse:
 @log_call
 async def scope_exists(scope_id: str) -> bool:
     scope_literal = ps_ipv4(scope_id)
-    return await _run_ps(
-        f"Get-DhcpServerv4Scope -ScopeId {scope_literal}",
+    script = (
+        f"$found = $false\n"
+        f"foreach ($s in @(Get-DhcpServerv4Scope -ErrorAction Stop)) {{\n"
+        f"    if ($s.ScopeId.ToString() -eq {scope_literal}) {{ $found = $true; break }}\n"
+        f"}}\n"
+        f"$found | ConvertTo-Json -Compress"
+    )
+    result = await run_ps(
+        script,
         parse_json=True,
-        ignore_not_found=True,
+        append_error_action=False,
+        append_convert_to_json=False,
         scope_id=scope_id,
         operation="scope_exists",
-    ) is not None
+    )
+    return result is True
 
 
 @log_call
@@ -400,6 +400,37 @@ async def delete_scope(scope_id: str) -> None:
 # Failover helpers
 # ---------------------------------------------------------------------------
 
+async def _fetch_failover_by_name(
+    rel_name: str, scope_id: str | None = None
+) -> dict | None:
+    """Return the failover relationship object for rel_name, or None if it doesn't exist.
+
+    Uses an aggregate Get-DhcpServerv4Failover (no -Name flag) so that a missing
+    relationship is a normal empty result rather than a terminating PS error.
+    Real errors (server unreachable, permission denied) still propagate.
+    """
+    rel_literal = ps_single_quote(rel_name)
+    script = (
+        f"$fo = $null\n"
+        f"foreach ($f in @(Get-DhcpServerv4Failover -ErrorAction Stop)) {{\n"
+        f"    if ($f.Name -eq {rel_literal}) {{ $fo = $f; break }}\n"
+        f"}}\n"
+        f"$fo | ConvertTo-Json -Depth 10 -Compress"
+    )
+    raw = await run_ps(
+        script,
+        parse_json=True,
+        append_error_action=False,
+        append_convert_to_json=False,
+        scope_id=scope_id,
+        operation="get_failover",
+        relationship_name=rel_name,
+    )
+    if isinstance(raw, list):
+        return raw[0] if raw else None
+    return raw
+
+
 @log_call
 async def _replicate_failover(scope_id: str, relationship_name: str | None = None) -> None:
     await run_ps(
@@ -430,17 +461,8 @@ async def _remove_scope_from_failover(scope_id: str, rel_name: str) -> None:
         operation="remove_failover_scope",
         relationship_name=rel_name,
     )
-    rel_raw = await _run_ps(
-        f"Get-DhcpServerv4Failover -Name {ps_single_quote(rel_name)}",
-        parse_json=True,
-        best_effort=True,
-        scope_id=scope_id,
-        operation="get_failover",
-        relationship_name=rel_name,
-    )
-    if rel_raw:
-        rel = rel_raw if isinstance(rel_raw, dict) else rel_raw[0]
-        if not rel.get("ScopeId"):
+    rel_raw = await _fetch_failover_by_name(rel_name, scope_id=scope_id)
+    if isinstance(rel_raw, dict) and not rel_raw.get("ScopeId"):
             await run_ps(
                 f"Remove-DhcpServerv4Failover -Name {ps_single_quote(rel_name)} -Force",
                 parse_json=False,
@@ -452,14 +474,7 @@ async def _remove_scope_from_failover(scope_id: str, rel_name: str) -> None:
 
 @log_call
 async def _setup_failover(scope_id: str, failover: DhcpFailover) -> None:
-    existing = await _run_ps(
-        f"Get-DhcpServerv4Failover -Name {ps_single_quote(failover.relationshipName)}",
-        parse_json=True,
-        ignore_not_found=True,
-        scope_id=scope_id,
-        operation="get_failover",
-        relationship_name=failover.relationshipName,
-    )
+    existing = await _fetch_failover_by_name(failover.relationshipName, scope_id=scope_id)
     if existing:
         await _run_ps(
             f"Add-DhcpServerv4FailoverScope -Name {ps_single_quote(failover.relationshipName)} "
