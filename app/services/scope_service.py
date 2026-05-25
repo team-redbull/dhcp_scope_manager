@@ -362,18 +362,23 @@ async def update_scope(scope_id: str, desired: DhcpScopePayload) -> DhcpScopePay
 @log_call
 async def delete_scope(scope_id: str) -> None:
     scope_literal = ps_ipv4(scope_id)
-    logger.info("Deleting DHCP scope", extra=_scope_extra(scope_id, "delete_scope"))
+    logger.info("Received delete request for DHCP scope", extra=_scope_extra(scope_id, "delete_scope"))
     async with scope_locks.lock(scope_id):
         if not await scope_exists(scope_id):
             logger.info(
-                "DHCP scope does not exist, delete is already converged",
+                "Scope not found — already absent, returning 204 (idempotent delete)",
                 extra=_scope_extra(scope_id, "delete_scope", status="not_found"),
             )
             return
 
         current = await _try_assemble_scope(scope_id)
         if current is None:
-            return  # scope disappeared between existence check and assembly
+            logger.info(
+                "Scope disappeared between existence check and state assembly — "
+                "likely a concurrent delete, returning 204",
+                extra=_scope_extra(scope_id, "delete_scope", status="not_found"),
+            )
+            return
 
         if current.failover is not None:
             await _remove_scope_from_failover(scope_id, current.failover.relationshipName)

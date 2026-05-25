@@ -56,4 +56,7 @@ async def delete_scope(
     scope_id: str = Depends(validate_scope_id),
 ) -> Response:
     await scope_service.delete_scope(scope_id)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return Response(
+        status_code=status.HTTP_204_NO_CONTENT,
+        headers={"X-Deleted-Scope": scope_id},
+    )
