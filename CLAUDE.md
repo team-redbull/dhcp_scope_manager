@@ -116,6 +116,8 @@ If failover detach fails, delete aborts and retries on next Crossplane cycle.
 Always: `-ErrorAction Stop`, `ConvertTo-Json -Depth 10`, `-Force` where applicable, `run_ps()` wrapper, `_ps_str()` to escape user strings.
 Never: return raw PS output to clients, swallow errors, execute partial operations without error handling.
 
+**IP address fields in PS output**: `ConvertTo-Json -Depth 10` serializes .NET `IPAddress` properties (scope `SubnetMask`/`StartRange`/`EndRange`/`ScopeId`, exclusion `StartRange`/`EndRange`, option values) as dicts with an `IPAddressToString` key, not plain strings. Always use `_extract_ip_str()` from `ps_parsers` to extract these values — never call `str()` directly on them. Violating this produces "only decimal digits permitted in address" errors at `IPv4Address()` construction time.
+
 ## 9. Reconciliation
 
 GET → 404: POST. GET body differs from desired: PUT. CR deleted: DELETE.
