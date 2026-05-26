@@ -7,6 +7,7 @@ from app.models import DhcpFailover, DhcpScopeListError, DhcpScopeListResponse, 
 from app.errors import PowerShellError
 from app.services.ps_executor import is_already_exists_error, is_not_found_error, run_ps
 from app.services.ps_parsers import (
+    _extract_ip_str,
     assemble_scope_state,
     build_get_all_scopes_script,
     build_payload_from_scope_state,
@@ -155,7 +156,7 @@ async def list_scopes() -> DhcpScopeListResponse:
     errors: list[DhcpScopeListError] = []
     for entry in entries:
         state = normalize_get_scope_state(entry)
-        scope_id = str(state["scope"].get("ScopeId", "")).strip()
+        scope_id = _extract_ip_str(state["scope"].get("ScopeId") or "").strip()
         if not scope_id:
             continue
         try:

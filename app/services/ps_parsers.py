@@ -34,6 +34,21 @@ function Test-DhcpNoExclusions($ErrorRecord) {
 """.strip()
 
 
+def _extract_ip_str(val: object) -> str:
+    """Extract a plain IPv4 dotted-decimal string from a PowerShell-serialized value.
+
+    ConvertTo-Json serializes .NET IPAddress objects as dicts; the reliable
+    human-readable key is 'IPAddressToString'. Falls back to plain str for
+    values that are already strings.
+    """
+    if isinstance(val, dict):
+        ip_str = val.get("IPAddressToString")
+        if ip_str:
+            return str(ip_str)
+        raise ValueError(f"IPAddress dict missing 'IPAddressToString': {val!r}")
+    return str(val)
+
+
 def normalize_list(result) -> list:
     """Normalize PowerShell JSON None/scalar/object/list output into a list."""
     if result is None:
@@ -221,7 +236,7 @@ def extract_option(options: list, option_id: int) -> str:
         if opt.get("OptionId") == option_id:
             values = normalize_list(opt.get("Value"))
             if values:
-                return str(values[0])
+                return _extract_ip_str(values[0])
     return ""
 
 
@@ -237,7 +252,7 @@ def extract_option_list(options: list, option_id: int) -> list[str]:
         if not isinstance(opt, dict):
             continue
         if opt.get("OptionId") == option_id:
-            return [str(v) for v in normalize_list(opt.get("Value"))]
+            return [_extract_ip_str(v) for v in normalize_list(opt.get("Value"))]
     return []
 
 
@@ -298,14 +313,15 @@ def build_payload_from_scope_state(scope_id: str, state: dict[str, Any]) -> Dhcp
             f"Observed DHCP scope {scope_id} is missing required DNS servers"
         )
 
-    # Build sorted exclusions
+    # Build sorted exclusions; skip any non-dict entries (e.g. null from PS)
     exclusions = sorted(
         [
             DhcpExclusion(
-                startAddress=IPv4Address(str(e["StartRange"])),
-                endAddress=IPv4Address(str(e["EndRange"])),
+                startAddress=IPv4Address(_extract_ip_str(e["StartRange"])),
+                endAddress=IPv4Address(_extract_ip_str(e["EndRange"])),
             )
             for e in exclusions_list
+            if isinstance(e, dict)
         ],
         key=lambda x: (ip_to_int(x.startAddress), ip_to_int(x.endAddress)),
     )
@@ -314,9 +330,9 @@ def build_payload_from_scope_state(scope_id: str, state: dict[str, Any]) -> Dhcp
     return DhcpScopePayload(
         scopeName=str(scope.get("Name") or ""),
         network=IPv4Address(scope_id),
-        subnetMask=IPv4Address(str(scope.get("SubnetMask", ""))),
-        startRange=IPv4Address(str(scope.get("StartRange", ""))),
-        endRange=IPv4Address(str(scope.get("EndRange", ""))),
+        subnetMask=IPv4Address(_extract_ip_str(scope.get("SubnetMask", ""))),
+        startRange=IPv4Address(_extract_ip_str(scope.get("StartRange", ""))),
+        endRange=IPv4Address(_extract_ip_str(scope.get("EndRange", ""))),
         leaseDurationDays=lease_days,
         description=str(scope.get("Description") or ""),
         gateway=IPv4Address(raw_gateway) if raw_gateway else None,
