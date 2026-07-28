@@ -67,7 +67,6 @@ dhcp_values:
 | `endRange`          | IPv4         | in subnet, not network/broadcast, >= startRange | Last IP in the DHCP distribution range                               |
 | `leaseDurationDays` | integer      | 1–3650                                          | Lease duration sent to clients                                       |
 | `dns.servers`       | list of IPv4 | at least one required                           | DNS servers sent to clients (DHCP option 6)                          |
-| `dns.domain`        | string       | max 256 chars                                   | DNS search domain sent to clients (DHCP option 15)                   |
 
 ### Optional fields
 
@@ -117,7 +116,7 @@ dns:
   domain: "lab.local"
 ```
 
-If the order in `values.yaml` does not match what the DHCP server has stored, Crossplane will issue a PUT every 60 seconds. Keep the order consistent.
+If the order in `values.yaml` does not match what the DHCP server has stored, Crossplane will issue a single PUT to reorder the DHCP server's option 6 value to match `values.yaml` — after that PUT, GET and desired state agree and reconciliation goes quiet again. This is harmless but still worth avoiding: when adopting a scope that was previously configured manually or by another tool, matching the existing order in `values.yaml` up front avoids an unnecessary write.
 
 At least one DNS server is required by the backend model. `dns.servers: []` is rejected with `422 VALIDATION_ERROR`, and a live DHCP scope observed with no DNS option is treated as invalid managed state.
 

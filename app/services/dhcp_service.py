@@ -204,9 +204,9 @@ async def _check_dhcp_cmdlets() -> None:
             DhcpEnvReason.DHCP_CMDLETS_UNAVAILABLE,
             "DHCP PowerShell cmdlets are not available on this machine. "
             "The command 'Get-DhcpServerv4Scope' was not found. "
-            "Install the DhcpServer PowerShell module: "
-            "on Windows Server, ensure the DHCP Server role is installed; "
-            "on Windows client, install RSAT → Remote Server Administration Tools → DHCP Server Tools. "
+            "This service manages the DHCP server on the local host, so the DHCP Server "
+            "role must be installed here: "
+            "Install-WindowsFeature -Name DHCP -IncludeManagementTools. "
             "Note: PowerShell alone does not imply DHCP cmdlet availability.",
         )
 

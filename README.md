@@ -25,6 +25,14 @@ Git (values files — desired state)
           → Windows DHCP Server
 ```
 
+The API invokes PowerShell as a local subprocess, so it currently runs on the
+Windows DHCP server itself. Whether it should stay there in production, and
+whether it could instead run on Linux over WinRM/PSRP, is analysed in
+[docs/api-host-architecture.md](docs/api-host-architecture.md).
+
+A disposable Windows DHCP test environment for exercising the scope lifecycle
+against real PowerShell lives in [test-env/](test-env/).
+
 ## Repository Layout
 
 ```text
@@ -101,8 +109,11 @@ The API itself requires:
 - Windows host (native Windows, **not** Linux / macOS / WSL)
 - `powershell.exe` on PATH
 - DHCP PowerShell cmdlets (`Get-DhcpServerv4Scope`, etc.)
-  - Windows Server: DHCP Server role or RSAT DHCP tools
-  - Windows client: RSAT DHCP tools
+  - The DHCP Server role installed on this same host:
+    `Install-WindowsFeature -Name DHCP -IncludeManagementTools`
+  - Cmdlets are invoked without `-ComputerName`, so the service always manages
+    the **local** DHCP server. RSAT on an administrative host is not sufficient —
+    it provides the cmdlets but no local DHCP service for them to act on.
 
 The CI validation scripts require only Python 3.12+ and can run on any OS.
 
