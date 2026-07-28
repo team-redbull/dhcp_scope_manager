@@ -39,7 +39,78 @@ try {
     Write-Output 'DHCP cmdlets are discoverable.'
 
     # ------------------------------------------------------------------
-    # 2. Git — resolved from the latest release rather than a pinned URL,
+    # 2. Administrator account — used for RDP and for NTLM over WinRM
+    # ------------------------------------------------------------------
+    Write-Output '=== Configuring Administrator account ==='
+    $securePass = ConvertTo-SecureString '${admin_password}' -AsPlainText -Force
+    Set-LocalUser -Name 'Administrator' -Password $securePass -PasswordNeverExpires $true
+    Enable-LocalUser -Name 'Administrator'
+
+    # Without this, a *local* (non-domain) account authenticating remotely gets
+    # a UAC-filtered token: the session opens but every DhcpServer cmdlet fails
+    # with access denied. Domain accounts are not affected, which is why this
+    # only matters for a standalone workgroup box like this one.
+    New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
+                     -Name 'LocalAccountTokenFilterPolicy' -Value 1 -PropertyType DWord -Force | Out-Null
+
+    # ------------------------------------------------------------------
+    # 3. Remote Desktop — for the DHCP management console (dhcpmgmt.msc)
+    # ------------------------------------------------------------------
+    Write-Output '=== Enabling Remote Desktop ==='
+    Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                     -Name 'fDenyTSConnections' -Value 0
+    # Network Level Authentication on, so RDP is not exposed pre-auth.
+    Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                     -Name 'UserAuthentication' -Value 1
+    Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+    # ------------------------------------------------------------------
+    # 4. WinRM over HTTPS — the PSRP transport the API drives DHCP through
+    # ------------------------------------------------------------------
+    Write-Output '=== Configuring WinRM HTTPS listener ==='
+
+    # Public address, for the certificate subject. IMDSv2 (token required) —
+    # the instance sets http_tokens = "required".
+    $imdsToken = Invoke-RestMethod -Method Put -Uri 'http://169.254.169.254/latest/api/token' `
+        -Headers @{ 'X-aws-ec2-metadata-token-ttl-seconds' = '21600' }
+    $publicIp = Invoke-RestMethod -Uri 'http://169.254.169.254/latest/meta-data/public-ipv4' `
+        -Headers @{ 'X-aws-ec2-metadata-token' = $imdsToken }
+    Write-Output "Public IP for certificate subject: $publicIp"
+
+    Set-Service -Name WinRM -StartupType Automatic
+    Start-Service -Name WinRM
+
+    # Self-signed: there is no CA for a throwaway box, so the client connects
+    # with certificate validation disabled (WINRM_CERT_VALIDATION=false).
+    # That is acceptable here and NOT acceptable in production, where the DHCP
+    # server should present a cert from the internal CA.
+    $cert = New-SelfSignedCertificate -DnsName $publicIp -CertStoreLocation 'Cert:\LocalMachine\My'
+
+    # Drop any listener EC2Launch may have created, so this run is idempotent.
+    Get-ChildItem -Path WSMan:\localhost\Listener |
+        Where-Object { $_.Keys -contains 'Transport=HTTPS' } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+    New-WSManInstance -ResourceURI 'winrm/config/Listener' `
+        -SelectorSet @{ Address = '*'; Transport = 'HTTPS' } `
+        -ValueSet @{ Hostname = $publicIp; CertificateThumbprint = $cert.Thumbprint } | Out-Null
+
+    # Negotiate carries NTLM. Basic stays off, and unencrypted traffic is
+    # refused outright — everything rides the HTTPS listener.
+    Set-Item -Path WSMan:\localhost\Service\Auth\Negotiate     -Value $true
+    Set-Item -Path WSMan:\localhost\Service\Auth\Basic         -Value $false
+    Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted   -Value $false
+
+    New-NetFirewallRule -DisplayName 'WinRM HTTPS (PSRP)' `
+                        -Direction Inbound -Protocol TCP -LocalPort 5986 `
+                        -Action Allow | Out-Null
+
+    Restart-Service -Name WinRM -Force
+    Write-Output 'WinRM HTTPS listener is configured on 5986.'
+
+%{ if install_api ~}
+    # ------------------------------------------------------------------
+    # 5. Git — resolved from the latest release rather than a pinned URL,
     #    which would rot.
     # ------------------------------------------------------------------
     Write-Output '=== Installing Git ==='
@@ -58,7 +129,7 @@ try {
     if (-not (Test-Path $Git)) { throw "Git did not install to the expected path: $Git" }
 
     # ------------------------------------------------------------------
-    # 3. Python 3.12
+    # 6. Python 3.12
     #    Not 3.13 — the pinned pydantic 2.8.0 / pydantic-core pair has no
     #    3.13 wheels and would fall back to a source build.
     # ------------------------------------------------------------------
@@ -78,7 +149,7 @@ try {
     & $python --version
 
     # ------------------------------------------------------------------
-    # 4. Application code
+    # 7. Application code
     # ------------------------------------------------------------------
     Write-Output '=== Cloning application repo ==='
     & $Git clone --branch '${repo_ref}' --depth 1 '${repo_url}' $AppDir
@@ -89,7 +160,7 @@ try {
     }
 
     # ------------------------------------------------------------------
-    # 5. Virtualenv and dependencies
+    # 8. Virtualenv and dependencies
     # ------------------------------------------------------------------
     Write-Output '=== Creating virtualenv and installing dependencies ==='
     & $python -m venv (Join-Path $AppDir '.venv')
@@ -98,7 +169,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "pip install failed with exit code $LASTEXITCODE" }
 
     # ------------------------------------------------------------------
-    # 6. Configuration
+    # 9. Configuration
     #    Read by pydantic-settings from the working directory (app/config.py).
     # ------------------------------------------------------------------
     Write-Output '=== Writing .env ==='
@@ -107,13 +178,14 @@ try {
         "PORT=$ApiPort"
         'LOG_LEVEL=INFO'
         'DHCP_API_TOKEN=${api_token}'
+        'DHCP_TRANSPORT=local'
     )
     # ASCII, not the UTF-8-with-BOM that Set-Content defaults to on PS 5.1 —
     # a BOM would end up inside the first key name.
     Set-Content -Path (Join-Path $AppDir '.env') -Value $envLines -Encoding ASCII
 
     # ------------------------------------------------------------------
-    # 7. Firewall
+    # 10. Firewall
     # ------------------------------------------------------------------
     Write-Output '=== Opening firewall port ==='
     New-NetFirewallRule -DisplayName 'DHCP Scope Manager API' `
@@ -121,8 +193,8 @@ try {
                         -Action Allow | Out-Null
 
     # ------------------------------------------------------------------
-    # 8. Run the API as a scheduled task
-    #    SYSTEM is a local administrator, which the DhcpServer cmdlets require.
+    # 11. Run the API as a scheduled task
+    #     SYSTEM is a local administrator, which the DhcpServer cmdlets require.
     # ------------------------------------------------------------------
     Write-Output '=== Registering DhcpScopeApi scheduled task ==='
     $startScript = Join-Path $AppDir 'start-api.ps1'
@@ -146,7 +218,7 @@ Set-Location '$AppDir'
     Start-ScheduledTask -TaskName 'DhcpScopeApi'
 
     # ------------------------------------------------------------------
-    # 9. Refresh helper — pull new code and restart, for the edit/test loop
+    # 12. Refresh helper — pull new code and restart, for the edit/test loop
     # ------------------------------------------------------------------
     @"
 & '$Git' -C '$AppDir' pull --ff-only
@@ -156,7 +228,7 @@ Write-Output 'Refreshed. Tail C:\api.log to confirm.'
 "@ | Set-Content -Path 'C:\refresh-app.ps1' -Encoding ASCII
 
     # ------------------------------------------------------------------
-    # 10. Smoke check
+    # 13. Smoke check
     # ------------------------------------------------------------------
     Write-Output '=== Waiting for /healthz ==='
     $healthy = $false
@@ -178,6 +250,12 @@ Write-Output 'Refreshed. Tail C:\api.log to confirm.'
     if (-not $healthy) {
         throw 'API did not report healthy within 60s — see C:\api.log'
     }
+%{ else ~}
+    # The API is not installed here: it runs on Linux and drives this host over
+    # PSRP. This box is a DHCP server plus a WinRM endpoint, nothing more, so
+    # the bootstrap has no dependency on the application repo.
+    Write-Output '=== Skipping API install (install_api = false) ==='
+%{ endif ~}
 
     'bootstrap completed successfully' | Set-Content -Path 'C:\bootstrap-complete.txt'
     Write-Output '=== BOOTSTRAP COMPLETE ==='
