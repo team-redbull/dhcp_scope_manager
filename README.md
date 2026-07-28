@@ -194,6 +194,41 @@ A `.env` file in the repo root is also supported.
 uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
 
+### Container
+
+```bash
+docker build -t dhcp-scope-manager .
+docker run -p 8080:8080 \
+  -e DHCP_TRANSPORT=psrp -e DHCP_SERVER_HOST=<windows-dhcp-host> \
+  -e WINRM_AUTH=ntlm -e WINRM_USERNAME=Administrator \
+  -e WINRM_PASSWORD=<password> -e WINRM_CERT_VALIDATION=false \
+  dhcp-scope-manager
+```
+
+The image is Linux-only and contains no PowerShell — it is built for
+`DHCP_TRANSPORT=psrp`, where the cmdlets execute on the remote Windows host.
+Kerberos client libraries are included so switching `WINRM_AUTH` to `kerberos`
+is a config change rather than a rebuild.
+
+It runs as an arbitrary UID with GID 0, which is what OpenShift's `restricted-v2`
+SCC assigns — so it does **not** depend on the `USER` in the Dockerfile being the
+UID it actually gets.
+
+### Deployment
+
+Pushes are built and published to `ghcr.io/team-redbull/dhcp-scope-manager` by
+the org-wide reusable workflow (`team-redbull/.github`), which also bumps the
+image tag in the chart repo.
+
+| | |
+|---|---|
+| Chart | `team-redbull/helm-charts-dhcp-scope-manager` |
+| Argo app | `gitops/services/prod/dhcp-scope-manager` in `redbull-platform` |
+| Namespace | `dhcp-scope-manager` |
+
+The chart deliberately keeps the WinRM password in a Secret rather than in
+values; see the chart's README.
+
 ## API Endpoints
 
 Base path: `/api/v1`
