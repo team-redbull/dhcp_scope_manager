@@ -1,0 +1,194 @@
+<powershell>
+# Rendered by Terraform (test-env/bootstrap.ps1.tftpl) and executed once by
+# EC2Launch v2 on first boot. Terraform owns $${...} interpolation, so every
+# PowerShell variable below uses the bare $name form on purpose.
+#
+# Progress log: C:\bootstrap.log
+# Success marker: C:\bootstrap-complete.txt   (failure marker: C:\bootstrap-FAILED.txt)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'  # Invoke-WebRequest is ~10x faster without it
+
+Start-Transcript -Path 'C:\bootstrap.log' -Append
+
+$AppDir  = 'C:\dhcp_scope_manager'
+$VenvPy  = Join-Path $AppDir '.venv\Scripts\python.exe'
+$Git     = 'C:\Program Files\Git\cmd\git.exe'
+$ApiPort = ${api_port}
+
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    # ------------------------------------------------------------------
+    # 1. DHCP Server role
+    # ------------------------------------------------------------------
+    Write-Output '=== Installing DHCP Server role ==='
+    Install-WindowsFeature -Name DHCP -IncludeManagementTools
+
+    # Standalone workgroup server: no Active Directory, so no authorization
+    # step. Create the local DHCP admin groups and mark the role configured,
+    # otherwise the role keeps reporting as pending post-install config.
+    netsh dhcp add securitygroups
+    Set-Service -Name dhcpserver -StartupType Automatic
+    Restart-Service -Name dhcpserver -Force
+    Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12' `
+                     -Name ConfigurationState -Value 2
+
+    # Same check the API runs at startup (app/services/dhcp_service.py).
+    Get-Command Get-DhcpServerv4Scope -ErrorAction Stop | Out-Null
+    Write-Output 'DHCP cmdlets are discoverable.'
+
+    # ------------------------------------------------------------------
+    # 2. Git — resolved from the latest release rather than a pinned URL,
+    #    which would rot.
+    # ------------------------------------------------------------------
+    Write-Output '=== Installing Git ==='
+    $rel = Invoke-RestMethod -UseBasicParsing `
+        -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest' `
+        -Headers @{ 'User-Agent' = 'dhcp-scope-test-bootstrap' }
+    $asset = $rel.assets |
+        Where-Object { $_.name -like 'Git-*-64-bit.exe' } |
+        Select-Object -First 1
+    if (-not $asset) { throw 'Could not resolve a Git for Windows 64-bit installer' }
+
+    $gitInstaller = 'C:\Windows\Temp\git-installer.exe'
+    Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $gitInstaller
+    Start-Process -FilePath $gitInstaller -Wait -NoNewWindow `
+        -ArgumentList '/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-'
+    if (-not (Test-Path $Git)) { throw "Git did not install to the expected path: $Git" }
+
+    # ------------------------------------------------------------------
+    # 3. Python 3.12
+    #    Not 3.13 — the pinned pydantic 2.8.0 / pydantic-core pair has no
+    #    3.13 wheels and would fall back to a source build.
+    # ------------------------------------------------------------------
+    Write-Output '=== Installing Python 3.12 ==='
+    $pyInstaller = 'C:\Windows\Temp\python-installer.exe'
+    Invoke-WebRequest -UseBasicParsing `
+        -Uri 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' `
+        -OutFile $pyInstaller
+    Start-Process -FilePath $pyInstaller -Wait -NoNewWindow -ArgumentList @(
+        '/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_pip=1', 'Include_test=0'
+    )
+
+    $python = 'C:\Program Files\Python312\python.exe'
+    if (-not (Test-Path $python)) {
+        throw "Python did not install to the expected path: $python"
+    }
+    & $python --version
+
+    # ------------------------------------------------------------------
+    # 4. Application code
+    # ------------------------------------------------------------------
+    Write-Output '=== Cloning application repo ==='
+    & $Git clone --branch '${repo_ref}' --depth 1 '${repo_url}' $AppDir
+    if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
+
+    if (-not (Test-Path (Join-Path $AppDir 'app\main.py'))) {
+        throw "Clone did not contain app\main.py"
+    }
+
+    # ------------------------------------------------------------------
+    # 5. Virtualenv and dependencies
+    # ------------------------------------------------------------------
+    Write-Output '=== Creating virtualenv and installing dependencies ==='
+    & $python -m venv (Join-Path $AppDir '.venv')
+    & $VenvPy -m pip install --upgrade pip
+    & $VenvPy -m pip install -r (Join-Path $AppDir 'requirements.txt')
+    if ($LASTEXITCODE -ne 0) { throw "pip install failed with exit code $LASTEXITCODE" }
+
+    # ------------------------------------------------------------------
+    # 6. Configuration
+    #    Read by pydantic-settings from the working directory (app/config.py).
+    # ------------------------------------------------------------------
+    Write-Output '=== Writing .env ==='
+    $envLines = @(
+        'HOST=0.0.0.0'
+        "PORT=$ApiPort"
+        'LOG_LEVEL=INFO'
+        'DHCP_API_TOKEN=${api_token}'
+    )
+    # ASCII, not the UTF-8-with-BOM that Set-Content defaults to on PS 5.1 —
+    # a BOM would end up inside the first key name.
+    Set-Content -Path (Join-Path $AppDir '.env') -Value $envLines -Encoding ASCII
+
+    # ------------------------------------------------------------------
+    # 7. Firewall
+    # ------------------------------------------------------------------
+    Write-Output '=== Opening firewall port ==='
+    New-NetFirewallRule -DisplayName 'DHCP Scope Manager API' `
+                        -Direction Inbound -Protocol TCP -LocalPort $ApiPort `
+                        -Action Allow | Out-Null
+
+    # ------------------------------------------------------------------
+    # 8. Run the API as a scheduled task
+    #    SYSTEM is a local administrator, which the DhcpServer cmdlets require.
+    # ------------------------------------------------------------------
+    Write-Output '=== Registering DhcpScopeApi scheduled task ==='
+    $startScript = Join-Path $AppDir 'start-api.ps1'
+    @"
+Set-Location '$AppDir'
+& '$VenvPy' -m uvicorn app.main:app --host 0.0.0.0 --port $ApiPort *>> 'C:\api.log'
+"@ | Set-Content -Path $startScript -Encoding ASCII
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$startScript`""
+    $trigger   = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
+        -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+
+    Register-ScheduledTask -TaskName 'DhcpScopeApi' -Force `
+        -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
+    Start-ScheduledTask -TaskName 'DhcpScopeApi'
+
+    # ------------------------------------------------------------------
+    # 9. Refresh helper — pull new code and restart, for the edit/test loop
+    # ------------------------------------------------------------------
+    @"
+& '$Git' -C '$AppDir' pull --ff-only
+& '$VenvPy' -m pip install -r '$AppDir\requirements.txt'
+Restart-ScheduledTask -TaskName DhcpScopeApi
+Write-Output 'Refreshed. Tail C:\api.log to confirm.'
+"@ | Set-Content -Path 'C:\refresh-app.ps1' -Encoding ASCII
+
+    # ------------------------------------------------------------------
+    # 10. Smoke check
+    # ------------------------------------------------------------------
+    Write-Output '=== Waiting for /healthz ==='
+    $healthy = $false
+    foreach ($attempt in 1..30) {
+        Start-Sleep -Seconds 2
+        try {
+            $resp = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 `
+                -Uri "http://127.0.0.1:$ApiPort/healthz"
+            if ($resp.StatusCode -eq 200) {
+                Write-Output "healthz OK: $($resp.Content)"
+                $healthy = $true
+                break
+            }
+        }
+        catch {
+            Write-Output "attempt $attempt : not up yet"
+        }
+    }
+    if (-not $healthy) {
+        throw 'API did not report healthy within 60s — see C:\api.log'
+    }
+
+    'bootstrap completed successfully' | Set-Content -Path 'C:\bootstrap-complete.txt'
+    Write-Output '=== BOOTSTRAP COMPLETE ==='
+}
+catch {
+    $_ | Out-String | Set-Content -Path 'C:\bootstrap-FAILED.txt'
+    Write-Output "=== BOOTSTRAP FAILED: $($_.Exception.Message) ==="
+    throw
+}
+finally {
+    Stop-Transcript
+}
+</powershell>
+<persist>false</persist>
