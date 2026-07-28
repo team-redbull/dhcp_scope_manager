@@ -22,6 +22,9 @@ class DhcpEnvReason:
     POWERSHELL_NOT_FOUND = "powershell_not_found"
     POWERSHELL_EXEC_FAILED = "powershell_exec_failed"
     DHCP_CMDLETS_UNAVAILABLE = "dhcp_cmdlets_unavailable"
+    # psrp transport only
+    PSRP_DEPENDENCY_MISSING = "psrp_dependency_missing"
+    PSRP_CONNECTION_FAILED = "psrp_connection_failed"
 
 
 class DhcpEnvironmentError(Exception):

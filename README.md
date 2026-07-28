@@ -103,7 +103,12 @@ tests/
 
 ## Runtime Requirements
 
-The API itself requires:
+The DHCP server is always Windows. What varies is where the API runs, selected
+by `DHCP_TRANSPORT`.
+
+### `DHCP_TRANSPORT=local` (default)
+
+API and DHCP server on the same Windows host:
 
 - Python 3.12+
 - Windows host (native Windows, **not** Linux / macOS / WSL)
@@ -114,6 +119,26 @@ The API itself requires:
   - Cmdlets are invoked without `-ComputerName`, so the service always manages
     the **local** DHCP server. RSAT on an administrative host is not sufficient —
     it provides the cmdlets but no local DHCP service for them to act on.
+
+This is what `test-env/` deploys.
+
+### `DHCP_TRANSPORT=psrp`
+
+API on Linux, DHCP server on a separate Windows host:
+
+- Python 3.12+ on any OS (Linux in production)
+- `pypsrp` installed (already in `requirements.txt`)
+- Network reachability to `DHCP_SERVER_HOST` on `WINRM_PORT` (5986/HTTPS —
+  a single port, unlike the dynamic RPC range that `-ComputerName` needs)
+- WinRM enabled on the DHCP server, with the DHCP Server role installed **there**
+- Kerberos: a working `krb5.conf`, a keytab or credential cache, correct SPNs,
+  and clock skew within tolerance
+
+No PowerShell runs on the API host. Script text is sent to the Windows server,
+which executes it in a real Windows runspace and returns a JSON string — so the
+`DhcpServer` module is never needed locally. See
+[docs/api-host-architecture.md](docs/api-host-architecture.md) for the full
+rationale.
 
 The CI validation scripts require only Python 3.12+ and can run on any OS.
 
@@ -137,6 +162,30 @@ pip install -r requirements.txt
 | `POWERSHELL_ENV_CHECK_TIMEOUT_SECONDS` | `15`      | Timeout for PowerShell startup/cmdlet availability checks.    |
 | `POWERSHELL_MAX_CONCURRENCY`           | `10`      | Maximum concurrent PowerShell commands across all requests.   |
 
+### Transport
+
+| Variable                            | Default   | Description                                                                       |
+| ----------------------------------- | --------- | --------------------------------------------------------------------------------- |
+| `DHCP_TRANSPORT`                    | `local`   | `local` = spawn `powershell.exe` here. `psrp` = run cmdlets on a remote Windows host. |
+| `DHCP_SERVER_HOST`                  | _(empty)_ | Target DHCP server. **Required** when `DHCP_TRANSPORT=psrp`.                       |
+| `WINRM_PORT`                        | `5986`    | WinRM port.                                                                       |
+| `WINRM_USE_SSL`                     | `true`    | Use HTTPS for WinRM.                                                              |
+| `WINRM_AUTH`                        | `kerberos`| `kerberos` or `ntlm`.                                                             |
+| `WINRM_USERNAME`                    | _(empty)_ | Required for `ntlm`. Optional for `kerberos` (an explicit principal).             |
+| `WINRM_PASSWORD`                    | _(empty)_ | Required for `ntlm`. Leave unset with Kerberos — no password is stored.           |
+| `WINRM_CERT_VALIDATION`             | `true`    | Validate the WinRM TLS certificate.                                               |
+| `WINRM_CONNECTION_TIMEOUT_SECONDS`  | `30`      | WinRM connection timeout.                                                         |
+
+`DHCP_SERVER_HOST` is deliberately a single explicit host, not a DNS alias or
+load balancer. Under failover either peer can answer a read, and replication lag
+or drift on the partner would make `GET` differ from the desired `PUT` body —
+Crossplane would then issue corrective `PUT`s in a loop. See
+[Reconciliation Contract](#reconciliation-contract).
+
+Misconfiguration fails at startup, not per request: `DHCP_TRANSPORT=psrp`
+without `DHCP_SERVER_HOST`, or `WINRM_AUTH=ntlm` without credentials, raises
+immediately.
+
 A `.env` file in the repo root is also supported.
 
 ## Run the API
@@ -154,7 +203,7 @@ Base path: `/api/v1`
 All `/api/v1/scopes*` endpoints share two implicit checks that run before the handler:
 
 - **Auth** — rejects requests when `DHCP_API_TOKEN` is set and the token is missing or wrong. Returns `401`.
-- **Environment guard** — rejects requests when the host cannot execute DHCP automation (wrong OS, missing PowerShell, no DHCP cmdlets). Returns `503`.
+- **Environment guard** — rejects requests when DHCP automation cannot run. Under `local` that means the wrong OS, missing PowerShell, or no DHCP cmdlets; under `psrp` it means `pypsrp` missing, WinRM unreachable or unauthenticated, or no DHCP cmdlets on the target host. Returns `503`.
 
 Scope APIs use a real async execution path:
 

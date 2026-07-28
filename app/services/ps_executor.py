@@ -6,6 +6,7 @@ import time
 from app.config import settings
 from app.errors import PowerShellError, PowerShellExecutionError, PowerShellTimeoutError, sanitize_powershell_text
 from app.services import dhcp_service
+from app.services.ps_transport import get_transport
 
 logger = logging.getLogger(__name__)
 
@@ -87,27 +88,14 @@ async def run_ps(
     }
     logger.info("Running DHCP PowerShell command", extra=log_extra)
 
-    process: asyncio.subprocess.Process | None = None
     t0 = time.monotonic()
     try:
         async with _get_powershell_semaphore():
-            process = await asyncio.create_subprocess_exec(
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
+            result = await get_transport().execute(
                 full_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
-                timeout=settings.POWERSHELL_COMMAND_TIMEOUT_SECONDS,
+                settings.POWERSHELL_COMMAND_TIMEOUT_SECONDS,
             )
     except asyncio.TimeoutError as exc:
-        if process is not None and process.returncode is None:
-            process.kill()
-            await process.wait()
         raise PowerShellTimeoutError(
             command,
             settings.POWERSHELL_COMMAND_TIMEOUT_SECONDS,
@@ -115,25 +103,25 @@ async def run_ps(
             scope_id=scope_id,
         ) from exc
 
-    stdout = stdout_bytes.decode(errors="replace")
-    stderr = stderr_bytes.decode(errors="replace")
+    stdout = result.stdout
+    stderr = result.stderr
     duration_ms = round((time.monotonic() - t0) * 1000, 2)
 
-    if process.returncode != 0:
+    if result.returncode != 0:
         logger.error(
             "DHCP PowerShell command failed",
             extra={
                 **log_extra,
                 "duration_ms": duration_ms,
                 "status": "failed",
-                "returncode": process.returncode,
+                "returncode": result.returncode,
                 "stderr_preview": sanitize_powershell_text(stderr.strip()),
             },
         )
         raise PowerShellExecutionError(
             command,
             stderr.strip(),
-            process.returncode or 1,
+            result.returncode or 1,
             operation=operation,
             scope_id=scope_id,
         )

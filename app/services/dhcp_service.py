@@ -1,15 +1,23 @@
 """DHCP automation environment validator.
 
-Validates that the current runtime is capable of executing DHCP operations
-through Windows PowerShell. Two concerns are enforced here so no other module
-needs ad-hoc environment awareness:
+Validates that the current runtime can execute DHCP operations, so no other
+module needs ad-hoc environment awareness. What gets checked depends on the
+configured transport:
 
+``local`` — PowerShell runs on this host:
   1. OS / execution context  — native Windows only; WSL/Linux/macOS rejected.
   2. PowerShell availability — powershell.exe exists and can execute.
   3. DHCP cmdlet availability — the DhcpServer module cmdlets are discoverable.
 
+``psrp`` — PowerShell runs on a remote Windows DHCP server:
+  1. The pypsrp dependency is installed.
+  2. A WinRM session to DHCP_SERVER_HOST opens and authenticates.
+  3. The DhcpServer cmdlets are discoverable *on that remote host*.
+
+There is deliberately no OS check under psrp — running on Linux is the point.
+
 Results are cached after the first call (async-safe). Callers only pay the
-subprocess cost once per process lifetime.
+check cost once per process lifetime.
 
 For testing, call _reset_validation_cache() to clear the cache between tests.
 """
@@ -204,10 +212,50 @@ async def _check_dhcp_cmdlets() -> None:
             DhcpEnvReason.DHCP_CMDLETS_UNAVAILABLE,
             "DHCP PowerShell cmdlets are not available on this machine. "
             "The command 'Get-DhcpServerv4Scope' was not found. "
-            "This service manages the DHCP server on the local host, so the DHCP Server "
-            "role must be installed here: "
+            "With DHCP_TRANSPORT='local' this service manages the DHCP server on "
+            "the local host, so the DHCP Server role must be installed here: "
             "Install-WindowsFeature -Name DHCP -IncludeManagementTools. "
+            "To manage a remote DHCP server from this host instead, set "
+            "DHCP_TRANSPORT='psrp' and DHCP_SERVER_HOST. "
             "Note: PowerShell alone does not imply DHCP cmdlet availability.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Remote (psrp) environment check
+# ---------------------------------------------------------------------------
+
+async def _check_psrp_target() -> None:
+    """Verify the remote DHCP server is reachable and exposes the DHCP cmdlets.
+
+    Runs Get-Command on the target host over PSRP. A single call proves the
+    whole chain at once: pypsrp is installed, WinRM accepts the connection,
+    authentication succeeds, and the DhcpServer module is present *there*.
+
+    Connection and dependency failures already surface as DhcpEnvironmentError
+    from the transport, with their own reason codes.
+    """
+    from app.services.ps_transport import get_transport
+
+    try:
+        result = await get_transport().execute(
+            "Get-Command Get-DhcpServerv4Scope -ErrorAction Stop | Out-Null",
+            settings.POWERSHELL_ENV_CHECK_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise DhcpEnvironmentError(
+            DhcpEnvReason.POWERSHELL_EXEC_FAILED,
+            f"Timed out checking for DHCP cmdlets on {settings.DHCP_SERVER_HOST!r}. "
+            "The host may be unreachable or overloaded.",
+        )
+
+    if result.returncode != 0:
+        raise DhcpEnvironmentError(
+            DhcpEnvReason.DHCP_CMDLETS_UNAVAILABLE,
+            f"DHCP PowerShell cmdlets are not available on the target host "
+            f"{settings.DHCP_SERVER_HOST!r}. The command 'Get-DhcpServerv4Scope' "
+            "was not found there. Ensure the DHCP Server role is installed on "
+            "that host: Install-WindowsFeature -Name DHCP -IncludeManagementTools.",
         )
 
 
@@ -248,9 +296,12 @@ async def validate_dhcp_environment() -> None:
         # Run all checks inside the lock to prevent duplicate PowerShell checks
         # under concurrent startup traffic.
         try:
-            _check_os()
-            await _check_powershell_binary()
-            await _check_dhcp_cmdlets()
+            if settings.is_psrp:
+                await _check_psrp_target()
+            else:
+                _check_os()
+                await _check_powershell_binary()
+                await _check_dhcp_cmdlets()
         except DhcpEnvironmentError as exc:
             logger.error(
                 "DHCP environment validation failed [%s]: %s", exc.reason, exc.detail

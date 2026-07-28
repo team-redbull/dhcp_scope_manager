@@ -1,7 +1,10 @@
 # Where the API Runs: Host Architecture and the Linux/PSRP Question
 
-**Status:** Analysis and recommendation. Not implemented.
-**Date:** 2026-07-27
+**Status:** Implemented on `refactor/linux-api` as of 2026-07-28. Option C is
+available behind `DHCP_TRANSPORT=psrp`; `local` remains the default, so the
+co-located test environment is unaffected. The Kerberos spike in §9 has **not**
+been run — do that before switching production over.
+**Date:** 2026-07-27 (analysis), 2026-07-28 (implementation)
 **Scope:** Where the FastAPI service should run in production, and whether it
 can run on Linux.
 
@@ -262,24 +265,52 @@ remains available and the analysis above still holds.
 
 ---
 
-## 10. Implementation sketch for the future branch
+## 10. What was implemented
 
-Confined surface. Everything else stays put.
+Confined surface, as predicted. Everything else stayed put.
 
-| Change                                     | Location                              |
-| ------------------------------------------- | ------------------------------------- |
-| Replace subprocess with PSRP client         | body of `run_ps()`, `ps_executor.py:47` |
-| Replace local binary/cmdlet checks          | `dhcp_service.py:117-211`             |
-| Add target host + auth settings             | `app/config.py`                       |
-| Runspace pool lifecycle, tied to app startup| new module, e.g. `app/services/psrp_pool.py` |
-| Pin `pypsrp`                                | `requirements.txt`                    |
+| Change                                       | Location                        |
+| -------------------------------------------- | ------------------------------- |
+| Transport abstraction + local subprocess impl | `app/services/ps_transport.py` (new) |
+| PSRP transport and runspace pool              | `app/services/psrp_pool.py` (new)    |
+| `run_ps` delegates execution to the transport | `app/services/ps_executor.py`        |
+| Transport-aware environment checks            | `app/services/dhcp_service.py`       |
+| Target host + auth settings, validated at startup | `app/config.py`                  |
+| Pool teardown on shutdown                     | `app/main.py` (lifespan)             |
+| Pin `pypsrp==0.9.1` (lazy import)             | `requirements.txt`                   |
+
+Rather than replacing the subprocess call, `run_ps` now calls
+`get_transport().execute(...)`. Both transports return a `PsResult`
+(`returncode`, `stdout`, `stderr`) and both raise `asyncio.TimeoutError` on
+timeout, so the JSON parsing, error classification, logging, and
+`PowerShellError` mapping in `run_ps` are shared verbatim. PSRP has no process
+exit code, so an error stream is normalised to `returncode=1` — which keeps
+`is_not_found_error()` / `is_already_exists_error()` matching on the same text.
 
 **Explicitly unchanged:** `ps_parsers.py`, `scope_service.py`, all models, all
 routers, the canonical payload shape, and every invariant in CLAUDE.md §2.
 
-**Test strategy:** the existing 585 tests mock at or below `run_ps`, so they
-should continue to pass unmodified. Treat any test that requires changing as a
-signal that the abstraction boundary leaked.
+**Test result:** all 585 pre-existing tests passed **unmodified**, confirming
+the abstraction boundary did not leak. 38 new tests cover transport selection,
+settings validation, connection arguments, PSRP result mapping, pool
+reuse/discard/timeout behaviour, the remote environment check, and `run_ps`
+end-to-end over PSRP — including that `IPAddressToString` dicts still reach
+`_extract_ip_str()` intact. Total: 623.
+
+### Known limitations
+
+- **Not yet run against a real Windows host.** The pypsrp interaction is
+  covered only by fakes. The §9 spike remains the gate for production.
+- **`asyncio.wait_for` cannot cancel a blocked worker thread.** On timeout the
+  runspace is discarded rather than reused and closed in the background, so the
+  caller sees the timeout immediately; the underlying thread may linger until
+  WinRM I/O unblocks.
+- **§7.3 resolved conservatively:** helpers stay inlined per call, so pooled
+  runspaces share no state and current semantics are preserved exactly. Pool
+  size is bounded implicitly by `POWERSHELL_MAX_CONCURRENCY` via the existing
+  semaphore in `run_ps`.
+- **§8 resolved:** `DHCP_SERVER_HOST` is a single explicit host. Behaviour when
+  it is unreachable is fail-closed (503), consistent with delete semantics.
 
 ---
 
