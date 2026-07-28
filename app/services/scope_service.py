@@ -27,6 +27,16 @@ def _scope_extra(scope_id: str, operation: str, **extra: object) -> dict[str, ob
 
 
 def _set_options_command(scope_literal: str, payload: DhcpScopePayload) -> str:
+    # -Force is required, not cosmetic. Set-DhcpServerv4OptionValue validates
+    # that each -DnsServer is a resolvable DNS server and rejects the whole call
+    # otherwise ("10.10.1.5 is not a valid DNS server"), which aborts scope
+    # creation before exclusions are ever applied.
+    #
+    # Desired state comes from Git and is authoritative, so the API must apply
+    # it rather than second-guess reachability from the DHCP server. Without
+    # -Force a DNS server that is merely unreachable at that moment — or simply
+    # not resolvable from this host — permanently blocks reconciliation, and
+    # Crossplane retries the same failing POST forever.
     cmd = (
         f"Set-DhcpServerv4OptionValue -ScopeId {scope_literal} "
         f"-DnsServer {ps_ipv4_csv(payload.dnsServers)} "
@@ -34,7 +44,7 @@ def _set_options_command(scope_literal: str, payload: DhcpScopePayload) -> str:
     )
     if payload.gateway is not None:
         cmd += f" -Router {ps_ipv4(payload.gateway)}"
-    return cmd
+    return cmd + " -Force"
 
 
 # ---------------------------------------------------------------------------

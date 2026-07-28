@@ -28,6 +28,51 @@ logger = logging.getLogger(__name__)
 # expire before the server has had a chance to report the operation timeout.
 _READ_TIMEOUT_MARGIN_SECS = 10
 
+# System.Management.Automation.ErrorCategory. PSRP transmits the category as an
+# integer; console PowerShell prints the name. Only the values this project
+# classifies on are mapped by name — anything else falls back to the number,
+# which is still better than dropping it.
+_ERROR_CATEGORY_NAMES = {
+    5: "InvalidArgument",
+    6: "InvalidData",
+    7: "InvalidOperation",
+    13: "ObjectNotFound",
+    18: "PermissionDenied",
+    20: "ResourceExists",
+    21: "ResourceUnavailable",
+    28: "AuthenticationError",
+}
+
+
+def _format_error_record(err: object) -> str:
+    """Render a PSRP ErrorRecord the way console PowerShell writes it to stderr.
+
+    This is a parity requirement, not cosmetics. The local transport's stderr
+    carries CategoryInfo and FullyQualifiedErrorId lines, and error
+    classification in ps_executor depends on them: real DhcpServer messages
+    ("Failed to get scope information for scope X") contain no not-found wording
+    at all, so the category is the only reliable signal. Returning just the
+    message here would make the same DHCP error classify differently depending
+    on which transport ran it.
+    """
+    message = str(getattr(err, "message", "") or "").strip()
+    if not message:
+        exception = getattr(err, "exception", None)
+        message = str(getattr(exception, "Message", "") or exception or err).strip()
+
+    lines = [message]
+
+    category = getattr(err, "category", None)
+    if category is not None:
+        name = _ERROR_CATEGORY_NAMES.get(category, str(category))
+        lines.append(f"    + CategoryInfo          : {name}")
+
+    fq_error = getattr(err, "fq_error", None)
+    if fq_error:
+        lines.append(f"    + FullyQualifiedErrorId : {fq_error}")
+
+    return "\n".join(lines)
+
 
 def _import_pypsrp():
     """Import pypsrp lazily so the local transport never requires it installed."""
@@ -115,7 +160,7 @@ class _Runspace:
             return PsResult(
                 returncode=1,
                 stdout=stdout,
-                stderr="\n".join(str(err) for err in errors),
+                stderr="\n".join(_format_error_record(err) for err in errors),
             )
         return PsResult(returncode=0, stdout=stdout, stderr="")
 

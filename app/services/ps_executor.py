@@ -33,16 +33,51 @@ def _get_powershell_semaphore() -> asyncio.Semaphore:
     return _semaphore
 
 
+# The DhcpServer module does not describe failures in its messages: a missing
+# scope reports "Failed to get scope information for scope 10.20.30.0 on DHCP
+# server HOST", which contains no not-found wording at all. Matching on prose
+# alone therefore misclassifies every real DHCP error as a hard failure — GET
+# returns 500 instead of 404 and Crossplane never learns to POST.
+#
+# The reliable signals are the PowerShell error category and the DHCP error
+# number, both of which appear in stderr (console PowerShell prints them; the
+# PSRP transport reproduces them in _format_error_record). They are also
+# locale-independent, unlike the message text.
+#
+# Codes confirmed against Windows Server 2022, DHCP server version 10.0.
+_NOT_FOUND_MARKERS = (
+    "objectnotfound",   # category: missing scope, unset option, absent failover
+    "dhcp 20005",       # scope not found
+    "dhcp 20010",       # option value not set on scope
+    "dhcp 20116",       # no failover relationship for scope
+    # Retained for other cmdlets and older builds that do phrase it plainly.
+    "not found",
+    "does not exist",
+    "no dhcp scope",
+    "cannot find",
+)
+
+_ALREADY_EXISTS_MARKERS = (
+    "resourceexists",   # category: duplicate scope
+    "dhcp 20052",       # scope already exists
+    "dhcp 20023",       # exclusion range already present (category is InvalidData,
+                        # which is too broad to match on, so match the code)
+    "already exists",
+    "already been added",
+    "already in use",
+)
+
+
 def is_not_found_error(stderr: str) -> bool:
     """Return True if PowerShell stderr indicates the requested object does not exist."""
     lower = stderr.lower()
-    return any(kw in lower for kw in ("not found", "does not exist", "no dhcp scope", "cannot find"))
+    return any(kw in lower for kw in _NOT_FOUND_MARKERS)
 
 
 def is_already_exists_error(stderr: str) -> bool:
     """Return True if PowerShell stderr indicates the object already exists."""
     lower = stderr.lower()
-    return any(kw in lower for kw in ("already exists", "already been added", "already in use"))
+    return any(kw in lower for kw in _ALREADY_EXISTS_MARKERS)
 
 
 async def run_ps(
