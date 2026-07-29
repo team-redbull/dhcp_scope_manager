@@ -152,9 +152,9 @@ async def test_different_scope_locks_allow_parallel_operations():
     active = 0
     max_active = 0
 
-    async def worker(scope_id: str):
+    async def worker(scope: str):
         nonlocal active, max_active
-        async with locks.lock(scope_id):
+        async with locks.lock(scope):
             active += 1
             max_active = max(max_active, active)
             await asyncio.sleep(0.01)

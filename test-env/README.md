@@ -65,7 +65,6 @@ API=$(terraform output -raw api_base_url)
 create() {  # create() <network> <name>
   curl -s -X POST "$API/api/v1/scopes/$1" -H 'Content-Type: application/json' -d "{
     \"scopeName\": \"$2\",
-    \"network\": \"$1\",
     \"subnetMask\": \"255.255.255.0\",
     \"startRange\": \"$${1%.0}.50\",
     \"endRange\": \"$${1%.0}.200\",
@@ -84,7 +83,7 @@ create 192.168.50.0 cluster-b
 create 172.16.99.0  cluster-c
 
 create 10.20.30.0  cluster-a            # idempotent: must not fail (§2)
-curl -s "$API/api/v1/scopes"            # sorted by network address (§5)
+curl -s "$API/api/v1/scopes"            # sorted by scope address; items carry "scope" (§5)
 curl -s "$API/api/v1/scopes/10.20.30.0" # must round-trip the POST body (§9)
 curl -i -X DELETE "$API/api/v1/scopes/10.20.30.0"
 curl -i -X DELETE "$API/api/v1/scopes/10.20.30.0"  # 204 again (§2)
@@ -121,8 +120,9 @@ replaces the instance (`user_data_replace_on_change = true`).
 
 ## Troubleshooting
 
-Access is via SSM Session Manager — no RDP, no key pair, no inbound admin port.
-Server Core has no GUI, so this is the only shell.
+Two ways in, neither needing a key pair: SSM Session Manager for a shell (no
+inbound port at all), and RDP on 3389 from `rdp_allowed_cidr` for the DHCP
+management console (`dhcpmgmt.msc`).
 
 | Path                        | Contents                                     |
 | --------------------------- | -------------------------------------------- |
@@ -139,20 +139,38 @@ Get-Service dhcpserver
 
 ## Cost and teardown
 
-`t3.small` Windows runs roughly **$0.03/hour** (region-dependent), plus about
-**$2.40/month** for the 30 GB gp3 volume. Nothing here is free-tier eligible —
-Windows AMIs never are.
+`t3.small` Windows runs roughly **$0.04/hour** (region-dependent). Nothing here
+is free-tier eligible — Windows AMIs never are.
 
-The instance is the entire cost, so stop it between sessions and pay only for
-the disk:
+Stop the instance between sessions. Compute and the Windows licence both stop
+billing; the disk and the Elastic IP do not:
 
 ```bash
 terraform output -raw stop_command    # then start_command to resume
 ```
 
+| Parked (stopped)              | Cost         |
+| ----------------------------- | ------------ |
+| 50 GB gp3 root volume         | ~$4.00/month |
+| Elastic IP                    | ~$3.60/month |
+| Instance hours, Windows licence | $0         |
+
+The Elastic IP is what makes stop/start cheap in *time*: the address, the WinRM
+certificate subject, and `DHCP_SERVER_HOST` all survive a restart, so resuming
+is a start command rather than a rebuild. AWS bills every public IPv4 at
+$0.005/hour, so while the box runs the EIP costs exactly what the auto-assigned
+address did; the ~$3.60/month is only the parked case.
+
 `use_spot = true` cuts the hourly rate roughly 60–70%, at the risk of AWS
-reclaiming the box on two minutes' notice.
+reclaiming the box on two minutes' notice. It also removes stopping as an
+option: the config requests a `one-time` Spot instance, and those can only be
+terminated.
 
 ```bash
-terraform destroy
+terraform destroy       # releases the Elastic IP too
 ```
+
+Terminating loses everything on the disk — every scope lives in the Windows DHCP
+database there. Rebuilding is a single `terraform apply` (~8–12 min); the
+`terraform.tfvars`, the state file, and the IAM setup from `iam-bootstrap.sh` all
+survive a destroy.

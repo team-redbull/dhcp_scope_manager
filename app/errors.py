@@ -49,13 +49,13 @@ class PowerShellError(Exception):
         returncode: int,
         *,
         operation: str | None = None,
-        scope_id: str | None = None,
+        scope: str | None = None,
     ):
         self.command = command
         self.stderr = stderr
         self.returncode = returncode
         self.operation = operation
-        self.scope_id = scope_id
+        self.scope = scope
         super().__init__(self.safe_message)
 
     @property
@@ -87,7 +87,7 @@ class PowerShellTimeoutError(PowerShellError):
         timeout_seconds: int,
         *,
         operation: str | None = None,
-        scope_id: str | None = None,
+        scope: str | None = None,
     ):
         self.timeout_seconds = timeout_seconds
         super().__init__(
@@ -95,13 +95,12 @@ class PowerShellTimeoutError(PowerShellError):
             f"PowerShell command timed out after {timeout_seconds} seconds",
             -1,
             operation=operation,
-            scope_id=scope_id,
+            scope=scope,
         )
 
 
 class ErrorCode:
-    INVALID_SCOPE_ID = "INVALID_SCOPE_ID"
-    SCOPE_ID_MISMATCH = "SCOPE_ID_MISMATCH"
+    INVALID_SCOPE = "INVALID_SCOPE"
     UNAUTHORIZED = "UNAUTHORIZED"
     SCOPE_NOT_FOUND = "SCOPE_NOT_FOUND"
     DHCP_CONFLICT = "DHCP_CONFLICT"
@@ -138,25 +137,14 @@ class AppError(Exception):
         super().__init__(self.message)
 
 
-class InvalidScopeIdError(AppError):
+class InvalidScopeError(AppError):
     status_code = status.HTTP_400_BAD_REQUEST
-    code = ErrorCode.INVALID_SCOPE_ID
+    code = ErrorCode.INVALID_SCOPE
 
-    def __init__(self, scope_id: str) -> None:
+    def __init__(self, scope: str) -> None:
         super().__init__(
-            f"Scope ID '{scope_id}' is not a valid IPv4 address",
-            details={"scopeId": scope_id},
-        )
-
-
-class ScopeIdMismatchError(AppError):
-    status_code = status.HTTP_400_BAD_REQUEST
-    code = ErrorCode.SCOPE_ID_MISMATCH
-
-    def __init__(self, scope_id: str, payload_network: str) -> None:
-        super().__init__(
-            f"scope_id '{scope_id}' does not match payload network '{payload_network}'",
-            details={"scopeId": scope_id, "network": payload_network},
+            f"Scope '{scope}' is not a valid IPv4 address",
+            details={"scope": scope},
         )
 
 
@@ -175,11 +163,11 @@ class ScopeNotFoundError(AppError):
     status_code = status.HTTP_404_NOT_FOUND
     code = ErrorCode.SCOPE_NOT_FOUND
 
-    def __init__(self, scope_id: str) -> None:
-        self.scope_id = scope_id
+    def __init__(self, scope: str) -> None:
+        self.scope = scope
         super().__init__(
-            f"DHCP scope {scope_id} was not found",
-            details={"scopeId": scope_id},
+            f"DHCP scope {scope} was not found",
+            details={"scope": scope},
         )
 
 

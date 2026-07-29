@@ -86,7 +86,7 @@ async def run_ps(
     *,
     append_error_action: bool = True,
     append_convert_to_json: bool = True,
-    scope_id: str | None = None,
+    scope: str | None = None,
     operation: str | None = None,
     relationship_name: str | None = None,
 ) -> dict | list | None:
@@ -117,7 +117,7 @@ async def run_ps(
         full_cmd += " | ConvertTo-Json -Depth 5 -Compress"
 
     log_extra = {
-        "scope_id": scope_id,
+        "scope": scope,
         "operation": operation or "powershell",
         "relationship_name": relationship_name,
     }
@@ -135,7 +135,7 @@ async def run_ps(
             command,
             settings.POWERSHELL_COMMAND_TIMEOUT_SECONDS,
             operation=operation,
-            scope_id=scope_id,
+            scope=scope,
         ) from exc
 
     stdout = result.stdout
@@ -158,7 +158,7 @@ async def run_ps(
             stderr.strip(),
             result.returncode or 1,
             operation=operation,
-            scope_id=scope_id,
+            scope=scope,
         )
 
     logger.info(
@@ -177,5 +177,5 @@ async def run_ps(
             f"PowerShell returned non-JSON output: {exc}. stdout={stdout.strip()[:200]!r}",
             0,
             operation=operation,
-            scope_id=scope_id,
+            scope=scope,
         ) from exc

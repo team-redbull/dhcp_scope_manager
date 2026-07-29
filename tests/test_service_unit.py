@@ -17,7 +17,7 @@ pytestmark = pytest.mark.asyncio
 def _make_scope(**overrides):
     base = dict(
         scopeName="Cluster-A",
-        network="10.20.30.0",
+        scope="10.20.30.0",
         subnetMask="255.255.255.0",
         startRange="10.20.30.100",
         endRange="10.20.30.200",
@@ -76,6 +76,8 @@ class TestCreateScope:
             mock_ps.side_effect = [
                 True,  # scope_exists check → scope found
                 None,  # Set-DhcpServerv4OptionValue
+                None,  # Remove-DhcpServerv4OptionValue -OptionId 66 (no PXE desired)
+                None,  # Remove-DhcpServerv4OptionValue -OptionId 67
             ]
             from app.services import scope_service
             await scope_service.create_scope(payload)
@@ -93,12 +95,92 @@ class TestCreateScope:
             mock_ps.side_effect = [
                 True,  # scope_exists: exists
                 None,  # Set-DhcpServerv4OptionValue
+                None,  # Remove-DhcpServerv4OptionValue -OptionId 66 (no PXE desired)
+                None,  # Remove-DhcpServerv4OptionValue -OptionId 67
             ]
             from app.services import scope_service
             await scope_service.create_scope(payload)
 
         commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
         assert any("Set-DhcpServerv4OptionValue" in cmd for cmd in commands)
+
+    async def test_create_with_pxe_sets_options_66_and_67(self):
+        """A scope with a PXE pair gets one Set call per option, after the DNS call."""
+        payload = _make_scope(nextServer="boot.lab.local", bootFile="snponly.efi")
+        result = _make_scope()
+
+        with patch("app.services.scope_service.run_ps") as mock_ps, \
+             patch("app.services.scope_service.assemble_scope_state", return_value=result):
+            mock_ps.side_effect = [
+                None,  # scope_exists → not found
+                None,  # Add-DhcpServerv4Scope
+                None,  # Set-DhcpServerv4OptionValue (DNS/domain/router)
+                None,  # Set-DhcpServerv4OptionValue -OptionId 66
+                None,  # Set-DhcpServerv4OptionValue -OptionId 67
+            ]
+            from app.services import scope_service
+            await scope_service.create_scope(payload)
+
+        commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
+        assert any(
+            "-OptionId 66" in cmd and "-Value 'boot.lab.local'" in cmd for cmd in commands
+        )
+        assert any(
+            "-OptionId 67" in cmd and "-Value 'snponly.efi'" in cmd for cmd in commands
+        )
+
+    async def test_create_without_pxe_issues_no_boot_option_calls(self):
+        """The no-PXE case is the common one and must cost zero extra PowerShell calls."""
+        payload = _make_scope()
+        result = _make_scope()
+
+        with patch("app.services.scope_service.run_ps") as mock_ps, \
+             patch("app.services.scope_service.assemble_scope_state", return_value=result):
+            mock_ps.side_effect = [None, None, None]
+            from app.services import scope_service
+            await scope_service.create_scope(payload)
+
+        commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
+        assert not any("-OptionId 66" in cmd or "-OptionId 67" in cmd for cmd in commands)
+
+    async def test_create_on_existing_scope_clears_stale_boot_options(self):
+        """POST converges (§2): an existing scope's stale PXE pair is cleared when unset.
+
+        Skipped for a freshly added scope, which cannot carry stale options — see
+        test_create_without_pxe_issues_no_boot_option_calls.
+        """
+        payload = _make_scope()
+        result = _make_scope()
+
+        with patch("app.services.scope_service.run_ps") as mock_ps, \
+             patch("app.services.scope_service.assemble_scope_state", return_value=result):
+            mock_ps.side_effect = [True, None, None, None]
+            from app.services import scope_service
+            await scope_service.create_scope(payload)
+
+        commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
+        for option_id in (66, 67):
+            assert any(
+                "Remove-DhcpServerv4OptionValue" in cmd and f"-OptionId {option_id}" in cmd
+                for cmd in commands
+            ), f"expected stale option {option_id} to be cleared"
+
+    async def test_create_escapes_boot_file(self):
+        """Boot options are user strings from Git and go through ps_single_quote."""
+        payload = _make_scope(
+            nextServer="boot.lab.local", bootFile="a';Remove-DhcpServerv4Scope",
+        )
+        result = _make_scope()
+
+        with patch("app.services.scope_service.run_ps") as mock_ps, \
+             patch("app.services.scope_service.assemble_scope_state", return_value=result):
+            mock_ps.side_effect = [None, None, None, None, None]
+            from app.services import scope_service
+            await scope_service.create_scope(payload)
+
+        commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
+        boot_file_cmd = next(cmd for cmd in commands if "-OptionId 67" in cmd)
+        assert "-Value 'a'';Remove-DhcpServerv4Scope'" in boot_file_cmd
 
     async def test_create_without_gateway_does_not_set_router(self):
         payload = _make_scope(gateway=None)
@@ -255,7 +337,7 @@ class TestCreateScope:
             with pytest.raises(PowerShellError):
                 await scope_service.create_scope(payload)
 
-    async def test_create_scope_logs_scope_id(self, caplog):
+    async def test_create_scope_logs_scope(self, caplog):
         payload = _make_scope()
         result = _make_scope()
 
@@ -266,7 +348,7 @@ class TestCreateScope:
             from app.services import scope_service
             await scope_service.create_scope(payload)
 
-        assert any(getattr(record, "scope_id", None) == "10.20.30.0" for record in caplog.records)
+        assert any(getattr(record, "scope", None) == "10.20.30.0" for record in caplog.records)
 
     async def test_create_scope_escapes_scope_name_and_description(self):
         payload = _make_scope(
@@ -325,7 +407,7 @@ class TestGetScope:
             from app.services import scope_service
             with pytest.raises(ScopeNotFoundError) as exc_info:
                 await scope_service.get_scope("10.20.30.0")
-        assert exc_info.value.scope_id == "10.20.30.0"
+        assert exc_info.value.scope == "10.20.30.0"
 
     async def test_get_scope_permission_error_propagates_as_ps_error(self):
         """Non-not-found PS errors must not be swallowed — must propagate to the caller."""
@@ -520,10 +602,10 @@ class TestListScopes:
         put '10.20.30.0' first.  The sorted() key uses ip_to_int.
         """
         scope_9 = _make_scope(
-            scopeName="Scope-9", network="10.20.9.0",
+            scopeName="Scope-9", scope="10.20.9.0",
             startRange="10.20.9.100", endRange="10.20.9.200", gateway="10.20.9.1",
         )
-        scope_30 = _make_scope(scopeName="Scope-30", network="10.20.30.0")
+        scope_30 = _make_scope(scopeName="Scope-30", scope="10.20.30.0")
 
         # PS returns wrong order; list_scopes must sort the result.
         raw_entries = [
@@ -531,8 +613,8 @@ class TestListScopes:
             {"scope": {"ScopeId": "10.20.9.0"},  "options": [], "exclusions": [], "failover": None},
         ]
 
-        def fake_build(scope_id, state):
-            return scope_9 if scope_id == "10.20.9.0" else scope_30
+        def fake_build(scope, state):
+            return scope_9 if scope == "10.20.9.0" else scope_30
 
         with patch("app.services.scope_service.run_ps", return_value=raw_entries), \
              patch("app.services.scope_service.build_payload_from_scope_state",
@@ -541,8 +623,8 @@ class TestListScopes:
             result = await scope_service.list_scopes()
 
         assert len(result.scopes) == 2
-        assert str(result.scopes[0].network) == "10.20.9.0"
-        assert str(result.scopes[1].network) == "10.20.30.0"
+        assert str(result.scopes[0].scope) == "10.20.9.0"
+        assert str(result.scopes[1].scope) == "10.20.30.0"
 
     async def test_entry_without_scope_id_skipped(self):
         """Entries where scope.ScopeId is absent or empty are silently skipped."""
@@ -568,8 +650,8 @@ class TestListScopes:
             {"scope": {"ScopeId": "10.20.31.0"}, "options": [], "exclusions": [], "failover": None},
         ]
 
-        def fake_build(scope_id, state):
-            if scope_id == "10.20.31.0":
+        def fake_build(scope, state):
+            if scope == "10.20.31.0":
                 raise ValueError("DNS servers list is empty")
             return good_scope
 
@@ -581,7 +663,7 @@ class TestListScopes:
 
         assert len(result.scopes) == 1
         assert len(result.errors) == 1
-        assert result.errors[0].scopeId == "10.20.31.0"
+        assert result.errors[0].scope == "10.20.31.0"
         assert "DNS" in result.errors[0].error
 
     async def test_missing_dns_scope_in_errors_not_exception(self):
@@ -599,4 +681,4 @@ class TestListScopes:
 
         assert result.scopes == []
         assert len(result.errors) == 1
-        assert result.errors[0].scopeId == "10.20.30.0"
+        assert result.errors[0].scope == "10.20.30.0"

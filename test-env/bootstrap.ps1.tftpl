@@ -69,12 +69,13 @@ try {
     # ------------------------------------------------------------------
     Write-Output '=== Configuring WinRM HTTPS listener ==='
 
-    # Public address, for the certificate subject. IMDSv2 (token required) —
-    # the instance sets http_tokens = "required".
-    $imdsToken = Invoke-RestMethod -Method Put -Uri 'http://169.254.169.254/latest/api/token' `
-        -Headers @{ 'X-aws-ec2-metadata-token-ttl-seconds' = '21600' }
-    $publicIp = Invoke-RestMethod -Uri 'http://169.254.169.254/latest/meta-data/public-ipv4' `
-        -Headers @{ 'X-aws-ec2-metadata-token' = $imdsToken }
+    # Public address, for the certificate subject. Passed in from Terraform as
+    # the Elastic IP rather than read from IMDS: at first boot the instance
+    # still carries its ephemeral auto-assigned address, and
+    # aws_eip_association only swaps in the Elastic IP once the instance
+    # exists. Asking IMDS here would pin the certificate subject and the
+    # listener hostname to an address that disappears seconds later.
+    $publicIp = '${public_ip}'
     Write-Output "Public IP for certificate subject: $publicIp"
 
     Set-Service -Name WinRM -StartupType Automatic

@@ -45,7 +45,7 @@ app/
   dependencies/
     auth.py                  Bearer token verification (verify_token dependency)
     dhcp.py                  DHCP runtime environment guard dependency
-    scopes.py                scope_id and request body validation (validate_scope_id, validate_scope_request)
+    scopes.py                path address and body validation (validate_scope, validate_scope_request)
   models/
     __init__.py              Re-exports all model types
     scope.py                 DhcpScopePayload — canonical request/response model
@@ -54,7 +54,7 @@ app/
     list_response.py         DhcpScopeListResponse / DhcpScopeListError — GET /scopes response
   routers/
     __init__.py              Aggregates all sub-routers into a single router — main.py imports only this
-    scopes.py                DHCP scope endpoints (POST/GET/PUT/DELETE /api/v1/scopes/{scope_id})
+    scopes.py                DHCP scope endpoints (POST/GET/PUT/DELETE /api/v1/scopes/{scope})
     health.py                /healthz runtime capability check
   services/
     dhcp_service.py          Runtime guard (OS / PowerShell / DHCP cmdlets check)
@@ -233,7 +233,11 @@ values; see the chart's README.
 
 Base path: `/api/v1`
 
-`scope_id` is always the IPv4 network address of the scope (e.g. `10.20.30.0`).
+`{scope}` is always the IPv4 network address of the scope (e.g. `10.20.30.0`), and it is
+the **only** place that address appears in a request. It is identity rather than state, so
+the request body carries no `scope` (or `network`) field — a body that includes one is
+rejected with `422`. `GET /api/v1/scopes` is the exception: list items have no URL of their
+own, so each carries a leading `scope` field to identify itself.
 
 All `/api/v1/scopes*` endpoints share two implicit checks that run before the handler:
 
@@ -268,16 +272,15 @@ All API errors use the same envelope:
 
 - `error.code` is stable and machine-readable for Crossplane events and automation.
 - `error.message` is human-readable and safe to expose.
-- `error.details` contains sanitized structured context such as `scopeId`, `network`, validation errors, or DHCP environment `reason`.
+- `error.details` contains sanitized structured context such as `scope`, validation errors, or DHCP environment `reason`.
 
-Raw PowerShell commands, stack traces, and full internal stderr are not returned to clients. Backend logs use safe context such as request path, `scope_id`, operation name, return code, and sanitized stderr previews.
+Raw PowerShell commands, stack traces, and full internal stderr are not returned to clients. Backend logs use safe context such as request path, `scope`, operation name, return code, and sanitized stderr previews.
 
 Common error codes:
 
 | HTTP Status | Error Code                     | Meaning                                                        |
 | ----------- | ------------------------------ | -------------------------------------------------------------- |
-| `400`       | `INVALID_SCOPE_ID`             | `scope_id` is not a valid IPv4 address                         |
-| `400`       | `SCOPE_ID_MISMATCH`            | Path `scope_id` does not match body `network`                  |
+| `400`       | `INVALID_SCOPE`                | `{scope}` is not a valid IPv4 address                          |
 | `401`       | `UNAUTHORIZED`                 | Missing or invalid bearer token                                |
 | `404`       | `SCOPE_NOT_FOUND`              | DHCP scope does not exist                                      |
 | `409`       | `DHCP_CONFLICT`                | Windows DHCP reported an unsafe already-exists/in-use conflict |
@@ -316,14 +319,14 @@ Returns all scopes sorted by network address (ascending). Uses **one PowerShell 
 **Partial-result semantics** — the response is always `200` and always contains both a `scopes` list and an `errors` list:
 
 - PowerShell-level failures (connection refused, permission denied, etc.) propagate as `500` — the entire list is unavailable.
-- Per-scope assembly errors (invalid data, missing DNS option, unrecognized field format) are caught individually. The broken scope is added to `errors` with its `scopeId` and a description; all other scopes are returned normally in `scopes`.
+- Per-scope assembly errors (invalid data, missing DNS option, unrecognized field format) are caught individually. The broken scope is added to `errors` with its `scope` and a description; all other scopes are returned normally in `scopes`.
 
 ```json
 {
   "scopes": [{ "scopeName": "...", "network": "10.20.30.0", "...": "..." }],
   "errors": [
     {
-      "scopeId": "10.20.31.0",
+      "scope": "10.20.31.0",
       "error": "No DNS servers configured for this scope"
     }
   ]
@@ -339,14 +342,14 @@ Returns all scopes sorted by network address (ascending). Uses **one PowerShell 
 
 ---
 
-### `POST /api/v1/scopes/{scope_id}`
+### `POST /api/v1/scopes/{scope}`
 
 Creates the scope if it does not exist, then converges all options, exclusions, and failover to the desired state. Idempotent — never fails if the scope already exists.
 
 | Status | Body                                                               | When                                                                        |
 | ------ | ------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| `200`  | `DhcpScopePayload`                                                 | Scope created or already present and converged                              |
-| `400`  | Standard error body with `INVALID_SCOPE_ID` or `SCOPE_ID_MISMATCH` | `scope_id` is not a valid IPv4 address, or path `scope_id` ≠ body `network` |
+| `200`  | `DhcpScopeBody`                                                    | Scope created or already present and converged                              |
+| `400`  | Standard error body with `INVALID_SCOPE`                           | `{scope}` is not a valid IPv4 address                                       |
 | `401`  | Standard error body with `UNAUTHORIZED`                            | Bad or missing bearer token                                                 |
 | `409`  | Standard error body with `DHCP_CONFLICT`                           | Unsafe existing/in-use DHCP state                                           |
 | `422`  | Standard error body with `VALIDATION_ERROR`                        | Request body fails Pydantic field constraints                               |
@@ -356,7 +359,7 @@ Creates the scope if it does not exist, then converges all options, exclusions, 
 
 ---
 
-### `GET /api/v1/scopes/{scope_id}`
+### `GET /api/v1/scopes/{scope}`
 
 Returns the current canonical state of the scope. When Crossplane sees a `404` here it issues `POST` to create the scope.
 
@@ -367,12 +370,12 @@ The backend builds a single script that runs all required DHCP cmdlets in-proces
 3. `Get-DhcpServerv4ExclusionRange -ScopeId ...`
 4. `Get-DhcpServerv4Failover -ScopeId ...`
 
-`options` and `exclusions` are array-wrapped in PowerShell so single-result output does not collapse into an object. Missing exclusions become `[]`, missing failover becomes `null`, missing scope becomes `404 SCOPE_NOT_FOUND`. Any other cmdlet failure is re-thrown rather than silently returning empty state. `scope_id` is validated as an IPv4 address and inserted through a central PowerShell single-quote literal helper.
+`options` and `exclusions` are array-wrapped in PowerShell so single-result output does not collapse into an object. Missing exclusions become `[]`, missing failover becomes `null`, missing scope becomes `404 SCOPE_NOT_FOUND`. Any other cmdlet failure is re-thrown rather than silently returning empty state. The path address is validated as an IPv4 address and inserted through a central PowerShell single-quote literal helper.
 
 | Status | Body                                                    | When                                                       |
 | ------ | ------------------------------------------------------- | ---------------------------------------------------------- |
-| `200`  | `DhcpScopePayload`                                      | Scope found                                                |
-| `400`  | Standard error body with `INVALID_SCOPE_ID`             | `scope_id` is not a valid IPv4 address                     |
+| `200`  | `DhcpScopeBody`                                         | Scope found                                                |
+| `400`  | Standard error body with `INVALID_SCOPE`                | `{scope}` is not a valid IPv4 address                      |
 | `401`  | Standard error body with `UNAUTHORIZED`                 | Bad or missing bearer token                                |
 | `404`  | Standard error body with `SCOPE_NOT_FOUND`              | Scope does not exist on the DHCP server                    |
 | `500`  | Standard error body with `POWERSHELL_COMMAND_FAILED`    | PowerShell cmdlet failed for a reason other than not-found |
@@ -381,7 +384,7 @@ The backend builds a single script that runs all required DHCP cmdlets in-proces
 
 ---
 
-### `PUT /api/v1/scopes/{scope_id}`
+### `PUT /api/v1/scopes/{scope}`
 
 Diff-based convergence — compares the current scope state to the desired payload and issues only the PowerShell cmdlets needed to reconcile the difference.
 
@@ -389,14 +392,15 @@ Diff-based convergence — compares the current scope state to the desired paylo
 | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | `scopeName`, `leaseDurationDays`, `description`, `startRange`, `endRange` | `Set-DhcpServerv4Scope`                                                                      |
 | `gateway`, `dnsServers`, `dnsDomain`                                      | `Set-DhcpServerv4OptionValue`; `gateway: null` removes DHCP option 3                         |
+| `nextServer`, `bootFile`                                                  | `Set-DhcpServerv4OptionValue -OptionId 66/67`; clearing both removes the options              |
 | Exclusions added                                                          | `Add-DhcpServerv4ExclusionRange`                                                             |
 | Exclusions removed                                                        | `Remove-DhcpServerv4ExclusionRange`                                                          |
 | Failover added / changed / removed                                        | `Add-DhcpServerv4Failover` / `Set-DhcpServerv4Failover` / `Remove-DhcpServerv4FailoverScope` |
 
 | Status | Body                                                               | When                                                                        |
 | ------ | ------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| `200`  | `DhcpScopePayload`                                                 | Scope updated (or already at desired state — no-op)                         |
-| `400`  | Standard error body with `INVALID_SCOPE_ID` or `SCOPE_ID_MISMATCH` | `scope_id` is not a valid IPv4 address, or path `scope_id` ≠ body `network` |
+| `200`  | `DhcpScopeBody`                                                    | Scope updated (or already at desired state — no-op)                         |
+| `400`  | Standard error body with `INVALID_SCOPE`                           | `{scope}` is not a valid IPv4 address                                       |
 | `401`  | Standard error body with `UNAUTHORIZED`                            | Bad or missing bearer token                                                 |
 | `404`  | Standard error body with `SCOPE_NOT_FOUND`                         | Scope does not exist — Crossplane responds by issuing `POST`                |
 | `409`  | Standard error body with `DHCP_CONFLICT`                           | Unsafe existing/in-use DHCP state                                           |
@@ -407,7 +411,7 @@ Diff-based convergence — compares the current scope state to the desired paylo
 
 ---
 
-### `DELETE /api/v1/scopes/{scope_id}`
+### `DELETE /api/v1/scopes/{scope}`
 
 Deletes the scope and cleans up its failover relationship and exclusion ranges. Idempotent — returns `204` even if the scope does not exist.
 
@@ -423,7 +427,7 @@ If failover detach fails, the delete propagates a `500` so Crossplane retries on
 | Status | Body                                                    | When                                                   |
 | ------ | ------------------------------------------------------- | ------------------------------------------------------ |
 | `204`  | _(empty)_                                               | Scope deleted, or scope did not exist                  |
-| `400`  | Standard error body with `INVALID_SCOPE_ID`             | `scope_id` is not a valid IPv4 address                 |
+| `400`  | Standard error body with `INVALID_SCOPE`                | `{scope}` is not a valid IPv4 address                  |
 | `401`  | Standard error body with `UNAUTHORIZED`                 | Bad or missing bearer token                            |
 | `500`  | Standard error body with `POWERSHELL_COMMAND_FAILED`    | PowerShell cmdlet failed (e.g. failover detach failed) |
 | `503`  | Standard error body with `DHCP_ENVIRONMENT_UNAVAILABLE` | Host cannot run DHCP automation                        |
@@ -465,6 +469,8 @@ Environment validation is async-safe and cached per process. A successful check 
   "gateway": "10.20.30.1",
   "dnsServers": ["10.10.1.5", "10.10.1.6"],
   "dnsDomain": "lab.local",
+  "nextServer": "boot.lab.local",
+  "bootFile": "snponly.efi",
   "exclusions": [{ "startAddress": "10.20.30.1", "endAddress": "10.20.30.10" }],
   "failover": null
 }
@@ -474,10 +480,23 @@ Environment validation is async-safe and cached per process. A successful check 
 - `failover` is either `null` or a full failover object (no partial objects).
 - Exclusions are always returned sorted by IP (ascending). Values files must match this order.
 - `dnsServers` must contain at least one IPv4 address. If GET observes a managed scope without DNS servers, the backend treats that as invalid managed state instead of returning a pretend-valid payload.
-- `gateway` is optional. In values files, use `gateway: ""` when you do not want DHCP option 3; the API also accepts `null`/omitted and GET returns `null` when absent.
+- `subnetMask` and `gateway` are **derived when omitted** — `255.255.255.0` and the subnet's `.254` address respectively. Writing a value, including `null` or `""`, is always honoured as written:
+
+  | `gateway` | Result |
+  | --------- | ------ |
+  | key absent | derived `.254` (e.g. `10.20.30.254`) |
+  | `null` or `""` | no DHCP option 3; GET returns `null` |
+  | an IPv4 address | that address |
+
+  A `subnetMask` other than `255.255.255.0` with no explicit `gateway` is rejected — there is no `.254` convention to fall back on outside a /24. Both Helm and the API apply this rule, so the rendered PUT body and the GET response always agree.
 - **Gateway-in-range guard**: if `gateway` is set to an IP inside `[startRange, endRange]` and is not covered by an exclusion, the request is rejected with `422 VALIDATION_ERROR`. An unexcluded gateway inside the distribution pool would be leased to a client, causing a network outage.
 - DNS server order is preserved exactly (primary/secondary semantics — never sorted).
 - `description` defaults to `""` (never `null`).
+- `nextServer` / `bootFile` (DHCP options 66/67) are the PXE pair: option 66 names the boot server, option 67 the boot file. Both default to `""`, meaning the option is not set on the scope — that is the ordinary case for scopes whose hosts do not network-boot.
+
+  **They are optional but both-or-nothing**: a request setting one without the other is rejected with `422 VALIDATION_ERROR`, because a boot server with no boot file (or the reverse) leaves a host silently unbootable. Both keys are always present in the body regardless — `""` is the concrete "not set" state GET reports back, so omitting them would break the byte-compare. In values files these come from the `pxe.server` / `pxe.bootfile` keys; see [docs/dhcp_values.md](docs/dhcp_values.md).
+
+  Per-architecture boot files (BIOS vs UEFI) need Windows DHCP policies matching option 93 and are not modelled — a scope carries one 66/67 pair.
 
 ## Failover Model
 
@@ -504,6 +523,14 @@ Key behaviors:
   minimal existing render-time checks needed to form the Request URL/name.
 - **Optional defaults** — `description`, `gateway`, and `dns.domain` can be written as `""`,
   `exclusions` renders as `[]`, and disabled failover renders as `null`.
+- **Derived defaults** — omitting `subnetMask` or `gateway` renders the resolved value
+  (`255.255.255.0` and the subnet's `.254`) rather than passing the omission through to the
+  API. That is deliberate: Crossplane byte-compares the GET response to this body, and GET
+  reports the concrete address the DHCP server holds, so a body that said `null` would diff
+  forever. A non-/24 mask with no gateway fails the render with an explicit message.
+- **`helm/values.yaml` is the base of every merge** — Helm always layers `-f` files on top of
+  it, so a key set there cannot be unset downstream. `subnetMask` and `gateway` ship absent
+  from it precisely so the derived defaults remain reachable.
 - **`providerConfigRef.name`** is configurable via `crossplane.providerConfigName`
   (defaults to `dhcp-http`).
 
@@ -528,9 +555,9 @@ Quick reference — see the per-endpoint tables above for the exact set each rou
 
 | Code  | Meaning               | Error code examples                                                                  |
 | ----- | --------------------- | ------------------------------------------------------------------------------------ |
-| `200` | OK                    | Success response: `DhcpScopePayload`, `DhcpScopeListResponse`, or `{"status": "ok"}` |
+| `200` | OK                    | Success response: `DhcpScopeBody`, `DhcpScopeListResponse`, or `{"status": "ok"}`   |
 | `204` | No Content            | Success response with empty body — DELETE only                                       |
-| `400` | Bad Request           | `INVALID_SCOPE_ID`, `SCOPE_ID_MISMATCH`                                              |
+| `400` | Bad Request           | `INVALID_SCOPE`                                                                      |
 | `401` | Unauthorized          | `UNAUTHORIZED`                                                                       |
 | `404` | Not Found             | `SCOPE_NOT_FOUND` — GET and PUT only                                                 |
 | `409` | Conflict              | `DHCP_CONFLICT`                                                                      |
@@ -677,7 +704,7 @@ Dependencies are installed with `pip install -r scripts/requirements.txt` (pydan
 - Runtime environment guard rejects all scope operations on non-Windows / non-DHCP hosts
 - `-ErrorAction Stop` on every PowerShell command
 - PowerShell stderr is sanitized before returning to clients and before logging previews
-- Structured JSON logs include safe fields on every entry: `scope_id` (auto-extracted from the call when the function accepts it), `operation` (function name), `duration_ms`, `status` (`ok`/`error`), `relationship_name`, `returncode`, `stderr_preview`, and `error_code`
+- Structured JSON logs include safe fields on every entry: `scope` (auto-extracted from the call when the function accepts it), `operation` (function name), `duration_ms`, `status` (`ok`/`error`), `relationship_name`, `returncode`, `stderr_preview`, and `error_code`
 
 ## Debugging Errors
 
@@ -685,13 +712,13 @@ From Crossplane events:
 
 1. Read `error.code` first. It is stable and safe to use for automation.
 2. Use `error.message` for the short human explanation.
-3. Use `error.details` for safe context such as `scopeId`, body validation fields, or DHCP environment `reason`.
+3. Use `error.details` for safe context such as `scope`, body validation fields, or DHCP environment `reason`.
 
 From backend logs:
 
 - `AppError` entries mean the request failed in an expected, client-safe way.
 - `RequestValidationError` entries include sanitized validation fields and messages, not raw input values.
-- `PowerShellError` entries include return code, operation name, `scope_id` when available, and sanitized stderr preview.
+- `PowerShellError` entries include return code, operation name, `scope` when available, and sanitized stderr preview.
 - `DhcpEnvironmentError` entries include the full internal environment failure detail.
 - `INTERNAL_ERROR` responses mean an unexpected Python exception reached the fallback handler; inspect backend logs for the request path and timestamp.
 

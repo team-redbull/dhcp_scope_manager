@@ -4,8 +4,8 @@ output "instance_id" {
 }
 
 output "public_ip" {
-  description = "Public IP of the Windows DHCP server."
-  value       = aws_instance.dhcp.public_ip
+  description = "Elastic IP of the Windows DHCP server. Stable across stop/start."
+  value       = aws_eip.this.public_ip
 }
 
 output "rdp_target" {
@@ -14,12 +14,12 @@ output "rdp_target" {
     admin_password, then run dhcpmgmt.msc for the DHCP console.
     On macOS: Windows App (formerly Microsoft Remote Desktop) from the App Store.
   EOT
-  value       = "${aws_instance.dhcp.public_ip}:3389"
+  value       = "${aws_eip.this.public_ip}:3389"
 }
 
 output "winrm_endpoint" {
   description = "WinRM HTTPS endpoint the API connects to over PSRP."
-  value       = "https://${aws_instance.dhcp.public_ip}:5986"
+  value       = "https://${aws_eip.this.public_ip}:5986"
 }
 
 output "api_env" {
@@ -30,7 +30,7 @@ output "api_env" {
   EOT
   value = join("\n", [
     "DHCP_TRANSPORT=psrp",
-    "DHCP_SERVER_HOST=${aws_instance.dhcp.public_ip}",
+    "DHCP_SERVER_HOST=${aws_eip.this.public_ip}",
     "WINRM_PORT=5986",
     "WINRM_USE_SSL=true",
     "WINRM_AUTH=ntlm",
@@ -42,7 +42,7 @@ output "api_env" {
 
 output "api_base_url" {
   description = "Base URL of the co-located API. Only meaningful when install_api = true."
-  value       = var.install_api ? "http://${aws_instance.dhcp.public_ip}:${var.api_port}" : "n/a — install_api = false; the API runs on Linux over PSRP"
+  value       = var.install_api ? "http://${aws_eip.this.public_ip}:${var.api_port}" : "n/a — install_api = false; the API runs on Linux over PSRP"
 }
 
 output "session_manager_command" {
@@ -62,9 +62,8 @@ output "stop_command" {
 
 output "start_command" {
   description = <<-EOT
-    Restart a stopped instance. NOTE: the public IP changes on restart, which
-    invalidates both the WinRM certificate subject and DHCP_SERVER_HOST.
-    Re-run terraform apply, or attach an Elastic IP, if you plan to stop/start.
+    Restart a stopped instance. The Elastic IP reattaches automatically, so the
+    address, the WinRM certificate subject, and DHCP_SERVER_HOST all stay valid.
   EOT
   value       = "aws ec2 start-instances --instance-ids ${aws_instance.dhcp.id} --region ${var.region}"
 }

@@ -141,11 +141,11 @@ resource "aws_vpc_security_group_ingress_rule" "winrm" {
 
   security_group_id = aws_security_group.instance.id
   # ASCII only: EC2 rejects rule descriptions outside a-zA-Z0-9._-:/()#,@[]+=&;{}!$*
-  description       = "WinRM over HTTPS (PSRP transport from the API host)"
-  cidr_ipv4         = each.value
-  from_port         = 5986
-  to_port           = 5986
-  ip_protocol       = "tcp"
+  description = "WinRM over HTTPS (PSRP transport from the API host)"
+  cidr_ipv4   = each.value
+  from_port   = 5986
+  to_port     = 5986
+  ip_protocol = "tcp"
 }
 
 resource "aws_vpc_security_group_egress_rule" "all" {
@@ -221,6 +221,10 @@ resource "aws_instance" "dhcp" {
     }
   }
 
+  # The Elastic IP is allocated independently of the instance, so its address is
+  # known before first boot and can be baked into the WinRM certificate. This
+  # creates no cycle: the EIP does not reference the instance; only the
+  # association does, and it runs after both.
   user_data = templatefile("${path.module}/bootstrap.ps1.tftpl", {
     repo_url       = var.repo_url
     repo_ref       = var.repo_ref
@@ -228,6 +232,7 @@ resource "aws_instance" "dhcp" {
     api_token      = var.api_token
     admin_password = var.admin_password
     install_api    = var.install_api
+    public_ip      = aws_eip.this.public_ip
   })
 
   # Changing the bootstrap should rebuild the box, otherwise the running
@@ -235,4 +240,36 @@ resource "aws_instance" "dhcp" {
   user_data_replace_on_change = true
 
   tags = merge(local.tags, { Name = "${local.name}-server" })
+}
+
+################################################################################
+# Elastic IP
+#
+# An auto-assigned public IP is released on stop and a different one comes back
+# on start. That breaks more than the address in a bookmark: bootstrap.ps1.tftpl
+# bakes the public IP into the WinRM certificate subject and the listener
+# hostname, and its user_data is <persist>false</persist>, so it never re-runs
+# to correct them. DHCP_SERVER_HOST in the api_env output goes stale too.
+#
+# An Elastic IP survives stop/start, so the box can be parked between sessions
+# and resume on the same address with the same certificate.
+#
+# Cost: AWS bills every public IPv4 at $0.005/hour. While the instance runs this
+# replaces the auto-assigned address at identical cost; while it is stopped the
+# EIP keeps billing (~$3.60/month) where the auto-assigned address would have
+# been free. That is the price of an address that does not move.
+################################################################################
+
+resource "aws_eip" "this" {
+  domain = "vpc"
+
+  # An address in this VPC cannot route before the gateway exists.
+  depends_on = [aws_internet_gateway.this]
+
+  tags = merge(local.tags, { Name = "${local.name}-eip" })
+}
+
+resource "aws_eip_association" "this" {
+  instance_id   = aws_instance.dhcp.id
+  allocation_id = aws_eip.this.id
 }

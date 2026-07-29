@@ -185,7 +185,7 @@ class TestSetOptionsForce:
     def _payload(self, **overrides):
         base = dict(
             scopeName="cluster-a",
-            network="10.20.30.0",
+            scope="10.20.30.0",
             subnetMask="255.255.255.0",
             startRange="10.20.30.50",
             endRange="10.20.30.200",

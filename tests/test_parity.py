@@ -14,8 +14,13 @@ and verify it matches exactly what the Helm template would render as the PUT bod
 """
 import json
 import asyncio
+import shutil
+import subprocess
+import tempfile
+import textwrap
 from unittest.mock import patch
 import pytest
+import yaml
 from app.models import DhcpExclusion, DhcpFailover, DhcpScopePayload
 from app.services.ps_parsers import assemble_scope_state, parse_failover
 from app.utils.ip_utils import parse_timespan_days, parse_timespan_minutes
@@ -26,10 +31,13 @@ from app.utils.ip_utils import parse_timespan_days, parse_timespan_minutes
 # ---------------------------------------------------------------------------
 
 def _scope_json(**overrides) -> dict:
-    """The canonical desired-state dict — what Helm/Crossplane sends as PUT body."""
+    """The canonical desired-state dict — what Helm/Crossplane sends as PUT body.
+
+    Carries no scope address: the identity is in the URL, so the PUT body and the
+    GET response are both pure state. That is what makes them directly comparable.
+    """
     base = {
         "scopeName": "Cluster-A",
-        "network": "10.20.30.0",
         "subnetMask": "255.255.255.0",
         "startRange": "10.20.30.100",
         "endRange": "10.20.30.200",
@@ -38,6 +46,8 @@ def _scope_json(**overrides) -> dict:
         "gateway": "10.20.30.1",
         "dnsServers": ["10.50.1.5", "10.50.1.6"],
         "dnsDomain": "lab.local",
+        "nextServer": "",
+        "bootFile": "",
         "exclusions": [
             {"startAddress": "10.20.30.1", "endAddress": "10.20.30.10"},
             {"startAddress": "10.20.30.241", "endAddress": "10.20.30.254"},
@@ -104,7 +114,8 @@ def _assemble(scope_raw, options_raw, exclusions_raw, failover_raw=None) -> dict
     }
     with patch("app.services.ps_parsers.run_ps", return_value=state):
         result = asyncio.run(assemble_scope_state("10.20.30.0"))
-    return result.model_dump(mode="json")
+    # .body() is exactly what the single-scope endpoints return
+    return result.body().model_dump(mode="json")
 
 
 # ---------------------------------------------------------------------------
@@ -124,11 +135,22 @@ class TestScalarFieldParity:
         got = _assemble(_ps_scope(Name="My Production Scope"), _ps_options(), _ps_exclusions())
         assert got["scopeName"] == "My Production Scope"
 
-    def test_network_comes_from_path_not_ps(self):
-        """network is always the scope_id from the URL path, never from PS ScopeId field."""
-        # Even if PS returns a different ScopeId, we use the path scope_id
-        got = _assemble(_ps_scope(ScopeId="10.20.30.1"), _ps_options(), _ps_exclusions())
-        assert got["network"] == "10.20.30.0"  # path value, not PS value
+    def test_scope_comes_from_path_not_ps(self):
+        """The scope identity is always the address from the URL path, never PS ScopeId.
+
+        It is absent from the wire body entirely, so check the domain model, which
+        is where the identity is carried internally.
+        """
+        state = {
+            "scope": _ps_scope(ScopeId="10.20.30.1"),
+            "options": _ps_options(),
+            "exclusions": _ps_exclusions(),
+            "failover": None,
+        }
+        with patch("app.services.ps_parsers.run_ps", return_value=state):
+            result = asyncio.run(assemble_scope_state("10.20.30.0"))
+        assert str(result.scope) == "10.20.30.0"  # path value, not PS value
+        assert "scope" not in result.body().model_dump(mode="json")
 
     def test_subnet_mask(self):
         got = _assemble(_ps_scope(), _ps_options(), _ps_exclusions())
@@ -453,3 +475,107 @@ class TestFullPayloadParity:
         desired = _scope_json(exclusions=[], failover=None)
         got = _assemble(_ps_scope(), _ps_options(), None)
         assert got["exclusions"] == desired["exclusions"]
+
+
+# ---------------------------------------------------------------------------
+# Derived defaults — the end-to-end proof that omitting keys cannot loop
+# ---------------------------------------------------------------------------
+
+class TestDerivedDefaultParity:
+    """subnetMask and gateway may be omitted from a values file and derived.
+
+    Deriving them in only one place would be a reconciliation bug: GET always
+    reports the concrete values the DHCP server holds, so if the rendered PUT body
+    said null (or omitted the key), Crossplane would see a permanent diff and PUT
+    every 60 seconds forever. These tests render the *actual* chart and compare it
+    to the *actual* GET assembly — the two independent implementations of the rule.
+    """
+
+    _VALUES = textwrap.dedent("""\
+        apiServer:
+          url: https://dhcp-api.lab.local
+          tokenSecretRef: null
+        dhcp_values:
+          scopeName: "Cluster-A"
+          network: "10.20.30.0"
+          startRange: "10.20.30.100"
+          endRange: "10.20.30.200"
+          leaseDurationDays: 8
+          description: ""
+          dns:
+            servers:
+              - "10.50.1.5"
+              - "10.50.1.6"
+            domain: "lab.local"
+          exclusions:
+            - startAddress: "10.20.30.1"
+              endAddress: "10.20.30.10"
+            - startAddress: "10.20.30.241"
+              endAddress: "10.20.30.254"
+          failover: null
+    """)
+
+    @staticmethod
+    def _rendered_body(values: str) -> dict:
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as fh:
+            fh.write(values)
+            path = fh.name
+        result = subprocess.run(
+            ["helm", "template", "parity", "helm", "-f", path],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        cr = next(iter(yaml.safe_load_all(result.stdout)))
+        return cr["spec"]["forProvider"]["payload"]["body"]
+
+    @pytest.mark.skipif(shutil.which("helm") is None, reason="helm CLI not available")
+    def test_rendered_defaults_match_get_response(self):
+        """The whole point: rendered body == GET response, byte for byte."""
+        desired = self._rendered_body(self._VALUES)
+        # What the DHCP server holds after the API applied that body.
+        got = _assemble(
+            _ps_scope(Name="Cluster-A", SubnetMask="255.255.255.0"),
+            _ps_options(options=[
+                {"OptionId": 3, "Value": ["10.20.30.254"]},
+                {"OptionId": 6, "Value": ["10.50.1.5", "10.50.1.6"]},
+                {"OptionId": 15, "Value": ["lab.local"]},
+            ]),
+            _ps_exclusions(),
+        )
+        assert got == desired, (
+            f"GET/PUT mismatch on derived defaults!\n"
+            f"PUT body: {json.dumps(desired, indent=2)}\n"
+            f"GET resp: {json.dumps(got, indent=2)}"
+        )
+
+    @pytest.mark.skipif(shutil.which("helm") is None, reason="helm CLI not available")
+    def test_rendered_empty_gateway_matches_scope_without_option_3(self):
+        """The no-gateway path must stay loop-free too.
+
+        gateway: "" renders null, and a scope with no DHCP option 3 reads back as
+        null — so the pair still agrees.
+        """
+        desired = self._rendered_body(self._VALUES + '  gateway: ""\n')
+        got = _assemble(
+            _ps_scope(Name="Cluster-A"),
+            _ps_options(options=[
+                {"OptionId": 6, "Value": ["10.50.1.5", "10.50.1.6"]},
+                {"OptionId": 15, "Value": ["lab.local"]},
+            ]),
+            _ps_exclusions(),
+        )
+        assert desired["gateway"] is None
+        assert got == desired
+
+    def test_api_derives_the_same_address_helm_does(self):
+        """Both implementations of the .254 rule agree, without needing helm."""
+        payload = DhcpScopePayload(
+            scope="10.20.30.0",
+            scopeName="Cluster-A",
+            startRange="10.20.30.100",
+            endRange="10.20.30.200",
+            leaseDurationDays=8,
+            dnsServers=["10.50.1.5"],
+        )
+        assert str(payload.subnetMask) == "255.255.255.0"
+        assert str(payload.gateway) == "10.20.30.254"

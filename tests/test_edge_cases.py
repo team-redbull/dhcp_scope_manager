@@ -34,7 +34,7 @@ pytestmark = pytest.mark.asyncio
 def _make_scope(**overrides):
     defaults = dict(
         scopeName="Cluster-A",
-        network="10.20.30.0",
+        scope="10.20.30.0",
         subnetMask="255.255.255.0",
         startRange="10.20.30.100",
         endRange="10.20.30.200",
@@ -160,7 +160,7 @@ class TestUpdateScopeRangeDiff:
             patch("app.services.scope_service.run_ps") as mock_ps,
         ):
             mock_assemble.side_effect = [current_scope, desired_scope]
-            await scope_service.update_scope(str(current_scope.network), desired_scope)
+            await scope_service.update_scope(str(current_scope.scope), desired_scope)
             return [c.args[0] for c in mock_ps.call_args_list if c.args]
 
     async def test_start_range_changed_triggers_set_scope(self):

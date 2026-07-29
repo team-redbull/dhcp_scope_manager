@@ -173,7 +173,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             request.method,
             request.url.path,
             extra={
-                "scope_id": exc.scope_id,
+                "scope": exc.scope,
                 "operation": exc.operation or "powershell",
                 "returncode": exc.returncode,
                 "status": "failed",

@@ -14,13 +14,22 @@ apiServer:
 dhcp_values:
   scopeName: "tomer-hc-workers"
   network: "10.20.30.0"
-  subnetMask: "255.255.255.0"
   startRange: "10.20.30.11"
   endRange: "10.20.30.240"
   leaseDurationDays: 8
   description: "DHCP scope for tomer hosted cluster"
-  # Optional. Set to "" when no router/default gateway option is needed.
-  gateway: ""
+
+  # subnetMask and gateway are both omitted here on purpose — they are derived:
+  #   subnetMask -> 255.255.255.0
+  #   gateway    -> the subnet's .254 address (10.20.30.254)
+  #
+  # Leave them out unless you need something else. Note this file is the base of
+  # every Helm merge, so a value set here cannot be "unset" by a site or cluster
+  # file — that is why the common case ships absent rather than spelled out.
+  #
+  #   subnetMask: "255.255.0.0"  # any non-/24 mask REQUIRES an explicit gateway
+  #   gateway: "10.20.30.1"      # a gateway that is not the .254 default
+  #   gateway: ""                # no router option at all (DHCP option 3 unset)
 
   dns:
     # IMPORTANT: DNS server order is preserved exactly as written here.
@@ -31,6 +40,24 @@ dhcp_values:
       - "10.50.1.5"
       - "10.50.1.6"
     domain: "tomer.lab.local"
+
+  # PXE boot options — DHCP option 66 (boot server) and option 67 (boot file).
+  #
+  # Optional, but BOTH-OR-NOTHING: setting one without the other is a hard error in
+  # both the CI validator and the API, because a host that gets a boot server with no
+  # boot file (or the reverse) silently fails to network-boot. Omitting the whole
+  # block is the ordinary case and leaves options 66/67 unset on the server.
+  #
+  # Shipped commented out on purpose: this file is the base of every Helm merge, so a
+  # value set here could not be unset by a site or cluster file — same reasoning as
+  # subnetMask/gateway above.
+  #
+  # Note per-architecture boot files (BIOS vs UEFI) are NOT expressible here — that
+  # needs Windows DHCP policies matching option 93, which this API does not manage.
+  #
+  # pxe:
+  #   server: "10.50.1.20"      # host name or IP of the TFTP/HTTP boot server
+  #   bootfile: "snponly.efi"   # or a full URL for iPXE HTTP chainloading
 
   # IMPORTANT: exclusions MUST be listed in ascending IP numerical order.
   # The API always returns exclusions sorted by IP. If values.yaml order differs from IP

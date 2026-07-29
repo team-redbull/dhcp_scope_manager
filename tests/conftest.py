@@ -39,7 +39,7 @@ def sample_failover():
 def sample_scope_payload(sample_failover):
     return DhcpScopePayload(
         scopeName="Cluster-A Management",
-        network="10.20.30.0",
+        scope="10.20.30.0",
         subnetMask="255.255.255.0",
         startRange="10.20.30.100",
         endRange="10.20.30.200",
@@ -59,7 +59,7 @@ def sample_scope_payload(sample_failover):
 def sample_scope_payload_no_failover():
     return DhcpScopePayload(
         scopeName="Cluster-A Management",
-        network="10.20.30.0",
+        scope="10.20.30.0",
         subnetMask="255.255.255.0",
         startRange="10.20.30.100",
         endRange="10.20.30.200",

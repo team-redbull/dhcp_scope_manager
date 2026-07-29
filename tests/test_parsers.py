@@ -1,6 +1,6 @@
 from unittest.mock import AsyncMock, patch
 import pytest
-from app.errors import DhcpConflictError, InvalidScopeIdError
+from app.errors import DhcpConflictError, InvalidScopeError
 from app.errors import PowerShellError
 from app.services.ps_parsers import (
     build_get_all_scopes_script,
@@ -159,7 +159,7 @@ async def test_assemble_scope_state(
     assert kwargs["append_error_action"] is False
     assert kwargs["append_convert_to_json"] is False
     assert result.scopeName == "Cluster-A Management"
-    assert str(result.network) == "10.20.30.0"
+    assert str(result.scope) == "10.20.30.0"
     assert str(result.subnetMask) == "255.255.255.0"
     assert result.leaseDurationDays == 8
     assert str(result.gateway) == "10.20.30.1"
@@ -287,8 +287,8 @@ def test_returned_payload_comparable_with_post_put_body(
     result = build_payload_from_scope_state("10.20.30.0", state)
 
     assert result.model_dump(mode="json") == {
+        "scope": "10.20.30.0",
         "scopeName": "Cluster-A Management",
-        "network": "10.20.30.0",
         "subnetMask": "255.255.255.0",
         "startRange": "10.20.30.100",
         "endRange": "10.20.30.200",
@@ -297,9 +297,44 @@ def test_returned_payload_comparable_with_post_put_body(
         "gateway": "10.20.30.1",
         "dnsServers": ["10.0.0.53", "10.0.0.54"],
         "dnsDomain": "lab.local",
+        "nextServer": "",
+        "bootFile": "",
         "exclusions": [{"startAddress": "10.20.30.1", "endAddress": "10.20.30.99"}],
         "failover": None,
     }
+
+
+def test_build_payload_parses_boot_options(mock_ps_scope_raw, mock_ps_exclusions_raw):
+    """Options 66/67 come back through the generic extractor — no bespoke parsing."""
+    options = [
+        {"OptionId": 6, "Value": ["10.0.0.53"]},
+        {"OptionId": 66, "Value": ["boot.lab.local"], "Name": "Boot Server Host Name"},
+        {"OptionId": 67, "Value": ["snponly.efi"], "Name": "Bootfile Name"},
+    ]
+    state = normalize_get_scope_state(
+        _scope_state(mock_ps_scope_raw, options, mock_ps_exclusions_raw)
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.nextServer == "boot.lab.local"
+    assert result.bootFile == "snponly.efi"
+
+
+def test_build_payload_without_boot_options_returns_empty_strings(
+    mock_ps_scope_raw, mock_ps_exclusions_raw
+):
+    """An absent pair must read back as ""/"" — the same value the desired body carries,
+    or the byte-compare in §9 never converges for the overwhelmingly common no-PXE scope.
+    """
+    state = normalize_get_scope_state(
+        _scope_state(
+            mock_ps_scope_raw,
+            [{"OptionId": 6, "Value": ["10.0.0.53"]}],
+            mock_ps_exclusions_raw,
+        )
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.nextServer == ""
+    assert result.bootFile == ""
 
 
 def test_build_payload_without_gateway_returns_null(mock_ps_scope_raw, mock_ps_exclusions_raw):
@@ -328,7 +363,7 @@ def test_build_payload_without_dns_servers_is_invalid_managed_state(mock_ps_scop
 
 
 def test_invalid_or_unsafe_scope_id_cannot_inject_powershell():
-    with pytest.raises(InvalidScopeIdError):
+    with pytest.raises(InvalidScopeError):
         build_get_scope_state_script("10.20.30.0'; Remove-DhcpServerv4Scope -Force; '")
 
 

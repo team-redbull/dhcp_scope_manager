@@ -2,7 +2,7 @@
 
 Covers:
 - PowerShell string escaping (ps_single_quote)
-- scope_id injection prevention
+- scope injection prevention
 - API response sanitization: no Windows paths, no raw stderr, no stack traces
 - Secret values not in log output or exception messages
 - Exception handler helper unit tests (_sanitize_text, _is_already_exists_error)
@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
-from app.errors import InvalidScopeIdError
+from app.errors import InvalidScopeError
 from app.exception_handlers import _sanitize_text
 from app.services.ps_executor import is_already_exists_error as _is_already_exists_error
 from app.logging_config import _SafeJsonFormatter
@@ -24,7 +24,7 @@ from app.services.ps_parsers import build_get_scope_state_script, ps_single_quot
 
 def _scope_body(**overrides):
     base = dict(
-        scopeName="Test", network="10.20.30.0", subnetMask="255.255.255.0",
+        scopeName="Test", subnetMask="255.255.255.0",
         startRange="10.20.30.100", endRange="10.20.30.200",
         leaseDurationDays=8, description="", gateway="10.20.30.1",
         dnsServers=["10.0.0.53"], dnsDomain="", exclusions=[], failover=None,
@@ -66,32 +66,32 @@ class TestPsSingleQuoteEscaping:
         assert "''" in inner  # the quote was doubled, breaking the injection
 
 
-# ─── scope_id injection ───────────────────────────────────────────────────────
+# ─── scope injection ───────────────────────────────────────────────────────
 
 class TestScopeIdInjection:
 
     def test_semicolon_injection_rejected(self):
-        with pytest.raises(InvalidScopeIdError):
+        with pytest.raises(InvalidScopeError):
             build_get_scope_state_script("10.20.30.0; Invoke-Expression 'evil'")
 
     def test_single_quote_injection_rejected(self):
-        with pytest.raises(InvalidScopeIdError):
+        with pytest.raises(InvalidScopeError):
             build_get_scope_state_script("10.20.30.0'; Remove-DhcpServerv4Scope -Force; '")
 
     def test_pipe_injection_rejected(self):
-        with pytest.raises(InvalidScopeIdError):
+        with pytest.raises(InvalidScopeError):
             build_get_scope_state_script("10.20.30.0 | Remove-Item C:\\ -Recurse")
 
     def test_newline_injection_rejected(self):
-        with pytest.raises(InvalidScopeIdError):
+        with pytest.raises(InvalidScopeError):
             build_get_scope_state_script("10.20.30.0\nRemove-DhcpServerv4Scope")
 
     def test_dollar_variable_injection_rejected(self):
-        with pytest.raises(InvalidScopeIdError):
+        with pytest.raises(InvalidScopeError):
             build_get_scope_state_script("$ScopeId")
 
     def test_hostname_as_scope_id_rejected(self):
-        with pytest.raises(InvalidScopeIdError):
+        with pytest.raises(InvalidScopeError):
             build_get_scope_state_script("dhcp-server.lab.local")
 
     def test_valid_scope_id_accepted(self):
@@ -99,7 +99,7 @@ class TestScopeIdInjection:
         assert "10.20.30.0" in script
 
     def test_valid_scope_id_single_quoted_in_script(self):
-        """scope_id must be single-quoted in the generated PS script."""
+        """scope must be single-quoted in the generated PS script."""
         script = build_get_scope_state_script("10.20.30.0")
         assert "$ScopeId = '10.20.30.0'" in script
 
@@ -256,7 +256,7 @@ class TestPowerShellErrorSafety:
             "Failure in C:\\Windows\\System32\\dhcp.dll",
             1,
             operation="set_failover_params",
-            scope_id="10.20.30.0",
+            scope="10.20.30.0",
         )
         text = str(err)
         assert "C:\\" not in text
@@ -267,7 +267,7 @@ class TestPowerShellErrorSafety:
         record = logging.LogRecord(
             "app.test", logging.INFO, __file__, 1, "message %s", ("ok",), None
         )
-        record.scope_id = "10.20.30.0"
+        record.scope = "10.20.30.0"
         record.operation = "set_dns_options"
         record.relationship_name = "rel1"
         record.duration_ms = 12.5
@@ -275,16 +275,16 @@ class TestPowerShellErrorSafety:
         record.error_code = "POWERSHELL_COMMAND_FAILED"
         rendered = formatter.format(record)
         payload = json.loads(rendered)
-        assert payload["scope_id"] == "10.20.30.0"
+        assert payload["scope"] == "10.20.30.0"
         assert payload["operation"] == "set_dns_options"
         assert payload["relationship_name"] == "rel1"
         assert payload["duration_ms"] == 12.5
         assert payload["status"] == "ok"
         assert payload["error_code"] == "POWERSHELL_COMMAND_FAILED"
 
-    def test_json_formatter_handles_absent_scope_id(self):
+    def test_json_formatter_handles_absent_scope(self):
         formatter = _SafeJsonFormatter()
         record = logging.LogRecord("app.test", logging.INFO, __file__, 1, "hello", (), None)
         payload = json.loads(formatter.format(record))
         assert payload["msg"] == "hello"
-        assert "scope_id" not in payload
+        assert "scope" not in payload

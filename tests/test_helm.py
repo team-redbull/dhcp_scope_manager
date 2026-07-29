@@ -121,6 +121,12 @@ class TestHelmTemplateBasic:
         base_url = cr["spec"]["forProvider"]["payload"]["baseUrl"]
         assert "https://dhcp-api.lab.local" in base_url
 
+    def test_base_url_carries_the_scope_address(self):
+        """The scope address is baked into baseUrl — it is the only place it appears now."""
+        cr = _parse_cr(_helm_template(_VALID_VALUES))
+        base_url = cr["spec"]["forProvider"]["payload"]["baseUrl"]
+        assert base_url.endswith("/api/v1/scopes/10.20.30.0")
+
     def test_deletion_policy_is_delete(self):
         cr = _parse_cr(_helm_template(_VALID_VALUES))
         assert cr["spec"]["deletionPolicy"] == "Delete"
@@ -191,9 +197,11 @@ class TestHelmPayloadBody:
         body = self._body(_VALID_VALUES)
         assert body["scopeName"] == "test-scope"
 
-    def test_network_in_body(self):
+    def test_network_not_in_body(self):
+        """The scope address is the identifier — it belongs in the URL, not the body."""
         body = self._body(_VALID_VALUES)
-        assert body["network"] == "10.20.30.0"
+        assert "network" not in body
+        assert "scope" not in body
 
     def test_lease_duration_is_int(self):
         body = self._body(_VALID_VALUES)
@@ -226,10 +234,78 @@ class TestHelmPayloadBody:
         body = self._body(values)
         assert body.get("description") == "" or body.get("description") is not None
 
-    def test_gateway_omitted_renders_null(self):
+    def test_pxe_block_renders_boot_options(self):
+        values = _VALID_VALUES.replace(
+            "  exclusions: []",
+            '  pxe:\n'
+            '    server: "10.50.1.20"\n'
+            '    bootfile: "snponly.efi"\n'
+            "  exclusions: []",
+        )
+        body = self._body(values)
+        assert body["nextServer"] == "10.50.1.20"
+        assert body["bootFile"] == "snponly.efi"
+
+    def test_pxe_block_omitted_renders_empty_strings(self):
+        """No pxe: block must still emit both keys as "" — GET reports "" for an absent
+        option, so omitting the keys here would diff forever for every non-PXE scope.
+        """
+        body = self._body(_VALID_VALUES)
+        assert body["nextServer"] == ""
+        assert body["bootFile"] == ""
+
+    def test_boot_option_keys_sit_between_dns_domain_and_exclusions(self):
+        """Body key order must match DhcpScopeBody field order — Crossplane byte-compares."""
+        values = _VALID_VALUES.replace(
+            "  exclusions: []",
+            '  pxe:\n'
+            '    server: "10.50.1.20"\n'
+            '    bootfile: "snponly.efi"\n'
+            "  exclusions: []",
+        )
+        keys = list(self._body(values).keys())
+        assert keys.index("dnsDomain") < keys.index("nextServer")
+        assert keys.index("nextServer") < keys.index("bootFile")
+        assert keys.index("bootFile") < keys.index("exclusions")
+
+    def test_gateway_omitted_renders_derived_default(self):
+        """Omitting the key derives the subnet's .254 address.
+
+        Resolved at render time rather than left to the API: Crossplane byte-compares
+        the GET response (which reports the concrete address) to this body, so a body
+        that said null here would diff forever.
+        """
         values = _VALID_VALUES.replace('  gateway: "10.20.30.1"\n', "")
         body = self._body(values)
-        assert body["gateway"] is None
+        assert body["gateway"] == "10.20.30.254"
+
+    def test_subnet_mask_omitted_renders_default(self):
+        values = _VALID_VALUES.replace('  subnetMask: "255.255.255.0"\n', "")
+        body = self._body(values)
+        assert body["subnetMask"] == "255.255.255.0"
+
+    def test_non_24_mask_without_gateway_fails_render(self):
+        """No defensible .254 default exists off a /24 — fail rather than guess."""
+        values = (
+            _VALID_VALUES
+            .replace('  subnetMask: "255.255.255.0"', '  subnetMask: "255.255.0.0"')
+            .replace('  network: "10.20.30.0"', '  network: "10.20.0.0"')
+            .replace('  gateway: "10.20.30.1"\n', "")
+        )
+        stderr = _helm_template_fails(values)
+        assert "gateway is required when subnetMask is 255.255.0.0" in stderr
+
+    def test_non_24_mask_with_explicit_gateway_renders(self):
+        """The mismatch guard applies only to the derive path, not to any non-/24 mask."""
+        values = (
+            _VALID_VALUES
+            .replace('  subnetMask: "255.255.255.0"', '  subnetMask: "255.255.0.0"')
+            .replace('  network: "10.20.30.0"', '  network: "10.20.0.0"')
+            .replace('  gateway: "10.20.30.1"', '  gateway: "10.20.0.1"')
+        )
+        body = self._body(values)
+        assert body["subnetMask"] == "255.255.0.0"
+        assert body["gateway"] == "10.20.0.1"
 
     def test_gateway_null_renders_null(self):
         values = _VALID_VALUES.replace('  gateway: "10.20.30.1"', "  gateway: null")
@@ -284,9 +360,9 @@ class TestHelmMappings:
         methods = [m["method"] for m in self._mappings(_VALID_VALUES)]
         assert "DELETE" in methods
 
-    def test_post_mapping_uses_scope_id_in_url(self):
+    def test_post_mapping_targets_the_scope_url(self):
         post = next(m for m in self._mappings(_VALID_VALUES) if m["method"] == "POST")
-        assert "network" in post["url"]
+        assert post["url"] == "(.payload.baseUrl)"
 
     def test_put_mapping_includes_body(self):
         put = next(m for m in self._mappings(_VALID_VALUES) if m["method"] == "PUT")

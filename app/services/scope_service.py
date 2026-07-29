@@ -22,8 +22,8 @@ from app.utils.powershell import ps_ipv4, ps_ipv4_csv, ps_single_quote
 logger = logging.getLogger(__name__)
 
 
-def _scope_extra(scope_id: str, operation: str, **extra: object) -> dict[str, object]:
-    return {"scope_id": str(scope_id), "operation": operation, **extra}
+def _scope_extra(scope: str, operation: str, **extra: object) -> dict[str, object]:
+    return {"scope": str(scope), "operation": operation, **extra}
 
 
 def _set_options_command(scope_literal: str, payload: DhcpScopePayload) -> str:
@@ -47,6 +47,39 @@ def _set_options_command(scope_literal: str, payload: DhcpScopePayload) -> str:
     return cmd + " -Force"
 
 
+def _set_boot_options_commands(scope_literal: str, payload: DhcpScopePayload) -> list[str]:
+    """Commands that write DHCP options 66/67, or [] when the scope has no PXE config.
+
+    These cannot join _set_options_command: Set-DhcpServerv4OptionValue exposes named
+    parameters only for options 3/6/15 (-Router/-DnsServer/-DnsDomain), and -OptionId
+    takes a single id per invocation. So the PXE pair costs one call per option.
+
+    Checking nextServer alone is sufficient — DhcpScopeBody.pxe_options_set_together
+    guarantees the two are both set or both empty.
+    """
+    if not payload.nextServer:
+        return []
+    return [
+        f"Set-DhcpServerv4OptionValue -ScopeId {scope_literal} "
+        f"-OptionId 66 -Value {ps_single_quote(payload.nextServer)} -Force",
+        f"Set-DhcpServerv4OptionValue -ScopeId {scope_literal} "
+        f"-OptionId 67 -Value {ps_single_quote(payload.bootFile)} -Force",
+    ]
+
+
+def _remove_boot_options_commands(scope_literal: str) -> list[str]:
+    """Commands that clear DHCP options 66/67.
+
+    Windows does not drop an option value just because it stopped being written, so
+    clearing the pair needs explicit removals — same reason the router option has an
+    explicit Remove in update_scope. One call per id, mirroring the -OptionId 3 removal.
+    """
+    return [
+        f"Remove-DhcpServerv4OptionValue -ScopeId {scope_literal} -OptionId {option_id}"
+        for option_id in (66, 67)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # PS execution helper  (single entry point with explicit error-handling policy)
 # ---------------------------------------------------------------------------
@@ -58,7 +91,7 @@ async def _run_ps(
     ignore_not_found: bool = False,
     ignore_already_exists: bool = False,
     warn_prefix: str | None = None,
-    scope_id: str | None = None,
+    scope: str | None = None,
     operation: str | None = None,
     relationship_name: str | None = None,
 ) -> dict | list | None:
@@ -76,7 +109,7 @@ async def _run_ps(
         return await run_ps(
             cmd,
             parse_json=parse_json,
-            scope_id=scope_id,
+            scope=scope,
             operation=operation,
             relationship_name=relationship_name,
         )
@@ -86,25 +119,25 @@ async def _run_ps(
                 "%s: %s",
                 warn_prefix,
                 exc.safe_stderr_preview,
-                extra=_scope_extra(scope_id or "", operation or "powershell", status="ignored"),
+                extra=_scope_extra(scope or "", operation or "powershell", status="ignored"),
             )
             return None
         if ignore_not_found and is_not_found_error(exc.stderr):
             logger.info(
                 "Ignoring DHCP object not found",
-                extra=_scope_extra(scope_id or "", operation or "powershell", status="ignored"),
+                extra=_scope_extra(scope or "", operation or "powershell", status="ignored"),
             )
             return None
         if ignore_already_exists and is_already_exists_error(exc.stderr):
             logger.info(
                 "Ignoring DHCP object already exists",
-                extra=_scope_extra(scope_id or "", operation or "powershell", status="ignored"),
+                extra=_scope_extra(scope or "", operation or "powershell", status="ignored"),
             )
             return None
         raise
 
 
-async def _try_assemble_scope(scope_id: str) -> Optional[DhcpScopePayload]:
+async def _try_assemble_scope(scope: str) -> Optional[DhcpScopePayload]:
     """Assemble scope state for delete pre-flight; return None if scope is not found.
 
     Only suppresses not-found errors (scope disappeared between existence check and
@@ -114,20 +147,20 @@ async def _try_assemble_scope(scope_id: str) -> Optional[DhcpScopePayload]:
     to remove the CR while the scope remains on the DHCP server.
     """
     try:
-        return await assemble_scope_state(scope_id)
+        return await assemble_scope_state(scope)
     except PowerShellError as exc:
         if is_not_found_error(exc.stderr):
             return None
         raise
 
 
-async def _assemble_existing_scope(scope_id: str) -> DhcpScopePayload:
+async def _assemble_existing_scope(scope: str) -> DhcpScopePayload:
     """Assemble a scope and translate legitimate missing-scope errors to domain 404."""
     try:
-        return await assemble_scope_state(scope_id)
+        return await assemble_scope_state(scope)
     except PowerShellError as exc:
         if is_not_found_error(exc.stderr):
-            raise ScopeNotFoundError(str(scope_id)) from exc
+            raise ScopeNotFoundError(str(scope)) from exc
         raise
 
 
@@ -166,27 +199,27 @@ async def list_scopes() -> DhcpScopeListResponse:
     errors: list[DhcpScopeListError] = []
     for entry in entries:
         state = normalize_get_scope_state(entry)
-        scope_id = _extract_ip_str(state["scope"].get("ScopeId") or "").strip()
-        if not scope_id:
+        scope = _extract_ip_str(state["scope"].get("ScopeId") or "").strip()
+        if not scope:
             continue
         try:
-            payloads.append(build_payload_from_scope_state(scope_id, state))
+            payloads.append(build_payload_from_scope_state(scope, state))
         except Exception as exc:
             logger.warning(
                 "Skipping scope with invalid data during list",
-                extra=_scope_extra(scope_id, "list_scopes", status="error"),
+                extra=_scope_extra(scope, "list_scopes", status="error"),
                 exc_info=True,
             )
-            errors.append(DhcpScopeListError(scopeId=scope_id, error=str(exc)))
+            errors.append(DhcpScopeListError(scope=scope, error=str(exc)))
     return DhcpScopeListResponse(
-        scopes=sorted(payloads, key=lambda p: ip_to_int(p.network)),
+        scopes=sorted(payloads, key=lambda p: ip_to_int(p.scope)),
         errors=errors,
     )
 
 
 @log_call
-async def scope_exists(scope_id: str) -> bool:
-    scope_literal = ps_ipv4(scope_id)
+async def scope_exists(scope: str) -> bool:
+    scope_literal = ps_ipv4(scope)
     script = (
         f"$found = $false\n"
         f"foreach ($s in @(Get-DhcpServerv4Scope -ErrorAction Stop)) {{\n"
@@ -199,7 +232,7 @@ async def scope_exists(scope_id: str) -> bool:
         parse_json=True,
         append_error_action=False,
         append_convert_to_json=False,
-        scope_id=scope_id,
+        scope=scope,
         operation="scope_exists",
     )
     return result is True
@@ -207,12 +240,13 @@ async def scope_exists(scope_id: str) -> bool:
 
 @log_call
 async def create_scope(payload: DhcpScopePayload) -> DhcpScopePayload:
-    scope_id = str(payload.network)
-    scope_literal = ps_ipv4(scope_id)
-    logger.info("Creating DHCP scope", extra=_scope_extra(scope_id, "create_scope"))
+    scope = str(payload.scope)
+    scope_literal = ps_ipv4(scope)
+    logger.info("Creating DHCP scope", extra=_scope_extra(scope, "create_scope"))
 
-    async with scope_locks.lock(scope_id):
-        if not await scope_exists(scope_id):
+    async with scope_locks.lock(scope):
+        already_existed = await scope_exists(scope)
+        if not already_existed:
             await _run_ps(
                 f'Add-DhcpServerv4Scope '
                 f'-Name {ps_single_quote(payload.scopeName)} '
@@ -223,50 +257,72 @@ async def create_scope(payload: DhcpScopePayload) -> DhcpScopePayload:
                 f'-LeaseDuration (New-TimeSpan -Days {payload.leaseDurationDays}) '
                 f'-Description {ps_single_quote(payload.description)}',
                 ignore_already_exists=True,
-                scope_id=scope_id,
+                scope=scope,
                 operation="add_scope",
             )
         else:
             logger.info(
                 "Scope already exists, converging desired state",
-                extra=_scope_extra(scope_id, "create_scope", status="already_exists"),
+                extra=_scope_extra(scope, "create_scope", status="already_exists"),
             )
 
         await run_ps(
             _set_options_command(scope_literal, payload),
             parse_json=False,
-            scope_id=scope_id,
+            scope=scope,
             operation="set_dns_options",
         )
+
+        # PXE options 66/67. A scope with no PXE config costs zero extra calls here,
+        # which is the common case.
+        for cmd in _set_boot_options_commands(scope_literal, payload):
+            await run_ps(
+                cmd,
+                parse_json=False,
+                scope=scope,
+                operation="set_boot_options",
+            )
+        # POST must converge, not just create (§2), so a pre-existing scope carrying
+        # stale boot options has them cleared when the desired state has none. Skipped
+        # for a freshly added scope, which cannot have any.
+        if already_existed and not payload.nextServer:
+            for cmd in _remove_boot_options_commands(scope_literal):
+                await _run_ps(
+                    cmd,
+                    parse_json=False,
+                    ignore_not_found=True,
+                    scope=scope,
+                    operation="remove_boot_options",
+                )
 
         for excl in payload.exclusions:
             await _run_ps(
                 f"Add-DhcpServerv4ExclusionRange -ScopeId {scope_literal} "
                 f"-StartRange {ps_ipv4(excl.startAddress)} -EndRange {ps_ipv4(excl.endAddress)}",
                 ignore_already_exists=True,
-                scope_id=scope_id,
+                scope=scope,
                 operation="add_exclusion",
             )
 
         if payload.failover is not None:
-            await _setup_failover(scope_id, payload.failover)
-            await _replicate_failover(scope_id, payload.failover.relationshipName)
+            await _setup_failover(scope, payload.failover)
+            await _replicate_failover(scope, payload.failover.relationshipName)
 
-        return await assemble_scope_state(scope_id)
-
-
-@log_call
-async def get_scope(scope_id: str) -> DhcpScopePayload:
-    logger.info("Getting DHCP scope", extra=_scope_extra(scope_id, "get_scope"))
-    return await _assemble_existing_scope(scope_id)
+        return await assemble_scope_state(scope)
 
 
 @log_call
-async def update_scope(scope_id: str, desired: DhcpScopePayload) -> DhcpScopePayload:
-    scope_literal = ps_ipv4(scope_id)
-    logger.info("Updating DHCP scope", extra=_scope_extra(scope_id, "update_scope"))
-    async with scope_locks.lock(scope_id):
-        current = await _assemble_existing_scope(scope_id)
+async def get_scope(scope: str) -> DhcpScopePayload:
+    logger.info("Getting DHCP scope", extra=_scope_extra(scope, "get_scope"))
+    return await _assemble_existing_scope(scope)
+
+
+@log_call
+async def update_scope(scope: str, desired: DhcpScopePayload) -> DhcpScopePayload:
+    scope_literal = ps_ipv4(scope)
+    logger.info("Updating DHCP scope", extra=_scope_extra(scope, "update_scope"))
+    async with scope_locks.lock(scope):
+        current = await _assemble_existing_scope(scope)
         changed = False
 
         if (
@@ -279,7 +335,7 @@ async def update_scope(scope_id: str, desired: DhcpScopePayload) -> DhcpScopePay
             changed = True
             logger.info(
                 "Updating DHCP scope parameters",
-                extra=_scope_extra(scope_id, "set_scope_params"),
+                extra=_scope_extra(scope, "set_scope_params"),
             )
             await run_ps(
                 f"Set-DhcpServerv4Scope -ScopeId {scope_literal} "
@@ -289,7 +345,7 @@ async def update_scope(scope_id: str, desired: DhcpScopePayload) -> DhcpScopePay
                 f"-StartRange {ps_ipv4(desired.startRange)} "
                 f"-EndRange {ps_ipv4(desired.endRange)}",
                 parse_json=False,
-                scope_id=scope_id,
+                scope=scope,
                 operation="set_scope_params",
             )
 
@@ -302,7 +358,7 @@ async def update_scope(scope_id: str, desired: DhcpScopePayload) -> DhcpScopePay
             changed = True
             logger.info(
                 "Updating DHCP scope options",
-                extra=_scope_extra(scope_id, "set_dns_options"),
+                extra=_scope_extra(scope, "set_dns_options"),
             )
             # Single combined call: sets DNS servers, domain, and gateway (when not None).
             # Merging DNS and gateway into one cmdlet call avoids a redundant PowerShell
@@ -310,7 +366,7 @@ async def update_scope(scope_id: str, desired: DhcpScopePayload) -> DhcpScopePay
             await run_ps(
                 _set_options_command(scope_literal, desired),
                 parse_json=False,
-                scope_id=scope_id,
+                scope=scope,
                 operation="set_dns_options",
             )
             # If gateway is being removed (transitioned to None), explicitly remove
@@ -319,16 +375,51 @@ async def update_scope(scope_id: str, desired: DhcpScopePayload) -> DhcpScopePay
             if current.gateway != desired.gateway and desired.gateway is None:
                 logger.info(
                     "Removing DHCP router option",
-                    extra=_scope_extra(scope_id, "remove_router_option"),
+                    extra=_scope_extra(scope, "remove_router_option"),
                 )
                 await _run_ps(
                     f"Remove-DhcpServerv4OptionValue -ScopeId {scope_literal} "
                     f"-OptionId 3",
                     parse_json=False,
                     ignore_not_found=True,
-                    scope_id=scope_id,
+                    scope=scope,
                     operation="remove_router_option",
                 )
+
+        # Boot options are diffed separately from the DNS/router block above: they need
+        # their own cmdlet calls either way, and keeping them apart means a PXE-only
+        # change does not re-issue the DNS write (and vice versa).
+        boot_options_changed = (
+            current.nextServer != desired.nextServer
+            or current.bootFile != desired.bootFile
+        )
+        if boot_options_changed:
+            changed = True
+            if desired.nextServer:
+                logger.info(
+                    "Updating DHCP boot options",
+                    extra=_scope_extra(scope, "set_boot_options"),
+                )
+                for cmd in _set_boot_options_commands(scope_literal, desired):
+                    await run_ps(
+                        cmd,
+                        parse_json=False,
+                        scope=scope,
+                        operation="set_boot_options",
+                    )
+            else:
+                logger.info(
+                    "Removing DHCP boot options",
+                    extra=_scope_extra(scope, "remove_boot_options"),
+                )
+                for cmd in _remove_boot_options_commands(scope_literal):
+                    await _run_ps(
+                        cmd,
+                        parse_json=False,
+                        ignore_not_found=True,
+                        scope=scope,
+                        operation="remove_boot_options",
+                    )
 
         current_excl = {(e.startAddress, e.endAddress) for e in current.exclusions}
         desired_excl = {(e.startAddress, e.endAddress) for e in desired.exclusions}
@@ -337,13 +428,13 @@ async def update_scope(scope_id: str, desired: DhcpScopePayload) -> DhcpScopePay
             changed = True
             logger.info(
                 "Removing DHCP exclusion range",
-                extra=_scope_extra(scope_id, "remove_exclusion"),
+                extra=_scope_extra(scope, "remove_exclusion"),
             )
             await run_ps(
                 f"Remove-DhcpServerv4ExclusionRange -ScopeId {scope_literal} "
                 f"-StartRange {ps_ipv4(start)} -EndRange {ps_ipv4(end)}",
                 parse_json=False,
-                scope_id=scope_id,
+                scope=scope,
                 operation="remove_exclusion",
             )
 
@@ -351,65 +442,65 @@ async def update_scope(scope_id: str, desired: DhcpScopePayload) -> DhcpScopePay
             changed = True
             logger.info(
                 "Adding DHCP exclusion range",
-                extra=_scope_extra(scope_id, "add_exclusion"),
+                extra=_scope_extra(scope, "add_exclusion"),
             )
             await run_ps(
                 f"Add-DhcpServerv4ExclusionRange -ScopeId {scope_literal} "
                 f"-StartRange {ps_ipv4(start)} -EndRange {ps_ipv4(end)}",
                 parse_json=False,
-                scope_id=scope_id,
+                scope=scope,
                 operation="add_exclusion",
             )
 
-        failover_changed = await _handle_failover_diff(scope_id, current.failover, desired.failover)
+        failover_changed = await _handle_failover_diff(scope, current.failover, desired.failover)
         changed = changed or failover_changed
 
         if changed and desired.failover is not None:
-            await _replicate_failover(scope_id, desired.failover.relationshipName)
+            await _replicate_failover(scope, desired.failover.relationshipName)
 
-        return await _assemble_existing_scope(scope_id)
+        return await _assemble_existing_scope(scope)
 
 
 @log_call
-async def delete_scope(scope_id: str) -> None:
-    scope_literal = ps_ipv4(scope_id)
-    logger.info("Received delete request for DHCP scope", extra=_scope_extra(scope_id, "delete_scope"))
-    async with scope_locks.lock(scope_id):
-        if not await scope_exists(scope_id):
+async def delete_scope(scope: str) -> None:
+    scope_literal = ps_ipv4(scope)
+    logger.info("Received delete request for DHCP scope", extra=_scope_extra(scope, "delete_scope"))
+    async with scope_locks.lock(scope):
+        if not await scope_exists(scope):
             logger.info(
                 "Scope not found — already absent, returning 204 (idempotent delete)",
-                extra=_scope_extra(scope_id, "delete_scope", status="not_found"),
+                extra=_scope_extra(scope, "delete_scope", status="not_found"),
             )
             return
 
-        current = await _try_assemble_scope(scope_id)
+        current = await _try_assemble_scope(scope)
         if current is None:
             logger.info(
                 "Scope disappeared between existence check and state assembly — "
                 "likely a concurrent delete, returning 204",
-                extra=_scope_extra(scope_id, "delete_scope", status="not_found"),
+                extra=_scope_extra(scope, "delete_scope", status="not_found"),
             )
             return
 
         if current.failover is not None:
-            await _remove_scope_from_failover(scope_id, current.failover.relationshipName)
+            await _remove_scope_from_failover(scope, current.failover.relationshipName)
 
         for excl in current.exclusions:
             await _run_ps(
                 f"Remove-DhcpServerv4ExclusionRange -ScopeId {scope_literal} "
                 f"-StartRange {ps_ipv4(excl.startAddress)} -EndRange {ps_ipv4(excl.endAddress)}",
                 warn_prefix=f"Failed to remove exclusion {excl.startAddress}",
-                scope_id=scope_id,
+                scope=scope,
                 operation="remove_exclusion",
             )
 
         await run_ps(
             f"Remove-DhcpServerv4Scope -ScopeId {scope_literal} -Force",
             parse_json=False,
-            scope_id=scope_id,
+            scope=scope,
             operation="remove_scope",
         )
-        logger.info("DHCP scope deleted", extra=_scope_extra(scope_id, "delete_scope", status="ok"))
+        logger.info("DHCP scope deleted", extra=_scope_extra(scope, "delete_scope", status="ok"))
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +508,7 @@ async def delete_scope(scope_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _fetch_failover_by_name(
-    rel_name: str, scope_id: str | None = None
+    rel_name: str, scope: str | None = None
 ) -> dict | None:
     """Return the failover relationship object for rel_name, or None if it doesn't exist.
 
@@ -438,7 +529,7 @@ async def _fetch_failover_by_name(
         parse_json=True,
         append_error_action=False,
         append_convert_to_json=False,
-        scope_id=scope_id,
+        scope=scope,
         operation="get_failover",
         relationship_name=rel_name,
     )
@@ -448,18 +539,18 @@ async def _fetch_failover_by_name(
 
 
 @log_call
-async def _replicate_failover(scope_id: str, relationship_name: str | None = None) -> None:
+async def _replicate_failover(scope: str, relationship_name: str | None = None) -> None:
     await run_ps(
-        f"Invoke-DhcpServerv4FailoverReplication -ScopeId {ps_ipv4(scope_id)} -Force",
+        f"Invoke-DhcpServerv4FailoverReplication -ScopeId {ps_ipv4(scope)} -Force",
         parse_json=False,
-        scope_id=scope_id,
+        scope=scope,
         operation="replicate_failover",
         relationship_name=relationship_name,
     )
     logger.info(
         "Failover replication completed",
         extra=_scope_extra(
-            scope_id,
+            scope,
             "replicate_failover",
             relationship_name=relationship_name,
             status="ok",
@@ -468,50 +559,53 @@ async def _replicate_failover(scope_id: str, relationship_name: str | None = Non
 
 
 @log_call
-async def _remove_scope_from_failover(scope_id: str, rel_name: str) -> None:
+async def _remove_scope_from_failover(scope: str, rel_name: str) -> None:
     await run_ps(
         f"Remove-DhcpServerv4FailoverScope -Name {ps_single_quote(rel_name)} "
-        f"-ScopeId {ps_ipv4(scope_id)} -Force",
+        f"-ScopeId {ps_ipv4(scope)} -Force",
         parse_json=False,
-        scope_id=scope_id,
+        scope=scope,
         operation="remove_failover_scope",
         relationship_name=rel_name,
     )
-    rel_raw = await _fetch_failover_by_name(rel_name, scope_id=scope_id)
+    rel_raw = await _fetch_failover_by_name(rel_name, scope=scope)
     if isinstance(rel_raw, dict) and not rel_raw.get("ScopeId"):
             await run_ps(
                 f"Remove-DhcpServerv4Failover -Name {ps_single_quote(rel_name)} -Force",
                 parse_json=False,
-                scope_id=scope_id,
+                scope=scope,
                 operation="remove_failover_relationship",
                 relationship_name=rel_name,
             )
 
 
 @log_call
-async def _setup_failover(scope_id: str, failover: DhcpFailover) -> None:
-    existing = await _fetch_failover_by_name(failover.relationshipName, scope_id=scope_id)
+async def _setup_failover(scope: str, failover: DhcpFailover) -> None:
+    existing = await _fetch_failover_by_name(failover.relationshipName, scope=scope)
     if existing:
         await _run_ps(
             f"Add-DhcpServerv4FailoverScope -Name {ps_single_quote(failover.relationshipName)} "
-            f"-ScopeId {ps_ipv4(scope_id)}",
+            f"-ScopeId {ps_ipv4(scope)}",
             ignore_already_exists=True,
-            scope_id=scope_id,
+            scope=scope,
             operation="add_failover_scope",
             relationship_name=failover.relationshipName,
         )
     else:
-        await _create_failover_relationship(scope_id, failover)
+        await _create_failover_relationship(scope, failover)
 
 
 @log_call
-async def _create_failover_relationship(scope_id: str, failover: DhcpFailover) -> None:
+async def _create_failover_relationship(scope: str, failover: DhcpFailover) -> None:
+    # Add-DhcpServerv4Failover has no -Mode parameter (unlike Set-DhcpServerv4Failover,
+    # which does). It resolves mode from the parameter set instead: -ServerRole /
+    # -ReservePercent select HotStandby, -LoadBalancePercent selects LoadBalance.
+    # Passing -Mode fails binding with NamedParameterNotFound before the cmdlet runs.
     cmd = (
         f'Add-DhcpServerv4Failover '
         f'-Name {ps_single_quote(failover.relationshipName)} '
         f'-PartnerServer {ps_single_quote(failover.partnerServer)} '
-        f'-ScopeId {ps_ipv4(scope_id)} '
-        f'-Mode {failover.mode} '
+        f'-ScopeId {ps_ipv4(scope)} '
         f'-MaxClientLeadTime (New-TimeSpan -Minutes {failover.maxClientLeadTimeMinutes}) '
         f'-Force'
     )
@@ -524,7 +618,7 @@ async def _create_failover_relationship(scope_id: str, failover: DhcpFailover) -
     await run_ps(
         cmd,
         parse_json=False,
-        scope_id=scope_id,
+        scope=scope,
         operation="create_failover_relationship",
         relationship_name=failover.relationshipName,
     )
@@ -532,7 +626,7 @@ async def _create_failover_relationship(scope_id: str, failover: DhcpFailover) -
 
 @log_call
 async def _handle_failover_diff(
-    scope_id: str,
+    scope: str,
     current: Optional[DhcpFailover],
     desired: Optional[DhcpFailover],
 ) -> bool:
@@ -541,24 +635,24 @@ async def _handle_failover_diff(
 
     if current is None:
         assert desired is not None
-        await _setup_failover(scope_id, desired)
+        await _setup_failover(scope, desired)
         return True
 
     if desired is None:
-        await _remove_scope_from_failover(scope_id, current.relationshipName)
+        await _remove_scope_from_failover(scope, current.relationshipName)
         return True
 
     if current.mode != desired.mode:
         logger.info(
             "Failover mode changed, recreating relationship",
             extra=_scope_extra(
-                scope_id,
+                scope,
                 "recreate_failover",
                 relationship_name=current.relationshipName,
             ),
         )
-        await _remove_scope_from_failover(scope_id, current.relationshipName)
-        await _setup_failover(scope_id, desired)
+        await _remove_scope_from_failover(scope, current.relationshipName)
+        await _setup_failover(scope, desired)
         return True
 
     identity_changed = (
@@ -570,13 +664,13 @@ async def _handle_failover_diff(
         logger.info(
             "Failover identity changed, recreating relationship",
             extra=_scope_extra(
-                scope_id,
+                scope,
                 "recreate_failover",
                 relationship_name=current.relationshipName,
             ),
         )
-        await _remove_scope_from_failover(scope_id, current.relationshipName)
-        await _setup_failover(scope_id, desired)
+        await _remove_scope_from_failover(scope, current.relationshipName)
+        await _setup_failover(scope, desired)
         return True
 
     if current.mode == "HotStandby":
@@ -594,7 +688,7 @@ async def _handle_failover_diff(
         logger.info(
             "Updating failover parameters",
             extra=_scope_extra(
-                scope_id,
+                scope,
                 "set_failover_params",
                 relationship_name=current.relationshipName,
             ),
@@ -610,7 +704,7 @@ async def _handle_failover_diff(
         await run_ps(
             cmd,
             parse_json=False,
-            scope_id=scope_id,
+            scope=scope,
             operation="set_failover_params",
             relationship_name=current.relationshipName,
         )

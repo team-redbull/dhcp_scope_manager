@@ -8,7 +8,7 @@ from app.models.scope import DhcpScopePayload
 class DhcpScopeListError(BaseModel):
     """Describes one scope that could not be assembled during GET /scopes."""
 
-    scopeId: str
+    scope: str
     error: str
 
 

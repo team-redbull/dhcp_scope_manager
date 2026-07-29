@@ -10,7 +10,7 @@ pytestmark = pytest.mark.asyncio
 def _make_scope(**overrides):
     defaults = dict(
         scopeName="Cluster-A",
-        network="10.20.30.0",
+        scope="10.20.30.0",
         subnetMask="255.255.255.0",
         startRange="10.20.30.100",
         endRange="10.20.30.200",
@@ -34,7 +34,7 @@ async def _run_update(current_scope, desired_scope):
     ):
         # First call returns current, second call returns "fresh" state after update
         mock_assemble.side_effect = [current_scope, desired_scope]
-        await scope_service.update_scope(current_scope.network, desired_scope)
+        await scope_service.update_scope(current_scope.scope, desired_scope)
         return mock_ps.call_args_list
 
 
@@ -171,7 +171,7 @@ async def test_failover_add_new_relationship():
             None,  # Add-DhcpServerv4Failover
             None,  # Invoke-DhcpServerv4FailoverReplication
         ]
-        await scope_service.update_scope(current.network, desired)
+        await scope_service.update_scope(current.scope, desired)
 
     ps_commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
     assert any("Add-DhcpServerv4Failover" in cmd for cmd in ps_commands)
@@ -204,7 +204,7 @@ async def test_failover_add_existing_relationship():
             None,  # Add-DhcpServerv4FailoverScope
             None,  # Invoke-DhcpServerv4FailoverReplication
         ]
-        await scope_service.update_scope(current.network, desired)
+        await scope_service.update_scope(current.scope, desired)
 
     ps_commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
     assert any("Add-DhcpServerv4FailoverScope" in cmd for cmd in ps_commands)
@@ -225,7 +225,7 @@ async def test_failover_remove():
             None,  # Remove-DhcpServerv4FailoverScope
             None,  # _fetch_failover_by_name → relationship gone → None → no Remove-Failover
         ]
-        await scope_service.update_scope(current.network, desired)
+        await scope_service.update_scope(current.scope, desired)
 
     ps_commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
     assert any("Remove-DhcpServerv4FailoverScope" in cmd for cmd in ps_commands)
@@ -243,7 +243,7 @@ async def test_failover_params_updated():
     ):
         mock_assemble.side_effect = [current, desired]
         mock_ps.return_value = None
-        await scope_service.update_scope(current.network, desired)
+        await scope_service.update_scope(current.scope, desired)
 
     ps_commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
     assert any("Set-DhcpServerv4Failover" in cmd for cmd in ps_commands)
@@ -274,7 +274,7 @@ async def test_failover_relationship_name_change_triggers_recreate():
     ):
         mock_assemble.side_effect = [current, desired]
         mock_ps.return_value = None
-        await scope_service.update_scope(current.network, desired)
+        await scope_service.update_scope(current.scope, desired)
 
     ps_commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
     # Must remove from old relationship
@@ -295,7 +295,7 @@ async def test_failover_partner_server_change_triggers_recreate():
     ):
         mock_assemble.side_effect = [current, desired]
         mock_ps.return_value = None
-        await scope_service.update_scope(current.network, desired)
+        await scope_service.update_scope(current.scope, desired)
 
     ps_commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
     assert any("Remove-DhcpServerv4FailoverScope" in cmd for cmd in ps_commands)
@@ -362,6 +362,9 @@ async def test_create_failover_loadbalance_excludes_server_role():
         "Add-DhcpServerv4Failover for LoadBalance must not include -ServerRole"
     )
     assert "-LoadBalancePercent 50" in add_cmd
+    assert "-Mode" not in add_cmd, (
+        "Add-DhcpServerv4Failover has no -Mode parameter; mode comes from the parameter set"
+    )
 
 
 async def test_create_failover_hotstandby_includes_server_role():
@@ -391,6 +394,9 @@ async def test_create_failover_hotstandby_includes_server_role():
     assert "-ServerRole Active" in add_cmd
     assert "-ReservePercent 5" in add_cmd
     assert "-LoadBalancePercent" not in add_cmd
+    assert "-Mode" not in add_cmd, (
+        "Add-DhcpServerv4Failover has no -Mode parameter; mode comes from the parameter set"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -635,3 +641,71 @@ async def test_only_gateway_changed_no_dns_single_options_call():
     set_options_calls = [cmd for cmd in ps_commands if "Set-DhcpServerv4OptionValue" in cmd]
     assert len(set_options_calls) == 1
     assert "-Router '10.20.30.2'" in set_options_calls[0]
+
+
+# ---------------------------------------------------------------------------
+# PXE boot options (DHCP 66/67)
+# ---------------------------------------------------------------------------
+
+_PXE = dict(nextServer="boot.lab.local", bootFile="snponly.efi")
+
+
+async def test_boot_options_added():
+    """Adding a PXE pair writes options 66 and 67, one Set call each."""
+    current = _make_scope()
+    desired = _make_scope(**_PXE)
+    ps_commands = [c.args[0] for c in await _run_update(current, desired)]
+    assert any(
+        "-OptionId 66" in cmd and "-Value 'boot.lab.local'" in cmd for cmd in ps_commands
+    )
+    assert any(
+        "-OptionId 67" in cmd and "-Value 'snponly.efi'" in cmd for cmd in ps_commands
+    )
+
+
+async def test_boot_options_removed():
+    """Clearing the pair removes both options — Windows keeps a value that stops being written."""
+    current = _make_scope(**_PXE)
+    desired = _make_scope()
+    ps_commands = [c.args[0] for c in await _run_update(current, desired)]
+    for option_id in (66, 67):
+        assert any(
+            "Remove-DhcpServerv4OptionValue" in cmd and f"-OptionId {option_id}" in cmd
+            for cmd in ps_commands
+        ), f"expected option {option_id} to be removed"
+    assert not any("-OptionId 66 -Value" in cmd for cmd in ps_commands)
+
+
+async def test_boot_file_changed_alone_rewrites_both():
+    """Repointing only the boot file still rewrites the pair — two Set calls, no removals."""
+    current = _make_scope(**_PXE)
+    desired = _make_scope(nextServer="boot.lab.local", bootFile="ipxe.efi")
+    ps_commands = [c.args[0] for c in await _run_update(current, desired)]
+    assert any("-OptionId 67" in cmd and "-Value 'ipxe.efi'" in cmd for cmd in ps_commands)
+    assert not any("Remove-DhcpServerv4OptionValue" in cmd for cmd in ps_commands)
+
+
+async def test_boot_options_unchanged_issues_no_calls():
+    """An unchanged PXE pair must not re-issue option writes — that would be a PUT loop."""
+    scope = _make_scope(**_PXE)
+    assert await _run_update(scope, scope) == []
+
+
+async def test_boot_only_change_does_not_rewrite_dns():
+    """A PXE-only change must not re-issue the DNS/router write, and vice versa.
+
+    This is why boot options are diffed in their own block rather than folded into
+    options_changed — a shared flag would make each change rewrite the other's options.
+    """
+    current = _make_scope()
+    desired = _make_scope(**_PXE)
+    ps_commands = [c.args[0] for c in await _run_update(current, desired)]
+    assert not any("-DnsServer" in cmd for cmd in ps_commands)
+
+
+async def test_dns_only_change_does_not_touch_boot_options():
+    current = _make_scope(dnsServers=["10.0.0.53"], **_PXE)
+    desired = _make_scope(dnsServers=["10.0.0.53", "10.0.0.54"], **_PXE)
+    ps_commands = [c.args[0] for c in await _run_update(current, desired)]
+    assert any("-DnsServer" in cmd for cmd in ps_commands)
+    assert not any("-OptionId 66" in cmd or "-OptionId 67" in cmd for cmd in ps_commands)
