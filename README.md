@@ -323,7 +323,7 @@ Returns all scopes sorted by network address (ascending). Uses **one PowerShell 
 
 ```json
 {
-  "scopes": [{ "scopeName": "...", "network": "10.20.30.0", "...": "..." }],
+  "scopes": [{ "scope": "10.20.30.0", "scopeName": "...", "...": "..." }],
   "errors": [
     {
       "scope": "10.20.31.0",
@@ -457,10 +457,13 @@ Environment validation is async-safe and cached per process. A successful check 
 
 ## Canonical Payload Shape
 
+The POST/PUT request body and the single-scope GET response, identical by
+construction — both are `DhcpScopeBody`. The scope address is absent on purpose:
+it is identity, carried in the URL only (see [API Endpoints](#api-endpoints)).
+
 ```json
 {
   "scopeName": "cluster-a-workers",
-  "network": "10.20.30.0",
   "subnetMask": "255.255.255.0",
   "startRange": "10.20.30.50",
   "endRange": "10.20.30.200",
@@ -474,6 +477,13 @@ Environment validation is async-safe and cached per process. A successful check 
   "exclusions": [{ "startAddress": "10.20.30.1", "endAddress": "10.20.30.10" }],
   "failover": null
 }
+```
+
+`GET /api/v1/scopes` returns these same objects with a leading `scope` field, since a
+list item has no URL of its own to identify it:
+
+```json
+{ "scope": "10.20.30.0", "scopeName": "cluster-a-workers", "...": "..." }
 ```
 
 - Field order is intentional and tested — Crossplane byte-compares GET response to PUT body.
