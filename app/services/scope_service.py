@@ -1,8 +1,9 @@
 from __future__ import annotations
+from ipaddress import IPv4Address
 import logging
 from typing import Optional
 
-from app.errors import ScopeNotFoundError
+from app.errors import ImmutableScopeFieldError, ScopeNotFoundError
 from app.models import DhcpFailover, DhcpScopeListError, DhcpScopeListResponse, DhcpScopePayload
 from app.errors import PowerShellError
 from app.services.ps_executor import is_already_exists_error, is_not_found_error, run_ps
@@ -65,6 +66,40 @@ def _set_boot_options_commands(scope_literal: str, payload: DhcpScopePayload) ->
         f"Set-DhcpServerv4OptionValue -ScopeId {scope_literal} "
         f"-OptionId 67 -Value {ps_single_quote(payload.bootFile)} -Force",
     ]
+
+
+def _range_transition_steps(
+    current: tuple[IPv4Address, IPv4Address],
+    desired: tuple[IPv4Address, IPv4Address],
+) -> list[tuple[IPv4Address, IPv4Address]]:
+    """Range writes needed to move a scope's pool from `current` to `desired`.
+
+    Set-DhcpServerv4Scope accepts a new range only when it is a superset or a
+    subset of the one the scope already holds.  A mixed change (one edge moving
+    out while the other moves in) or a disjoint move is refused with "Failed to
+    set IP address range to a scope" — verified against Windows Server 2022 with
+    DhcpServer module 2.0.0.0.
+
+    Routing through the union satisfies the rule in every case: widening to the
+    union is always a superset of current, and narrowing from the union to the
+    desired range is always a subset of it.  A pure widening or pure narrowing
+    collapses back to a single write, so the common case costs no extra call.
+
+    The intermediate union is briefly leasable.  For a mixed change every union
+    address already belongs to current or desired, so nothing new is exposed;
+    only a fully disjoint move opens the gap between the two ranges, and only
+    for the duration of one cmdlet call.  Deactivating the scope first is not an
+    alternative — range writes fail outright on an Inactive scope.
+    """
+    if current == desired:
+        return []
+    union = (min(current[0], desired[0]), max(current[1], desired[1]))
+    steps: list[tuple[IPv4Address, IPv4Address]] = []
+    if union != current:
+        steps.append(union)
+    if union != desired:
+        steps.append(desired)
+    return steps
 
 
 def _remove_boot_options_commands(scope_literal: str) -> list[str]:
@@ -325,13 +360,47 @@ async def update_scope(scope: str, desired: DhcpScopePayload) -> DhcpScopePayloa
         current = await _assemble_existing_scope(scope)
         changed = False
 
-        if (
+        # Guarded before any write: Windows has no in-place mask change, so the
+        # only honest answers are "refuse" or "recreate", and recreating drops
+        # every active lease on the subnet.
+        if current.subnetMask != desired.subnetMask:
+            raise ImmutableScopeFieldError(
+                "subnetMask", str(current.subnetMask), str(desired.subnetMask)
+            )
+
+        params_changed = (
             current.scopeName != desired.scopeName
             or current.leaseDurationDays != desired.leaseDurationDays
             or current.description != desired.description
-            or current.startRange != desired.startRange
-            or current.endRange != desired.endRange
-        ):
+        )
+        range_steps = _range_transition_steps(
+            (current.startRange, current.endRange),
+            (desired.startRange, desired.endRange),
+        )
+
+        # Range before parameters, in its own cmdlet call. Windows applies the
+        # name/lease/description half of a combined call even when it goes on to
+        # reject the range, which would leave the scope matching neither the old
+        # nor the new desired state. Writing the range first means a refused
+        # range aborts before anything else has been touched.
+        for start, end in range_steps:
+            changed = True
+            logger.info(
+                "Updating DHCP scope range",
+                extra=_scope_extra(
+                    scope, "set_scope_range", start_range=str(start), end_range=str(end)
+                ),
+            )
+            await run_ps(
+                f"Set-DhcpServerv4Scope -ScopeId {scope_literal} "
+                f"-StartRange {ps_ipv4(start)} "
+                f"-EndRange {ps_ipv4(end)}",
+                parse_json=False,
+                scope=scope,
+                operation="set_scope_range",
+            )
+
+        if params_changed:
             changed = True
             logger.info(
                 "Updating DHCP scope parameters",
@@ -341,9 +410,7 @@ async def update_scope(scope: str, desired: DhcpScopePayload) -> DhcpScopePayloa
                 f"Set-DhcpServerv4Scope -ScopeId {scope_literal} "
                 f"-Name {ps_single_quote(desired.scopeName)} "
                 f"-LeaseDuration (New-TimeSpan -Days {desired.leaseDurationDays}) "
-                f"-Description {ps_single_quote(desired.description)} "
-                f"-StartRange {ps_ipv4(desired.startRange)} "
-                f"-EndRange {ps_ipv4(desired.endRange)}",
+                f"-Description {ps_single_quote(desired.description)}",
                 parse_json=False,
                 scope=scope,
                 operation="set_scope_params",

@@ -104,6 +104,7 @@ class ErrorCode:
     UNAUTHORIZED = "UNAUTHORIZED"
     SCOPE_NOT_FOUND = "SCOPE_NOT_FOUND"
     DHCP_CONFLICT = "DHCP_CONFLICT"
+    IMMUTABLE_FIELD = "IMMUTABLE_FIELD"
     VALIDATION_ERROR = "VALIDATION_ERROR"
     POWERSHELL_COMMAND_FAILED = "POWERSHELL_COMMAND_FAILED"
     POWERSHELL_TIMEOUT = "POWERSHELL_TIMEOUT"
@@ -177,3 +178,26 @@ class DhcpConflictError(AppError):
 
     def __init__(self, message: str = "DHCP state conflicts with the request") -> None:
         super().__init__(message)
+
+
+class ImmutableScopeFieldError(AppError):
+    """A field Windows cannot change in place differs from the observed state.
+
+    Reported instead of attempting the write, because the alternative — deleting
+    and recreating the scope — drops every active lease on that subnet and is
+    not something a values-file edit should trigger silently.  Returning success
+    without applying the change is worse still: the drift is then invisible and
+    Crossplane re-sends the same PUT forever.
+    """
+
+    status_code = status.HTTP_409_CONFLICT
+    code = ErrorCode.IMMUTABLE_FIELD
+
+    def __init__(self, field: str, current: str, desired: str) -> None:
+        self.field = field
+        super().__init__(
+            f"{field} cannot be changed on an existing scope: the DHCP server "
+            f"holds {current}, the request asks for {desired}. Windows cannot "
+            f"change it in place — the scope must be deleted and recreated.",
+            details={"field": field, "current": current, "desired": desired},
+        )

@@ -60,8 +60,14 @@ _NOT_FOUND_MARKERS = (
 _ALREADY_EXISTS_MARKERS = (
     "resourceexists",   # category: duplicate scope
     "dhcp 20052",       # scope already exists
-    "dhcp 20023",       # exclusion range already present (category is InvalidData,
-                        # which is too broad to match on, so match the code)
+    # Windows overloads DHCP 20023 across unrelated range failures: it is both
+    # "exclusion range already present" (Add-DhcpServerv4ExclusionRange) and
+    # "failed to set IP address range to a scope" (Set-DhcpServerv4Scope). The
+    # category is InvalidData for both, too broad to match on, so the code is
+    # matched instead. Only ever pass ignore_already_exists=True to a cmdlet
+    # where "already present" is the sole way 20023 can arise — never to a
+    # range-setting call, or a real failure will be silently swallowed.
+    "dhcp 20023",
     "already exists",
     "already been added",
     "already in use",

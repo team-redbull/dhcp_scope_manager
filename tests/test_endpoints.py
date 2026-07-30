@@ -852,3 +852,25 @@ async def test_get_put_roundtrip_with_pxe_options(
     assert put_str == get_str, (
         f"GET/PUT mismatch with PXE options!\nPUT: {put_str}\nGET: {get_str}"
     )
+
+
+async def test_put_subnet_mask_change_returns_409():
+    """An in-place mask change is impossible on Windows, so it must be refused.
+
+    Returning 200 without applying it hides the drift and makes Crossplane
+    re-send the same PUT on every reconcile loop.
+    """
+    from app.errors import ImmutableScopeFieldError
+    with patch(
+        "app.services.scope_service.update_scope",
+        side_effect=ImmutableScopeFieldError(
+            "subnetMask", "255.255.255.0", "255.255.255.128"
+        ),
+    ):
+        r = await client.put("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 409
+    err = _error(r.json())
+    assert err["code"] == "IMMUTABLE_FIELD"
+    assert err["details"]["field"] == "subnetMask"
+    assert err["details"]["current"] == "255.255.255.0"
+    assert err["details"]["desired"] == "255.255.255.128"

@@ -709,3 +709,144 @@ async def test_dns_only_change_does_not_touch_boot_options():
     ps_commands = [c.args[0] for c in await _run_update(current, desired)]
     assert any("-DnsServer" in cmd for cmd in ps_commands)
     assert not any("-OptionId 66" in cmd or "-OptionId 67" in cmd for cmd in ps_commands)
+
+
+# ---------------------------------------------------------------------------
+# Range transitions
+#
+# Set-DhcpServerv4Scope only accepts a new range that is a superset or a subset
+# of the current one, so mixed and disjoint moves are routed through the union.
+# ---------------------------------------------------------------------------
+
+def _ip(text):
+    from ipaddress import IPv4Address
+    return IPv4Address(text)
+
+
+def _steps(current, desired):
+    from app.services.scope_service import _range_transition_steps
+    return _range_transition_steps(
+        (_ip(current[0]), _ip(current[1])),
+        (_ip(desired[0]), _ip(desired[1])),
+    )
+
+
+async def test_range_steps_no_change():
+    assert _steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.50", "10.20.30.200")) == []
+
+
+async def test_range_steps_pure_widening_is_one_write():
+    """Desired is already a superset — Windows takes it directly."""
+    assert _steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.40", "10.20.30.250")) == [
+        (_ip("10.20.30.40"), _ip("10.20.30.250"))
+    ]
+
+
+async def test_range_steps_pure_narrowing_is_one_write():
+    """Desired is already a subset — Windows takes it directly."""
+    assert _steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.60", "10.20.30.190")) == [
+        (_ip("10.20.30.60"), _ip("10.20.30.190"))
+    ]
+
+
+async def test_range_steps_single_edge_moves_are_one_write():
+    assert len(_steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.40", "10.20.30.200"))) == 1
+    assert len(_steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.50", "10.20.30.180"))) == 1
+    assert len(_steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.60", "10.20.30.200"))) == 1
+    assert len(_steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.50", "10.20.30.250"))) == 1
+
+
+async def test_range_steps_mixed_start_out_end_in_goes_via_union():
+    assert _steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.40", "10.20.30.180")) == [
+        (_ip("10.20.30.40"), _ip("10.20.30.200")),   # union: superset of current
+        (_ip("10.20.30.40"), _ip("10.20.30.180")),   # desired: subset of union
+    ]
+
+
+async def test_range_steps_mixed_start_in_end_out_goes_via_union():
+    assert _steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.60", "10.20.30.250")) == [
+        (_ip("10.20.30.50"), _ip("10.20.30.250")),
+        (_ip("10.20.30.60"), _ip("10.20.30.250")),
+    ]
+
+
+async def test_range_steps_disjoint_goes_via_union():
+    assert _steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.10", "10.20.30.40")) == [
+        (_ip("10.20.30.10"), _ip("10.20.30.200")),
+        (_ip("10.20.30.10"), _ip("10.20.30.40")),
+    ]
+    assert _steps(("10.20.30.50", "10.20.30.200"), ("10.20.30.210", "10.20.30.250")) == [
+        (_ip("10.20.30.50"), _ip("10.20.30.250")),
+        (_ip("10.20.30.210"), _ip("10.20.30.250")),
+    ]
+
+
+async def test_range_steps_every_step_is_a_superset_or_subset_of_its_predecessor():
+    """The property the whole helper exists to guarantee."""
+    edges = ["10.20.30.10", "10.20.30.50", "10.20.30.120", "10.20.30.200", "10.20.30.250"]
+    pairs = [(a, b) for a in edges for b in edges if _ip(a) < _ip(b)]
+    for current in pairs:
+        for desired in pairs:
+            prev = (_ip(current[0]), _ip(current[1]))
+            for step in _steps(current, desired):
+                superset = step[0] <= prev[0] and step[1] >= prev[1]
+                subset = step[0] >= prev[0] and step[1] <= prev[1]
+                assert superset or subset, (
+                    f"{current} -> {desired}: step {step} is neither a superset "
+                    f"nor a subset of {prev}, Windows would refuse it"
+                )
+                prev = step
+            assert prev == (_ip(desired[0]), _ip(desired[1]))
+
+
+async def test_range_change_is_separate_from_scope_params():
+    """A combined write applies name/lease/description even when the range is refused."""
+    current = _make_scope(startRange="10.20.30.100", endRange="10.20.30.200")
+    desired = _make_scope(
+        scopeName="New Name", startRange="10.20.30.90", endRange="10.20.30.190"
+    )
+    ps_commands = [c.args[0] for c in await _run_update(current, desired)]
+    range_writes = [c for c in ps_commands if "-StartRange" in c]
+    param_writes = [c for c in ps_commands if "-Name " in c]
+    assert range_writes, "expected a range write"
+    assert param_writes, "expected a scope-parameter write"
+    assert not any("-Name " in c for c in range_writes), "range write must not carry -Name"
+    assert not any("-StartRange" in c for c in param_writes), "param write must not carry the range"
+    assert ps_commands.index(range_writes[0]) < ps_commands.index(param_writes[0]), (
+        "the range must be written first so a refused range aborts before "
+        "name/lease/description have been applied"
+    )
+
+
+async def test_mixed_range_change_issues_two_range_writes_union_first():
+    current = _make_scope(startRange="10.20.30.100", endRange="10.20.30.200")
+    desired = _make_scope(startRange="10.20.30.90", endRange="10.20.30.190")
+    ps_commands = [c.args[0] for c in await _run_update(current, desired)]
+    range_writes = [c for c in ps_commands if "-StartRange" in c]
+    assert len(range_writes) == 2, f"expected union + desired, got {range_writes}"
+    assert "'10.20.30.90'" in range_writes[0] and "'10.20.30.200'" in range_writes[0]
+    assert "'10.20.30.90'" in range_writes[1] and "'10.20.30.190'" in range_writes[1]
+
+
+async def test_name_only_change_issues_no_range_write():
+    current = _make_scope(scopeName="Old Name")
+    desired = _make_scope(scopeName="New Name")
+    ps_commands = [c.args[0] for c in await _run_update(current, desired)]
+    assert not any("-StartRange" in cmd for cmd in ps_commands)
+
+
+async def test_subnet_mask_change_is_rejected_before_any_write():
+    from app.errors import ImmutableScopeFieldError
+    current = _make_scope(subnetMask="255.255.255.0")
+    # A /25 payload that is valid in its own right — the rejection must come from
+    # the mask differing from observed state, not from body validation.
+    desired = _make_scope(
+        subnetMask="255.255.255.128",
+        startRange="10.20.30.100",
+        endRange="10.20.30.120",
+        gateway="10.20.30.126",
+    )
+    with pytest.raises(ImmutableScopeFieldError) as exc:
+        await _run_update(current, desired)
+    assert exc.value.field == "subnetMask"
+    assert exc.value.status_code == 409

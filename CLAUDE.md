@@ -51,6 +51,12 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
   the rendered PUT body must carry it too or the byte-compare in §9 never converges. Change
   one, change all three.
 
+**Immutable on an existing scope** (`subnetMask`)
+
+- Windows cannot change a scope's mask in place — the scope must be deleted and recreated
+- A PUT that changes it is refused with 409, never silently accepted (see §6)
+- On POST for a *new* scope the mask is applied normally; only the update path is affected
+
 **Reconciliation safety**
 
 - No hidden defaults inside the API beyond the two derived above; everything else comes from Helm / Git values
@@ -138,11 +144,35 @@ PUT is **diff-based convergence**, not full replace. Only changed sections trigg
 
 | Section      | Changed when                       | PowerShell cmdlet                            |
 | ------------ | ---------------------------------- | -------------------------------------------- |
-| Scope params | name / lease / description / range | `Set-DhcpServerv4Scope`                      |
+| Scope range  | `startRange` / `endRange`          | `Set-DhcpServerv4Scope` (1–2 calls, see below) |
+| Scope params | name / lease / description         | `Set-DhcpServerv4Scope`                      |
 | Options      | gateway / DNS servers / domain     | `Set-DhcpServerv4OptionValue`                |
 | Boot options | `nextServer` / `bootFile`          | `Set-` / `Remove-DhcpServerv4OptionValue` (ids 66, 67) |
 | Exclusions   | set difference (add/remove)        | `Add-` / `Remove-DhcpServerv4ExclusionRange` |
 | Failover     | any failover field                 | add / remove / update relationship           |
+| `subnetMask` | any change                         | **none — rejected with 409** (see below)     |
+
+**Range and params are separate calls, range first.** `Set-DhcpServerv4Scope` applies
+the name/lease/description half of a combined call even when it goes on to reject the
+range, leaving the scope matching neither the old nor the new desired state. Writing
+the range first means a refused range aborts before anything else is touched.
+
+**Range changes route through the union.** Windows accepts a new range only when it is
+a superset or a subset of the one the scope already holds; a mixed change (one edge
+moving out while the other moves in) or a disjoint move is refused with "Failed to set
+IP address range to a scope" (`DHCP 20023`). `_range_transition_steps` therefore widens
+to the union of current and desired first, then narrows to desired — each step is a
+superset or subset by construction. Pure widenings and narrowings collapse to a single
+call, so the common case costs nothing extra. The intermediate union is briefly
+leasable; for a mixed change every union address already belongs to current or desired,
+so only a fully disjoint move exposes new addresses. Deactivating the scope first is
+not an alternative — range writes fail outright on an Inactive scope.
+
+**`subnetMask` is immutable on an existing scope.** `Set-DhcpServerv4Scope` has no
+`-SubnetMask` parameter; changing a mask requires deleting and recreating the scope,
+which drops every active lease on that subnet. A PUT that changes it is rejected with
+409 `IMMUTABLE_FIELD` naming both values, rather than returning 200 without applying it
+— a silent no-op hides the drift and makes Crossplane re-send the same PUT forever.
 
 Boot options are diffed in their own block, not folded into Options: they need separate
 cmdlet calls either way, and a shared flag would make a PXE-only change rewrite the DNS

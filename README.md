@@ -284,6 +284,7 @@ Common error codes:
 | `401`       | `UNAUTHORIZED`                 | Missing or invalid bearer token                                |
 | `404`       | `SCOPE_NOT_FOUND`              | DHCP scope does not exist                                      |
 | `409`       | `DHCP_CONFLICT`                | Windows DHCP reported an unsafe already-exists/in-use conflict |
+| `409`       | `IMMUTABLE_FIELD`              | `subnetMask` differs from the scope on the server — not changeable in place |
 | `422`       | `VALIDATION_ERROR`             | Request body failed FastAPI/Pydantic validation                |
 | `500`       | `POWERSHELL_COMMAND_FAILED`    | PowerShell failed unexpectedly                                 |
 | `500`       | `INTERNAL_ERROR`               | Unexpected Python/backend bug                                  |
@@ -390,12 +391,38 @@ Diff-based convergence — compares the current scope state to the desired paylo
 
 | Changed fields                                                            | PowerShell cmdlet                                                                            |
 | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `scopeName`, `leaseDurationDays`, `description`, `startRange`, `endRange` | `Set-DhcpServerv4Scope`                                                                      |
+| `startRange`, `endRange`                                                  | `Set-DhcpServerv4Scope` — written first, in its own call, routed through the union (see below) |
+| `scopeName`, `leaseDurationDays`, `description`                           | `Set-DhcpServerv4Scope`                                                                      |
+| `subnetMask`                                                              | none — rejected with `409 IMMUTABLE_FIELD` (see below)                                        |
 | `gateway`, `dnsServers`, `dnsDomain`                                      | `Set-DhcpServerv4OptionValue`; `gateway: null` removes DHCP option 3                         |
 | `nextServer`, `bootFile`                                                  | `Set-DhcpServerv4OptionValue -OptionId 66/67`; clearing both removes the options              |
 | Exclusions added                                                          | `Add-DhcpServerv4ExclusionRange`                                                             |
 | Exclusions removed                                                        | `Remove-DhcpServerv4ExclusionRange`                                                          |
 | Failover added / changed / removed                                        | `Add-DhcpServerv4Failover` / `Set-DhcpServerv4Failover` / `Remove-DhcpServerv4FailoverScope` |
+
+**Why the range is written separately, and first.** `Set-DhcpServerv4Scope` applies the
+name/lease/description half of a combined call even when it then rejects the range,
+which would leave the scope matching neither the old nor the new desired state. Keeping
+the range in its own call, ordered first, means a refused range aborts before anything
+else has been written.
+
+**Why a range change can take two calls.** Windows accepts a new range only when it is a
+superset or a subset of the one the scope already holds. A mixed change — one edge moving
+out while the other moves in — or a disjoint move is refused with "Failed to set IP
+address range to a scope" (`DHCP 20023`). The service widens to the union of the current
+and desired ranges first, then narrows to the desired range; each step is a superset or a
+subset by construction. A pure widening or narrowing collapses to one call, so the common
+case costs nothing extra. The intermediate union is briefly leasable — for a mixed change
+every union address already belongs to the current or desired range, so only a fully
+disjoint move exposes new addresses, and only for one cmdlet call. Deactivating the scope
+first is not an alternative: range writes fail outright on an Inactive scope.
+
+**Why `subnetMask` is refused.** `Set-DhcpServerv4Scope` has no `-SubnetMask` parameter;
+changing a mask requires deleting and recreating the scope, which drops every active lease
+on that subnet. A PUT that changes it returns `409 IMMUTABLE_FIELD` naming both the
+observed and requested masks. Returning `200` without applying it would hide the drift and
+make Crossplane re-send the same PUT on every reconcile loop. Creating a *new* scope with
+any valid mask works normally — only the update path is affected.
 
 | Status | Body                                                               | When                                                                        |
 | ------ | ------------------------------------------------------------------ | --------------------------------------------------------------------------- |
@@ -404,6 +431,7 @@ Diff-based convergence — compares the current scope state to the desired paylo
 | `401`  | Standard error body with `UNAUTHORIZED`                            | Bad or missing bearer token                                                 |
 | `404`  | Standard error body with `SCOPE_NOT_FOUND`                         | Scope does not exist — Crossplane responds by issuing `POST`                |
 | `409`  | Standard error body with `DHCP_CONFLICT`                           | Unsafe existing/in-use DHCP state                                           |
+| `409`  | Standard error body with `IMMUTABLE_FIELD`                         | `subnetMask` differs from the scope on the server                           |
 | `422`  | Standard error body with `VALIDATION_ERROR`                        | Request body fails Pydantic field constraints                               |
 | `500`  | Standard error body with `POWERSHELL_COMMAND_FAILED`               | PowerShell cmdlet failed                                                    |
 | `503`  | Standard error body with `DHCP_ENVIRONMENT_UNAVAILABLE`            | Host cannot run DHCP automation                                             |
@@ -570,7 +598,7 @@ Quick reference — see the per-endpoint tables above for the exact set each rou
 | `400` | Bad Request           | `INVALID_SCOPE`                                                                      |
 | `401` | Unauthorized          | `UNAUTHORIZED`                                                                       |
 | `404` | Not Found             | `SCOPE_NOT_FOUND` — GET and PUT only                                                 |
-| `409` | Conflict              | `DHCP_CONFLICT`                                                                      |
+| `409` | Conflict              | `DHCP_CONFLICT`, `IMMUTABLE_FIELD` — PUT only                                        |
 | `422` | Unprocessable Entity  | `VALIDATION_ERROR`                                                                   |
 | `500` | Internal Server Error | `POWERSHELL_COMMAND_FAILED`, `INTERNAL_ERROR`                                        |
 | `503` | Service Unavailable   | `DHCP_ENVIRONMENT_UNAVAILABLE`                                                       |
