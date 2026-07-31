@@ -22,7 +22,15 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 
 **Idempotency**
 
-- POST must not fail if scope already exists — converge to desired state
+- POST must not fail if scope already exists — it is the create path, and must be
+  safe to retry after a partially-failed create
+- POST converges options, PXE and exclusion *additions* on an existing scope, but
+  **not** `scopeName` / `leaseDurationDays` / `description` / `startRange` /
+  `endRange`, exclusion removals, or clearing a `gateway`. Those live only in
+  `Add-DhcpServerv4Scope`, which the already-exists path skips. Converging an
+  existing scope is PUT's job (§6) — Crossplane only POSTs after a `GET` 404, so
+  it reaches an existing scope only when retrying its own create, where those
+  fields were already written correctly. Documented in the README's POST section.
 - DELETE must not fail if scope does not exist
 
 **Deterministic data**

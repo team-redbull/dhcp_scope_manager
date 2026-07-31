@@ -345,7 +345,30 @@ Returns all scopes sorted by network address (ascending). Uses **one PowerShell 
 
 ### `POST /api/v1/scopes/{scope}`
 
-Creates the scope if it does not exist, then converges all options, exclusions, and failover to the desired state. Idempotent — never fails if the scope already exists.
+Creates the scope if it does not exist, then converges options, exclusions, and failover to the desired state. Idempotent — never fails if the scope already exists.
+
+> **POST does not fully converge a scope that already exists.** Reconciliation
+> is `PUT`'s job; `POST` is the create path and is only safe to *retry*, not to
+> use as a general update.
+>
+> When the scope is already present, POST skips `Add-DhcpServerv4Scope` — the
+> only cmdlet on this path that writes `scopeName`, `leaseDurationDays`,
+> `description`, `startRange` and `endRange` — so those five fields are left at
+> whatever the server already holds. Exclusions are added but never removed, and
+> a `gateway` of `null` does not clear an existing DHCP option 3. The fields that
+> do converge (`dnsServers`, `dnsDomain`, a changed `gateway`, `nextServer` /
+> `bootFile`, added exclusions) are the ones written by option cmdlets that run
+> on both the create and already-exists paths.
+>
+> This is deliberate and does not affect GitOps reconciliation. Crossplane only
+> issues POST after a `GET` returns `404`, so POST reaches an existing scope only
+> when retrying its own partially-failed create — and there the skipped fields
+> were already written correctly by the create call it is retrying. Any real
+> drift is caught by the next `GET` and repaired with `PUT`.
+>
+> The consequence to be aware of: a POST sent **by hand** against an existing
+> scope with different values returns `200` while silently leaving those five
+> fields unchanged. Use `PUT` to update an existing scope.
 
 | Status | Body                                                               | When                                                                        |
 | ------ | ------------------------------------------------------------------ | --------------------------------------------------------------------------- |
