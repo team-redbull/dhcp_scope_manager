@@ -118,6 +118,10 @@ def build_get_all_scopes_script() -> str:
     matching by ScopeId inside Python/PowerShell — this avoids treating a scope
     that is not in any failover relationship as a PowerShell error.
 
+    A relationship holding no scopes has a null ScopeId, and `@($null)` is a
+    one-element array containing $null, not an empty one — hence the
+    Where-Object guard before .ToString().
+
     PowerShell collapses a single-element array to a plain object in ConvertTo-Json.
     normalize_list() on the parsed result handles both cases transparently.
     """
@@ -152,7 +156,7 @@ foreach ($s in $allScopes) {
 
     $failover = $null
     foreach ($fo in $allFailovers) {
-        $foScopes = @($fo.ScopeId) | ForEach-Object { $_.ToString() }
+        $foScopes = @($fo.ScopeId) | Where-Object { $null -ne $_ } | ForEach-Object { $_.ToString() }
         if ($foScopes -contains $sid) {
             $failover = $fo
             break
@@ -177,6 +181,10 @@ def build_get_scope_state_script(scope: str) -> str:
     Failover is resolved via an aggregate Get-DhcpServerv4Failover call (no -ScopeId)
     so that a scope not participating in any failover relationship is never treated as
     a PowerShell error — the filter simply yields $null, which normalizes to failover: null.
+
+    A relationship holding no scopes has a null ScopeId, and `@($null)` is a one-element
+    array containing $null, not an empty one — hence the Where-Object guard before
+    .ToString().
     """
     scope_literal = ps_single_quote(_validated_scope(scope))
     return (
@@ -209,7 +217,7 @@ try {{
 $allFailovers = @(Get-DhcpServerv4Failover -ErrorAction Stop)
 $failover = $null
 foreach ($fo in $allFailovers) {{
-    $foScopes = @($fo.ScopeId) | ForEach-Object {{ $_.ToString() }}
+    $foScopes = @($fo.ScopeId) | Where-Object {{ $null -ne $_ }} | ForEach-Object {{ $_.ToString() }}
     if ($foScopes -contains $ScopeId) {{
         $failover = $fo
         break

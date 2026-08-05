@@ -430,6 +430,16 @@ def test_all_scopes_script_uses_aggregate_failover_lookup():
     assert "Get-DhcpServerv4Failover -ScopeId" not in script
 
 
+def test_failover_scope_ids_are_null_guarded():
+    """A relationship with no scopes has a null ScopeId, and @($null) yields [$null].
+
+    Calling .ToString() on that element fails the whole script with
+    InvokeMethodOnNull, so every scope id must pass a null filter first.
+    """
+    for script in (build_get_scope_state_script("10.20.30.0"), build_get_all_scopes_script()):
+        assert "Where-Object { $null -ne $_ } | ForEach-Object { $_.ToString() }" in script
+
+
 def test_all_scopes_script_uses_list_accumulator():
     """The all-scopes script must use a List accumulator and foreach loop."""
     script = build_get_all_scopes_script()
