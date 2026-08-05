@@ -85,15 +85,8 @@ def _minimal_cluster_yaml() -> str:
         "    domain: lab.local\n"
         "  exclusions: []\n"
         "  failover: null\n"
-        "apiServer:\n"
-        "  url: https://dhcp-api.example.com\n"
-        "  tokenSecretRef:\n"
-        "    name: dhcp-token\n"
-        "    namespace: crossplane-system\n"
-        "    key: token\n"
-        "crossplane:\n"
-        "  namespace: crossplane-system\n"
-        "  providerConfigName: dhcp-provider\n"
+        # No dhcp_api / crossplane keys: those are chart-owned (helm/values.yaml),
+        # never part of the values repo this script walks.
     )
 
 
@@ -670,6 +663,89 @@ class TestDeepMerge:
         base = {"servers": ["1.1.1.1"]}
         vdv._deep_merge(base, {"servers": ["2.2.2.2"]})
         assert base["servers"] == ["2.2.2.2"]
+
+
+# ─── configValues.yaml as the base of the merge ───────────────────────────────
+
+class TestGlobalConfigInheritance:
+    """configValues.yaml is a real merge layer, not just a file that must exist.
+
+    Argo CD passes it as the first -f (hcAppset.yaml's valueFiles), so a cluster
+    may legitimately inherit required fields from it. Validating without it would
+    report those fields as missing on every cluster in the repo.
+    """
+
+    _GLOBAL = (
+        "dhcp_values:\n"
+        "  leaseDurationDays: 8\n"
+        "  subnetMask: 255.255.255.0\n"
+        "  dns:\n"
+        "    servers:\n"
+        "      - 10.50.1.5\n"
+        "      - 10.50.1.6\n"
+        "    domain: global.lab.local\n"
+    )
+
+    # Everything required is inherited except what identifies this scope.
+    _SPARSE_CLUSTER = (
+        "dhcp_values:\n"
+        "  scopeName: Sparse Scope\n"
+        "  network: 10.20.30.0\n"
+        "  startRange: 10.20.30.100\n"
+        "  endRange: 10.20.30.200\n"
+        "  failover: null\n"
+    )
+
+    def _run(self, tmp_path, global_yaml: str) -> tuple[int, str]:
+        import argparse
+        import io
+        from contextlib import redirect_stdout
+
+        sites_dir = _build_tree(tmp_path, {
+            "_configValues": global_yaml,
+            "telAviv": {"mces": {"prep-mce-tlv-a": {
+                "hostedClusters": {"prep-tlv-gpu.yaml": self._SPARSE_CLUSTER},
+            }}},
+        })
+        args = argparse.Namespace(
+            sites_dir=str(sites_dir), repo_root=str(tmp_path),
+            site=None, mce=None, cluster=None,
+            verbose=False, fail_fast=False, no_color=True,
+            strict=False, format="text",
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = vdv.run_validation(args)
+        return rc, buf.getvalue()
+
+    def test_required_fields_inherited_from_global(self, tmp_path):
+        rc, out = self._run(tmp_path, self._GLOBAL)
+        assert rc == 0, out
+
+    def test_same_cluster_fails_without_the_global_layer(self, tmp_path):
+        """The inverse — proves the pass above comes from the merge, not from
+        the fields having quietly stopped being required."""
+        rc, out = self._run(tmp_path, "global: true\n")
+        assert rc == 1
+        assert "leaseDurationDays" in out
+        assert "dns.servers" in out
+
+    def test_cluster_overrides_global(self, tmp_path, capsys):
+        override = self._SPARSE_CLUSTER + "  leaseDurationDays: 30\n"
+        sites_dir = _build_tree(tmp_path, {
+            "_configValues": self._GLOBAL,
+            "telAviv": {"mces": {"prep-mce-tlv-a": {
+                "hostedClusters": {"prep-tlv-gpu.yaml": override},
+            }}},
+        })
+        merged = vdv.merge_yaml_files(
+            sites_dir / "configValues.yaml",
+            sites_dir / "telAviv" / "values.yaml",
+            sites_dir / "telAviv" / "mces" / "prep-mce-tlv-a" / "values.yaml",
+            sites_dir / "telAviv" / "mces" / "prep-mce-tlv-a" / "hostedClusters" / "prep-tlv-gpu.yaml",
+        )
+        assert merged["dhcp_values"]["leaseDurationDays"] == 30
+        assert merged["dhcp_values"]["dns"]["servers"] == ["10.50.1.5", "10.50.1.6"]
 
 
 # ─── PXE boot options (DHCP 66/67) ────────────────────────────────────────────

@@ -59,12 +59,12 @@ def _parse_cr(rendered: str) -> dict:
     return docs[0]
 
 
-# Minimal valid values.
-# Includes failover: null and explicit tokenSecretRef: null to override the chart
-# defaults in values.yaml (which has HotStandby failover and a complete tokenSecretRef).
-# Without these overrides, defaults leak into "no failover" and "no secret" test cases.
+# Minimal valid values. dhcp_values comes entirely from here: the chart's own
+# values.yaml ships it commented out, so nothing leaks in from the base layer.
+# failover: null and tokenSecretRef: null are still spelled out so the "no failover"
+# and "no token" cases stay explicit rather than relying on absence.
 _VALID_VALUES = textwrap.dedent("""\
-    apiServer:
+    dhcp_api:
       url: https://dhcp-api.lab.local
       tokenSecretRef: null
     dhcp_values:
@@ -137,13 +137,12 @@ class TestHelmRequiredFields:
     def test_network_required(self):
         """helm template fails when network is explicitly set to empty string.
 
-        The chart has a default value for network in values.yaml, so merely
-        omitting the key uses that default.  The `required` guard fires only
-        when the value resolves to an empty / null string — achieved here by
-        explicitly overriding with network: "".
+        Omitting dhcp_values entirely renders nothing at all (the template is gated
+        on scopeName), so the `required` guard is reached only by supplying a scope
+        whose network resolves to an empty / null string.
         """
         values = textwrap.dedent("""\
-            apiServer:
+            dhcp_api:
               url: https://dhcp-api.lab.local
             dhcp_values:
               network: ""
@@ -162,13 +161,13 @@ class TestHelmRequiredFields:
         assert "network" in stderr.lower() or "required" in stderr.lower()
 
     def test_api_server_url_required(self):
-        """helm template fails when apiServer.url is explicitly set to empty string.
+        """helm template fails when dhcp_api.url is explicitly set to empty string.
 
         The chart has a default url in values.yaml, so merely omitting the key
         uses that default.  Explicitly setting url: "" triggers the `required` guard.
         """
         values = textwrap.dedent("""\
-            apiServer:
+            dhcp_api:
               url: ""
             dhcp_values:
               scopeName: "test"
@@ -184,14 +183,20 @@ class TestHelmRequiredFields:
               exclusions: []
         """)
         stderr = _helm_template_fails(values)
-        assert "apiServer" in stderr or "url" in stderr.lower() or "required" in stderr.lower()
+        assert "dhcp_api" in stderr or "url" in stderr.lower() or "required" in stderr.lower()
 
 
 class TestHelmPayloadBody:
 
     def _body(self, values_content: str) -> dict:
+        """The request body, parsed.
+
+        provider-http types payload.body as a JSON *string*, so the chart renders
+        text rather than a nested mapping. json.loads preserves insertion order,
+        so the field-order assertions below still read the canonical order.
+        """
         cr = _parse_cr(_helm_template(values_content))
-        return cr["spec"]["forProvider"]["payload"]["body"]
+        return json.loads(cr["spec"]["forProvider"]["payload"]["body"])
 
     def test_scope_name_in_body(self):
         body = self._body(_VALID_VALUES)
@@ -216,7 +221,7 @@ class TestHelmPayloadBody:
     def test_description_defaults_to_empty_string_not_null(self):
         """description must be "" not null — otherwise Crossplane sees a mismatch."""
         values = textwrap.dedent("""\
-            apiServer:
+            dhcp_api:
               url: https://dhcp-api.lab.local
             dhcp_values:
               scopeName: "test-scope"
@@ -255,7 +260,7 @@ class TestHelmPayloadBody:
         assert body["bootFile"] == ""
 
     def test_boot_option_keys_sit_between_dns_domain_and_exclusions(self):
-        """Body key order must match DhcpScopeBody field order — Crossplane byte-compares."""
+        """Body key order must match DhcpScopeBody field order — GET and PUT are one model."""
         values = _VALID_VALUES.replace(
             "  exclusions: []",
             '  pxe:\n'
@@ -271,8 +276,8 @@ class TestHelmPayloadBody:
     def test_gateway_omitted_renders_derived_default(self):
         """Omitting the key derives the subnet's .254 address.
 
-        Resolved at render time rather than left to the API: Crossplane byte-compares
-        the GET response (which reports the concrete address) to this body, so a body
+        Resolved at render time rather than left to the API: Crossplane checks this
+        body against the GET response, which reports the concrete address, so a body
         that said null here would diff forever.
         """
         values = _VALID_VALUES.replace('  gateway: "10.20.30.1"\n', "")
@@ -379,7 +384,7 @@ def _values_with_failover(**failover_fields) -> str:
     """
     fo_lines = "\n".join(f"    {k}: {_yaml_value(v)}" for k, v in failover_fields.items())
     return (
-        "apiServer:\n"
+        "dhcp_api:\n"
         "  url: https://dhcp-api.lab.local\n"
         "  tokenSecretRef: null\n"
         "dhcp_values:\n"
@@ -416,8 +421,14 @@ def _yaml_value(v):
 class TestHelmFailoverRendering:
 
     def _body(self, values_content: str) -> dict:
+        """The request body, parsed.
+
+        provider-http types payload.body as a JSON *string*, so the chart renders
+        text rather than a nested mapping. json.loads preserves insertion order,
+        so the field-order assertions below still read the canonical order.
+        """
         cr = _parse_cr(_helm_template(values_content))
-        return cr["spec"]["forProvider"]["payload"]["body"]
+        return json.loads(cr["spec"]["forProvider"]["payload"]["body"])
 
     def test_hotstandby_failover_renders_all_fields(self):
         values = _values_with_failover(
@@ -467,16 +478,22 @@ class TestHelmFailoverRendering:
         assert body["failover"]["loadBalancePercent"] == 0
 
 class TestHelmSecretInjection:
+    """Bearer token injection.
+
+    provider-http resolves a `{{ name:namespace:key }}` placeholder in a header
+    against the live Secret at reconcile time, keeping the token out of git.
+    NOT secretInjectionConfigs — that field runs the other direction, extracting
+    fields from the HTTP *response* into a Secret.
+    """
 
     def test_secret_injection_not_rendered_without_all_fields(self):
         """tokenSecretRef block requires name, namespace, AND key — partial config → omit.
 
-        The chart values.yaml has a complete tokenSecretRef default.  To test the
-        partial-config branch we must explicitly null out namespace and key so
-        Helm does not fall back to the defaults.
+        A half-configured ref would render a placeholder provider-http cannot
+        resolve, so the header is dropped entirely instead.
         """
         values = textwrap.dedent("""\
-            apiServer:
+            dhcp_api:
               url: https://dhcp-api.lab.local
               tokenSecretRef:
                 name: dhcp-api-token
@@ -497,12 +514,11 @@ class TestHelmSecretInjection:
               failover: null
         """)
         cr = _parse_cr(_helm_template(values))
-        spec = cr["spec"]["forProvider"]
-        assert "secretInjectionConfigs" not in spec
+        assert "Authorization" not in cr["spec"]["forProvider"]["headers"]
 
     def test_secret_injection_rendered_with_all_three_fields(self):
         values = textwrap.dedent("""\
-            apiServer:
+            dhcp_api:
               url: https://dhcp-api.lab.local
               tokenSecretRef:
                 name: dhcp-api-token
@@ -523,15 +539,45 @@ class TestHelmSecretInjection:
         """)
         cr = _parse_cr(_helm_template(values))
         spec = cr["spec"]["forProvider"]
-        assert "secretInjectionConfigs" in spec
-        sec = spec["secretInjectionConfigs"][0]
-        assert sec["secretRef"]["name"] == "dhcp-api-token"
-        assert sec["toFieldPath"] == "headers.Authorization[0]"
-        assert "Bearer" in sec["format"]
+
+        # The placeholder order is name:namespace:key — provider-http resolves it
+        # in that order, so a swap would silently read the wrong Secret.
+        assert spec["headers"]["Authorization"] == [
+            "Bearer {{ dhcp-api-token:crossplane-system:token }}"
+        ]
+
+        # secretInjectionConfigs would write the response INTO a Secret. Using it
+        # for a request header does not work and is rejected by the CRD schema.
+        assert "secretInjectionConfigs" not in spec
+
+    def test_token_never_appears_verbatim_in_rendered_output(self):
+        """Only the placeholder is rendered — the chart never reads Secret contents."""
+        values = textwrap.dedent("""\
+            dhcp_api:
+              url: https://dhcp-api.lab.local
+              tokenSecretRef:
+                name: dhcp-api-token
+                namespace: crossplane-system
+                key: token
+            dhcp_values:
+              scopeName: "test-scope"
+              network: "10.20.30.0"
+              subnetMask: "255.255.255.0"
+              startRange: "10.20.30.100"
+              endRange: "10.20.30.200"
+              leaseDurationDays: 8
+              gateway: "10.20.30.1"
+              dns:
+                servers: ["10.0.0.53"]
+                domain: "lab.local"
+              exclusions: []
+        """)
+        rendered = _helm_template(values)
+        assert "{{ dhcp-api-token:crossplane-system:token }}" in rendered
 
     def test_custom_provider_config_name(self):
         values = textwrap.dedent("""\
-            apiServer:
+            dhcp_api:
               url: https://dhcp-api.lab.local
             crossplane:
               providerConfigName: my-custom-provider

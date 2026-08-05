@@ -6,15 +6,23 @@ This document describes how to write the `dhcp_values` block in a Helm values fi
 
 ## Values File Hierarchy
 
-Values files live in a separate repository. Helm merges them in this order (last value wins):
+Values files live in a separate repository (`day1` / `platform-config`). Helm merges them in this
+order (last value wins), which is exactly the `valueFiles` list Argo CD builds in `hcAppset.yaml`:
 
 ```
-sites/{site}/config.yaml                                  # site defaults
-  → sites/{site}/mce/{mce}/config.yaml                    # MCE overrides (optional)
-    → sites/{site}/mce/{mce}/hosted-cluster/{cluster}.yaml # cluster-specific values
+sites/configValues.yaml                                       # global defaults
+  → sites/{site}/values.yaml                                  # site defaults
+    → sites/{site}/mces/{mce}/values.yaml                     # MCE overrides
+      → sites/{site}/mces/{mce}/hostedClusters/{cluster}.yaml # cluster-specific values
 ```
 
-You only need to set the fields that differ from the layer above. Required fields must appear somewhere in the chain.
+The chart's own `helm/values.yaml` sits underneath all of them as an implicit base. It carries
+`dhcp_api` and `crossplane` — which the values repo never sets, one API per cluster being a
+platform constant — and ships `dhcp_values` commented out, so nothing here is inherited by
+accident.
+
+You only need to set the fields that differ from the layer above. Required fields must appear
+somewhere in the chain.
 
 ---
 
@@ -122,7 +130,7 @@ gateway: "10.20.0.1"
 The rule is applied in three places — the Helm chart, the API's Pydantic model, and the
 CI validator — so a values file that passes CI renders and applies identically. The chart
 resolves the value at render time rather than letting the API do it alone, because
-Crossplane byte-compares the GET response to the rendered body: GET reports the concrete
+Crossplane checks the GET response against the rendered body: GET reports the concrete
 address the DHCP server holds, so a body that said `null` would diff on every cycle and
 trigger a PUT every 60 seconds forever.
 
@@ -213,7 +221,7 @@ There are exactly three legal states:
 | both `server` and `bootfile`    | both carry the values                  | options 66/67 set     |
 | only one of the two             | render succeeds, **CI and API reject** | —                     |
 
-Both keys always appear in the rendered request body (as `""` when unset). This is required, not cosmetic: GET reports `""` for an option the server does not have, so a body that omitted the keys could never byte-compare equal and Crossplane would re-PUT forever.
+Both keys always appear in the rendered request body (as `""` when unset). GET reports `""` for an option the server does not have, so carrying the keys keeps the rendered body and the GET response identical rather than merely compatible.
 
 Removing a `pxe` block from a values file that previously had one clears options 66 and 67 from the scope on the next reconciliation.
 
@@ -334,8 +342,6 @@ Set `failover: null` (or omit the key). Do not use `failover: {}` — Helm deep-
 
 ---
 
-```
-
 The validator checks: IP format, subnet consistency, startRange/endRange ordering, gateway in subnet when set, gateway not inside `[startRange, endRange]` without a covering exclusion, exclusions in subnet, network/broadcast address rejection, no overlapping exclusions, and failover mode-specific required fields. `gateway: ""` is accepted and means DHCP option 3 is unset.
 
 ---
@@ -356,4 +362,3 @@ For reconciliation to be stable (no perpetual PUT loops), the GET response from 
 - Exclusions not listed in ascending IP order.
 - `description: null` in values (Helm renders `""`, API normalizes to `""` — safe).
 - `failover: {}` instead of `failover: null` when disabling failover.
-```

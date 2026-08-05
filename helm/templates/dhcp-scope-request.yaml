@@ -14,25 +14,27 @@ spec:
         - "application/json"
       Accept:
         - "application/json"
-
-    {{- with .Values.apiServer.tokenSecretRef }}
-    {{- if and .name .namespace .key }}
-    secretInjectionConfigs:
-      - secretRef:
-          name: {{ .name }}
-          namespace: {{ .namespace }}
-          key: {{ .key }}
-        toFieldPath: "headers.Authorization[0]"
-        format: "Bearer %v"
-    {{- end }}
-    {{- end }}
+      {{- with .Values.dhcp_api.tokenSecretRef }}
+      {{- if and .name .namespace .key }}
+      # provider-http resolves {{ "{{" }} name:namespace:key {{ "}}" }} against a live Secret at
+      # reconcile time and sends the resolved value, while storing only the
+      # placeholder in spec, status.requestDetails and its own logs — so the token
+      # never lands in git or in the Argo CD UI. Placeholders work in headers and
+      # body only. NOT secretInjectionConfigs: that runs the other direction,
+      # extracting response fields *into* a Secret.
+      Authorization:
+        - {{ printf "Bearer {{ %s:%s:%s }}" .name .namespace .key | quote }}
+      {{- end }}
+      {{- end }}
 
     payload:
       # The scope address is the resource identifier, so it lives in the URL only —
       # it is deliberately absent from the body. Baked in here at template time
       # because dhcp_values.network is already required for the object name above.
-      baseUrl: "{{ required "apiServer.url is required" .Values.apiServer.url }}/api/v1/scopes/{{ required "dhcp_values.network is required" .Values.dhcp_values.network }}"
-      body:
+      baseUrl: "{{ required "dhcp_api.url is required" .Values.dhcp_api.url }}/api/v1/scopes/{{ required "dhcp_values.network is required" .Values.dhcp_values.network }}"
+      # A JSON *string*, not a mapping — provider-http types this field as a string
+      # and the API server rejects anything else. The mappings below parse it with jq.
+      body: |
         {{- include "dhcp.payload" . | nindent 8 }}
 
     mappings:

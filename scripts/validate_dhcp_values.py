@@ -479,6 +479,9 @@ def _nested_present(data: dict, *keys: str) -> bool:
     return current is not None
 
 
+# Only dhcp_values lives in the values repo. dhcp_api and crossplane are chart-owned
+# (helm/values.yaml) — a platform-wide constant, not per-cluster config — so the merge
+# chain this script walks never contains them and must not demand them.
 _REQUIRED_PATHS: list[tuple[str, ...]] = [
     ("dhcp_values", "scopeName"),
     ("dhcp_values", "network"),
@@ -486,10 +489,6 @@ _REQUIRED_PATHS: list[tuple[str, ...]] = [
     ("dhcp_values", "endRange"),
     ("dhcp_values", "leaseDurationDays"),
     ("dhcp_values", "dns", "servers"),
-    ("apiServer", "url"),
-    ("apiServer", "tokenSecretRef", "name"),
-    ("apiServer", "tokenSecretRef", "namespace"),
-    ("apiServer", "tokenSecretRef", "key"),
 ]
 
 
@@ -653,10 +652,11 @@ def run_validation(args: argparse.Namespace) -> int:
             _print_summary(all_errors, cluster_results, output_fmt, use_color)
             return 1
 
+    global_config_path = sites_dir / "configValues.yaml"
+
     if output_fmt == "text":
         print(f"Validating sites directory: {_c(str(sites_dir), _BOLD, use_color=use_color)}\n")
-        config_path = sites_dir / "configValues.yaml"
-        if config_path.exists():
+        if global_config_path.exists():
             print(f"Global config:\n  {_ok('configValues.yaml', use_color)}\n")
 
     # ── 2. Walk sites ────────────────────────────────────────────────────────
@@ -720,7 +720,12 @@ def run_validation(args: argparse.Namespace) -> int:
                 # DHCP content validation on merged chain
                 dhcp_skipped = False
                 if not struct_errors:
-                    chain = [p for p in (site_values_path, mce_values_path, cluster_path)
+                    # configValues.yaml is the base of the merge, matching the
+                    # valueFiles list Argo CD hands to Helm (hcAppset.yaml). Without
+                    # it, a cluster that inherits leaseDurationDays or dns.servers
+                    # from the global layer is reported as missing them.
+                    chain = [p for p in (global_config_path, site_values_path,
+                                         mce_values_path, cluster_path)
                              if p.exists()]
                     merged = merge_yaml_files(*chain)
                     cluster_data, _ = load_yaml_file(cluster_path)

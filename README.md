@@ -537,7 +537,7 @@ list item has no URL of its own to identify it:
 { "scope": "10.20.30.0", "scopeName": "cluster-a-workers", "...": "..." }
 ```
 
-- Field order is intentional and tested — Crossplane byte-compares GET response to PUT body.
+- Field order is intentional and tested — GET response and PUT body are the same model.
 - `failover` is either `null` or a full failover object (no partial objects).
 - Exclusions are always returned sorted by IP (ascending). Values files must match this order.
 - `dnsServers` must contain at least one IPv4 address. If GET observes a managed scope without DNS servers, the backend treats that as invalid managed state instead of returning a pretend-valid payload.
@@ -555,7 +555,7 @@ list item has no URL of its own to identify it:
 - `description` defaults to `""` (never `null`).
 - `nextServer` / `bootFile` (DHCP options 66/67) are the PXE pair: option 66 names the boot server, option 67 the boot file. Both default to `""`, meaning the option is not set on the scope — that is the ordinary case for scopes whose hosts do not network-boot.
 
-  **They are optional but both-or-nothing**: a request setting one without the other is rejected with `422 VALIDATION_ERROR`, because a boot server with no boot file (or the reverse) leaves a host silently unbootable. Both keys are always present in the body regardless — `""` is the concrete "not set" state GET reports back, so omitting them would break the byte-compare. In values files these come from the `pxe.server` / `pxe.bootfile` keys; see [docs/dhcp_values.md](docs/dhcp_values.md).
+  **They are optional but both-or-nothing**: a request setting one without the other is rejected with `422 VALIDATION_ERROR`, because a boot server with no boot file (or the reverse) leaves a host silently unbootable. Both keys are always present in the body regardless — `""` is the concrete "not set" state GET reports back, so carrying them keeps the body and the GET response identical. In values files these come from the `pxe.server` / `pxe.bootfile` keys; see [docs/dhcp_values.md](docs/dhcp_values.md).
 
   Per-architecture boot files (BIOS vs UEFI) need Windows DHCP policies matching option 93 and are not modelled — a scope carries one 66/67 pair.
 
@@ -586,12 +586,19 @@ Key behaviors:
   `exclusions` renders as `[]`, and disabled failover renders as `null`.
 - **Derived defaults** — omitting `subnetMask` or `gateway` renders the resolved value
   (`255.255.255.0` and the subnet's `.254`) rather than passing the omission through to the
-  API. That is deliberate: Crossplane byte-compares the GET response to this body, and GET
+  API. That is deliberate: Crossplane checks the GET response against this body, and GET
   reports the concrete address the DHCP server holds, so a body that said `null` would diff
   forever. A non-/24 mask with no gateway fails the render with an explicit message.
 - **`helm/values.yaml` is the base of every merge** — Helm always layers `-f` files on top of
-  it, so a key set there cannot be unset downstream. `subnetMask` and `gateway` ship absent
-  from it precisely so the derived defaults remain reachable.
+  it, so a key set there cannot be unset downstream. It therefore ships `dhcp_values` entirely
+  commented out (a worked example would give every hosted cluster the same `scopeName` and
+  `network`, colliding on one Request name) and carries only `dhcp_api` and `crossplane`, which
+  the values repo never sets.
+- **`payload.body` is a JSON string** — provider-http types the field as a string and rejects a
+  nested mapping. The chart writes the JSON field by field so the canonical field order survives.
+- **Bearer token** — set `dhcp_api.tokenSecretRef.{name,namespace,key}` and the chart renders
+  `Authorization: "Bearer {{ name:namespace:key }}"`, which provider-http resolves against the
+  live Secret at reconcile time, keeping the token out of git. All three keys or none.
 - **`providerConfigRef.name`** is configurable via `crossplane.providerConfigName`
   (defaults to `dhcp-http`).
 
@@ -601,13 +608,14 @@ Reference chart render (single file):
 helm template dhcp-request ./helm -f ./helm/values.yaml
 ```
 
-Production render (three-layer merge — later file wins):
+Production render — the same four files Argo CD passes, later file wins:
 
 ```bash
 helm template dhcp-scope-hc-workers ./helm \
-  -f sites/site-a/values.yaml \
-  -f sites/site-a/mce-1/values.yaml \
-  -f sites/site-a/mce-1/hc-workers.yaml
+  -f sites/configValues.yaml \
+  -f sites/telAviv/values.yaml \
+  -f sites/telAviv/mces/prep-mce-tlv-a/values.yaml \
+  -f sites/telAviv/mces/prep-mce-tlv-a/hostedClusters/prep-tlv-gpu.yaml
 ```
 
 ## HTTP Response Codes
@@ -633,7 +641,7 @@ Crossplane reconciles every ~60 seconds: GET current state → compare to desire
 
 Rules that must hold to prevent infinite reconciliation loops:
 
-- GET response must be byte-identical to the desired PUT body when no change is intended.
+- GET response must be identical to the desired PUT body when no change is intended.
 - No hidden defaults or transformations inside the API.
 - Exclusions in values files **must** be in ascending IP numerical order — the API always returns them sorted.
 - DNS server order must match exactly — the API preserves insertion order, never sorts.
@@ -674,10 +682,15 @@ sites/
 Inheritance chain per cluster (last file wins — mirrors Helm `-f` merge semantics):
 
 ```
-sites/<site>/values.yaml
-  → sites/<site>/mces/<mce>/values.yaml
-    → sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml
+sites/configValues.yaml
+  → sites/<site>/values.yaml
+    → sites/<site>/mces/<mce>/values.yaml
+      → sites/<site>/mces/<mce>/hostedClusters/<cluster>.yaml
 ```
+
+`configValues.yaml` is a real merge layer, not just a file that must exist: a cluster may
+inherit `leaseDurationDays`, `dns.servers` or a `failover` relationship from it, and the
+validator merges it first so those are not reported as missing.
 
 ### What it validates
 

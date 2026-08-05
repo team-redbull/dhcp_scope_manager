@@ -492,7 +492,7 @@ class TestDerivedDefaultParity:
     """
 
     _VALUES = textwrap.dedent("""\
-        apiServer:
+        dhcp_api:
           url: https://dhcp-api.lab.local
           tokenSecretRef: null
         dhcp_values:
@@ -526,7 +526,9 @@ class TestDerivedDefaultParity:
         )
         assert result.returncode == 0, result.stderr
         cr = next(iter(yaml.safe_load_all(result.stdout)))
-        return cr["spec"]["forProvider"]["payload"]["body"]
+        # payload.body is a JSON string (provider-http types it as one), so the
+        # comparison against the GET assembly happens on the parsed object.
+        return json.loads(cr["spec"]["forProvider"]["payload"]["body"])
 
     @pytest.mark.skipif(shutil.which("helm") is None, reason="helm CLI not available")
     def test_rendered_defaults_match_get_response(self):

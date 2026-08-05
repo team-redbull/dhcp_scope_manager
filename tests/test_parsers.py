@@ -323,7 +323,7 @@ def test_build_payload_without_boot_options_returns_empty_strings(
     mock_ps_scope_raw, mock_ps_exclusions_raw
 ):
     """An absent pair must read back as ""/"" — the same value the desired body carries,
-    or the byte-compare in §9 never converges for the overwhelmingly common no-PXE scope.
+    or the drift check in §9 never converges for the overwhelmingly common no-PXE scope.
     """
     state = normalize_get_scope_state(
         _scope_state(
