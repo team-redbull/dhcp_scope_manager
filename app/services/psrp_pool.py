@@ -94,6 +94,10 @@ def _connection_kwargs() -> dict:
 
     Kerberos deliberately passes no credentials — it authenticates from the
     host keytab or credential cache, so no password is ever stored or logged.
+
+    CredSSP passes them like ntlm, but the protocol additionally *delegates*
+    the credential to the DHCP server, which is what lets the failover cmdlets
+    authenticate onward to the partner. See the WINRM_AUTH notes in config.py.
     """
     kwargs = {
         "server": settings.DHCP_SERVER_HOST,
@@ -105,7 +109,7 @@ def _connection_kwargs() -> dict:
         "operation_timeout": settings.POWERSHELL_COMMAND_TIMEOUT_SECONDS,
         "read_timeout": settings.POWERSHELL_COMMAND_TIMEOUT_SECONDS + _READ_TIMEOUT_MARGIN_SECS,
     }
-    if settings.WINRM_AUTH == "ntlm":
+    if settings.WINRM_AUTH in ("ntlm", "credssp"):
         kwargs["username"] = settings.WINRM_USERNAME
         kwargs["password"] = settings.WINRM_PASSWORD
     elif settings.WINRM_USERNAME:

@@ -36,6 +36,28 @@ locals {
     Purpose   = "test-environment"
     ManagedBy = "terraform"
   }
+
+  # One entry per Windows box. The partner exists only to give
+  # Add-DhcpServerv4Failover a real server to point at; it is otherwise
+  # identical to the primary, minus the API.
+  instances = merge(
+    {
+      primary = {
+        # No pinned address: the primary already holds an AWS-assigned one, and
+        # setting private_ip here would replace a running instance for nothing.
+        private_ip      = null
+        instance_suffix = "server"
+        eip_suffix      = "eip"
+      }
+    },
+    var.enable_failover_partner ? {
+      partner = {
+        private_ip      = var.partner_private_ip
+        instance_suffix = "partner"
+        eip_suffix      = "partner-eip"
+      }
+    } : {}
+  )
 }
 
 ################################################################################
@@ -108,13 +130,17 @@ resource "aws_security_group" "instance" {
 # Ingress is split by *source*, not just by port, because the two consumers are
 # different machines:
 #
-#   RDP   — a human at a laptop, opening the DHCP console.
+#   RDP   — a human at a laptop, opening the DHCP console. Off by default:
+#           laptop addresses are dynamic, so a pinned rule goes stale on its
+#           own and RDP fails with 0x204 for no visible reason. Use the tunnel.
 #   WinRM — the API, calling from wherever it runs. When the API runs in a
 #           cluster, the source is that cluster's egress/NAT address, NOT the
 #           laptop. Allowing only the laptop here silently black-holes every
-#           call the API makes.
+#           call the API makes. That address is a stable NAT gateway, so
+#           pinning it here is sound in a way pinning a laptop is not.
 #
 # SSM Session Manager remains available for shell access and needs no ingress.
+# It also carries the RDP and WinRM tunnels — see rdp-tunnel.sh / winrm-tunnel.sh.
 
 resource "aws_vpc_security_group_ingress_rule" "api" {
   count = var.install_api ? 1 : 0
@@ -127,7 +153,12 @@ resource "aws_vpc_security_group_ingress_rule" "api" {
   ip_protocol       = "tcp"
 }
 
+# Created only when rdp_allowed_cidr is set. The default is "" — RDP normally
+# arrives through the Session Manager tunnel (./rdp-tunnel.sh), which needs no
+# ingress and so cannot be invalidated by the workstation's address changing.
 resource "aws_vpc_security_group_ingress_rule" "rdp" {
+  count = var.rdp_allowed_cidr == "" ? 0 : 1
+
   security_group_id = aws_security_group.instance.id
   description       = "RDP for the DHCP management console"
   cidr_ipv4         = var.rdp_allowed_cidr
@@ -146,6 +177,70 @@ resource "aws_vpc_security_group_ingress_rule" "winrm" {
   from_port   = 5986
   to_port     = 5986
   ip_protocol = "tcp"
+}
+
+# Server-to-server, for failover only. Source is the security group itself
+# rather than a CIDR, so it covers both boxes without naming either address and
+# survives the partner being rebuilt.
+#
+# Two distinct channels, and both are needed — allowing only 647 produces a
+# relationship that cannot be *created*, and allowing only RPC produces one that
+# is created and then never replicates:
+#
+#   647   — the DHCP failover protocol itself. The servers exchange BNDUPD /
+#           BNDACK lease bindings over it for the life of the relationship.
+#   135   — RPC endpoint mapper. Add-DhcpServerv4Failover configures *both*
+#           servers, and reaches the partner over RPC.
+#   49152+ — the port the endpoint mapper hands back. Windows negotiates a
+#           dynamic high port per call, so the range cannot be narrowed without
+#           reconfiguring RPC on both hosts.
+resource "aws_vpc_security_group_ingress_rule" "failover_protocol" {
+  count = var.enable_failover_partner ? 1 : 0
+
+  security_group_id            = aws_security_group.instance.id
+  description                  = "DHCP failover protocol between the two servers"
+  referenced_security_group_id = aws_security_group.instance.id
+  from_port                    = 647
+  to_port                      = 647
+  ip_protocol                  = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "failover_rpc_epmap" {
+  count = var.enable_failover_partner ? 1 : 0
+
+  security_group_id            = aws_security_group.instance.id
+  description                  = "RPC endpoint mapper (Add-DhcpServerv4Failover configures the partner)"
+  referenced_security_group_id = aws_security_group.instance.id
+  from_port                    = 135
+  to_port                      = 135
+  ip_protocol                  = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "failover_rpc_dynamic" {
+  count = var.enable_failover_partner ? 1 : 0
+
+  security_group_id            = aws_security_group.instance.id
+  description                  = "RPC dynamic port range negotiated through 135"
+  referenced_security_group_id = aws_security_group.instance.id
+  from_port                    = 49152
+  to_port                      = 65535
+  ip_protocol                  = "tcp"
+}
+
+# Not required by failover. Note this rule alone does NOT make the two boxes
+# pingable: Windows Firewall drops inbound echo by default, so a healthy pair
+# still fails Test-Connection and it is a misleading first diagnostic. Verified
+# on this environment — 135 answered while ICMP did not. To actually use it:
+#   Enable-NetFirewallRule -Name 'FPS-ICMP4-ERQ-In'
+resource "aws_vpc_security_group_ingress_rule" "failover_icmp" {
+  count = var.enable_failover_partner ? 1 : 0
+
+  security_group_id            = aws_security_group.instance.id
+  description                  = "ICMP echo between the two servers, for reachability checks"
+  referenced_security_group_id = aws_security_group.instance.id
+  from_port                    = 8
+  to_port                      = -1
+  ip_protocol                  = "icmp"
 }
 
 resource "aws_vpc_security_group_egress_rule" "all" {
@@ -189,9 +284,12 @@ resource "aws_iam_instance_profile" "instance" {
 ################################################################################
 
 resource "aws_instance" "dhcp" {
+  for_each = local.instances
+
   ami                    = local.ami_id
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
+  private_ip             = each.value.private_ip
   vpc_security_group_ids = [aws_security_group.instance.id]
   iam_instance_profile   = aws_iam_instance_profile.instance.name
 
@@ -225,21 +323,44 @@ resource "aws_instance" "dhcp" {
   # known before first boot and can be baked into the WinRM certificate. This
   # creates no cycle: the EIP does not reference the instance; only the
   # association does, and it runs after both.
+  #
+  # The partner never runs the API regardless of var.install_api: it is a DHCP
+  # server and nothing else. Its Administrator password is the primary's, which
+  # is what makes the cross-server RPC work at all — with no Active Directory,
+  # matching local accounts on both hosts is the only credential NTLM can use.
   user_data = templatefile("${path.module}/bootstrap.ps1.tftpl", {
     repo_url       = var.repo_url
     repo_ref       = var.repo_ref
     api_port       = var.api_port
     api_token      = var.api_token
     admin_password = var.admin_password
-    install_api    = var.install_api
-    public_ip      = aws_eip.this.public_ip
+    install_api    = each.key == "primary" ? var.install_api : false
+    public_ip      = aws_eip.this[each.key].public_ip
   })
 
   # Changing the bootstrap should rebuild the box, otherwise the running
   # instance silently diverges from the config that produced the plan.
   user_data_replace_on_change = true
 
-  tags = merge(local.tags, { Name = "${local.name}-server" })
+  tags = merge(local.tags, { Name = "${local.name}-${each.value.instance_suffix}" })
+}
+
+# The primary predates the partner and was a single un-keyed resource. Without
+# these, adding for_each reads as "destroy the server, create server[primary]"
+# and takes the running box with it.
+moved {
+  from = aws_instance.dhcp
+  to   = aws_instance.dhcp["primary"]
+}
+
+moved {
+  from = aws_eip.this
+  to   = aws_eip.this["primary"]
+}
+
+moved {
+  from = aws_eip_association.this
+  to   = aws_eip_association.this["primary"]
 }
 
 ################################################################################
@@ -261,15 +382,19 @@ resource "aws_instance" "dhcp" {
 ################################################################################
 
 resource "aws_eip" "this" {
+  for_each = local.instances
+
   domain = "vpc"
 
   # An address in this VPC cannot route before the gateway exists.
   depends_on = [aws_internet_gateway.this]
 
-  tags = merge(local.tags, { Name = "${local.name}-eip" })
+  tags = merge(local.tags, { Name = "${local.name}-${each.value.eip_suffix}" })
 }
 
 resource "aws_eip_association" "this" {
-  instance_id   = aws_instance.dhcp.id
-  allocation_id = aws_eip.this.id
+  for_each = local.instances
+
+  instance_id   = aws_instance.dhcp[each.key].id
+  allocation_id = aws_eip.this[each.key].id
 }

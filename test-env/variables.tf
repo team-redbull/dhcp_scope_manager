@@ -19,15 +19,30 @@ variable "allowed_cidr" {
 
 variable "rdp_allowed_cidr" {
   description = <<-EOT
-    CIDR allowed to reach RDP (3389), for the DHCP management console. This is
-    a human sitting at a laptop, so it is your own address.
-    Find it with: curl -s https://checkip.amazonaws.com
+    CIDR allowed to reach RDP (3389) directly from the internet.
+
+    Empty ("") is the default and the recommended setting: no inbound 3389 rule
+    is created at all, and the DHCP console is reached through the Session
+    Manager tunnel instead (./rdp-tunnel.sh).
+
+    Pinning a workstation address here is what makes RDP break at random. A home
+    or office address is assigned by the ISP and rotates on its own schedule; the
+    rule then names an address that is no longer yours and every connection is
+    dropped with "We couldn't connect to the remote PC" (client error 0x204).
+    The tunnel has no such failure mode because it carries RDP over the instance's
+    outbound SSM channel, so nothing has to know your address in advance.
+
+    Set a CIDR only if you specifically want direct exposure. Find it with:
+      curl -s https://checkip.amazonaws.com
   EOT
   type        = string
+  default     = ""
 
   validation {
-    condition     = can(cidrhost(var.rdp_allowed_cidr, 0)) && var.rdp_allowed_cidr != "0.0.0.0/0"
-    error_message = "rdp_allowed_cidr must be a valid CIDR and must not be 0.0.0.0/0."
+    condition = var.rdp_allowed_cidr == "" || (
+      can(cidrhost(var.rdp_allowed_cidr, 0)) && var.rdp_allowed_cidr != "0.0.0.0/0"
+    )
+    error_message = "rdp_allowed_cidr must be \"\" (use the SSM tunnel) or a valid CIDR other than 0.0.0.0/0."
   }
 }
 
@@ -90,6 +105,41 @@ variable "install_api" {
   EOT
   type        = bool
   default     = false
+}
+
+variable "enable_failover_partner" {
+  description = <<-EOT
+    Launch a second Windows DHCP server so the failover paths in CLAUDE.md §6/§7
+    run against real cmdlets instead of mocks.
+
+    The partner is passive: it holds the DHCP role and a local Administrator with
+    the same password as the primary, and never runs the API. The relationship is
+    created from the primary with Add-DhcpServerv4Failover -PartnerServer.
+
+    Off by default because it doubles the running cost and adds a second Elastic
+    IP that keeps billing while the environment is parked.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "partner_private_ip" {
+  description = <<-EOT
+    Private address pinned to the failover partner, used as `partnerServer` in
+    the API payload.
+
+    Pinned rather than AWS-assigned because the payload has to name the partner
+    before it exists, and because a rebuilt partner that came back on a different
+    address would silently orphan every existing relationship. Must be inside the
+    VPC subnet (10.100.1.0/24) and outside the four addresses AWS reserves in it.
+  EOT
+  type        = string
+  default     = "10.100.1.11"
+
+  validation {
+    condition     = can(regex("^10\\.100\\.1\\.([4-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])$", var.partner_private_ip))
+    error_message = "partner_private_ip must be in 10.100.1.0/24, above the AWS-reserved .0-.3 and below the reserved .255."
+  }
 }
 
 variable "ami_id" {

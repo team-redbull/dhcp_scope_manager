@@ -34,7 +34,23 @@ class Settings(BaseSettings):
     DHCP_SERVER_HOST: str = ""
     WINRM_PORT: int = Field(default=5986, ge=1, le=65535)
     WINRM_USE_SSL: bool = True
-    WINRM_AUTH: Literal["kerberos", "ntlm"] = "kerberos"
+
+    # "kerberos" — no stored password; authenticates from a keytab or ccache.
+    # "ntlm"     — username/password, no delegation.
+    # "credssp"  — username/password, and the credential is *delegated* to the
+    #              DHCP server so it can authenticate onward to its failover
+    #              partner. Required for the failover paths in CLAUDE.md §6/§7:
+    #              Add-DhcpServerv4Failover, Add-DhcpServerv4FailoverScope and
+    #              Invoke-DhcpServerv4FailoverReplication all act on the partner
+    #              as the calling user, and a plain ntlm/kerberos WinRM session
+    #              holds no credential to present there (the "double hop").
+    #              Verified empirically: identical cmdlets fail under a network
+    #              logon and succeed under one carrying a credential.
+    #              The tradeoff is real — the password becomes recoverable on
+    #              the DHCP server — so use a dedicated account holding only
+    #              DHCP Administrators, never a Domain Admin. Note that accounts
+    #              in the Protected Users group cannot delegate at all.
+    WINRM_AUTH: Literal["kerberos", "ntlm", "credssp"] = "kerberos"
     WINRM_USERNAME: str = ""
     WINRM_PASSWORD: str = ""
     WINRM_CERT_VALIDATION: bool = True
@@ -60,12 +76,15 @@ class Settings(BaseSettings):
                 "set it to the DHCP server this API manages."
             )
 
-        if self.WINRM_AUTH == "ntlm" and not (self.WINRM_USERNAME and self.WINRM_PASSWORD):
+        if self.WINRM_AUTH in ("ntlm", "credssp") and not (
+            self.WINRM_USERNAME and self.WINRM_PASSWORD
+        ):
             raise ValueError(
-                "WINRM_USERNAME and WINRM_PASSWORD are required when "
-                "WINRM_AUTH='ntlm'. Prefer WINRM_AUTH='kerberos', which "
-                "authenticates from a keytab or credential cache with no "
-                "stored password."
+                f"WINRM_USERNAME and WINRM_PASSWORD are required when "
+                f"WINRM_AUTH='{self.WINRM_AUTH}'. Prefer WINRM_AUTH='kerberos', "
+                f"which authenticates from a keytab or credential cache with no "
+                f"stored password — but note that kerberos cannot drive the "
+                f"failover paths without delegation configured in AD."
             )
 
         return self

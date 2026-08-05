@@ -102,6 +102,24 @@ try {
     Set-Item -Path WSMan:\localhost\Service\Auth\Basic         -Value $false
     Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted   -Value $false
 
+    # CredSSP, so the API can drive the failover paths (CLAUDE.md sections 6-7).
+    # Those cmdlets act on the *partner* as the calling user, and a plain
+    # NTLM/Negotiate WinRM session holds no credential to present there — the
+    # double hop. Only CredSSP delegates one. Verified on this environment:
+    # Add-DhcpServerv4FailoverScope fails under Negotiate and succeeds under
+    # CredSSP against the same servers.
+    #
+    # Only the box the API connects to actually needs this; the partner is the
+    # *target* of the delegated credential, not a CredSSP endpoint, and runs
+    # fine with it off. The bootstrap is shared, so both get it — harmless, and
+    # it keeps either box usable as the API's target.
+    #
+    # Self-signed certificate plus delegated credentials is acceptable for a
+    # throwaway box and is NOT a production posture: there, use a dedicated
+    # account holding only DHCP Administrators, never a Domain Admin, and note
+    # that Protected Users members cannot delegate at all.
+    Enable-WSManCredSSP -Role Server -Force | Out-Null
+
     New-NetFirewallRule -DisplayName 'WinRM HTTPS (PSRP)' `
                         -Direction Inbound -Protocol TCP -LocalPort 5986 `
                         -Action Allow | Out-Null

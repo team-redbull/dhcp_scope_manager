@@ -56,7 +56,7 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 - Any mask other than `255.255.255.0` with no explicit gateway is a hard error, not a guess
 - Resolved identically in **three** places — Helm, the Pydantic model, and the CI validator.
   The duplication is deliberate: GET reports the concrete value the DHCP server holds, so
-  the rendered PUT body must carry it too or the byte-compare in §9 never converges. Change
+  the rendered PUT body must carry it too or the drift check in §9 never converges. Change
   one, change all three.
 
 **Immutable on an existing scope** (`subnetMask`)
@@ -72,23 +72,34 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 
 ## 3. GitOps Values Hierarchy
 
-Merge order (last value wins):
+Merge order (last value wins), matching the `valueFiles` list Argo CD hands to Helm
+(`argocd-platform/hostedClusters/templates/hcAppset.yaml`):
 
 ```
-sites/{site}/config.yaml  →  sites/{site}/mce/{mce}/config.yaml  →  sites/{site}/mce/{mce}/hosted-cluster/{c}.yaml
+helm/values.yaml                                      (chart defaults — implicit base)
+  → sites/configValues.yaml                           (global)
+    → sites/{site}/values.yaml
+      → sites/{site}/mces/{mce}/values.yaml
+        → sites/{site}/mces/{mce}/hostedClusters/{cluster}.yaml
 ```
 
 - Helm performs all merging — the API receives a fully resolved payload
+- **`dhcp_values` is the only key the values repo owns.** `dhcp_api` and `crossplane` are
+  chart-owned (`helm/values.yaml`): one API per cluster is a platform constant, not per-cluster
+  config. `_REQUIRED_PATHS` in the CI validator must therefore never demand them — that script
+  walks the values repo, which never contains them.
 - All IPs in values files must be absolute (no offsets)
 - `failover: null` removes an inherited failover — `failover: {}` does NOT (Helm deep-merges `{}`)
 
 ## 4. Helm Chart Behavior
 
 - **Crossplane object name** — based only on `dhcp_values.network`: `dhcp-scope-{network-dashed}`. Changing `scopeName` does NOT create a new CR.
-- **Request URL** — `dhcp_values.network` is baked into `payload.baseUrl` at template time (`{apiServer.url}/api/v1/scopes/{network}`); all four mappings then use `(.payload.baseUrl)`. The address is deliberately absent from `payload.body`. Note `network` remains a required **values file** key — only the rendered request body drops it.
-- **Required fields** — `helm template` fails hard if missing: `dhcp_values.network`, `scopeName`, `startRange`, `endRange`, `leaseDurationDays`, `dns.servers`, `apiServer.url`
+- **Request URL** — `dhcp_values.network` is baked into `payload.baseUrl` at template time (`{dhcp_api.url}/api/v1/scopes/{network}`); all four mappings then use `(.payload.baseUrl)`. The address is deliberately absent from `payload.body`. Note `network` remains a required **values file** key — only the rendered request body drops it.
+- **`payload.body` is a JSON *string*, not a mapping** — provider-http types the field as a string and the API server rejects an object outright (`must be of type string`). `dhcp.payload` therefore emits JSON text, written field by field rather than piped through `toJson`, because Go marshals a map with its keys sorted and that would destroy the canonical field order in §5. The mappings parse it back with jq (`.payload.body`).
+- **Bearer token via a header placeholder** — `Authorization: "Bearer {{ name:namespace:key }}"`, resolved by provider-http against the live Secret at reconcile time and stored only in placeholder form in `spec`, `status.requestDetails` and its logs. **Not** `secretInjectionConfigs`: that field runs the opposite direction, extracting HTTP *response* fields into a Secret. All three of `dhcp_api.tokenSecretRef.{name,namespace,key}` are required or the header is omitted entirely — a half-resolved placeholder would be sent as literal text.
+- **Required fields** — `helm template` fails hard if missing: `dhcp_values.network`, `scopeName`, `startRange`, `endRange`, `leaseDurationDays`, `dns.servers`, `dhcp_api.url`
 - **Derived fields** — `subnetMask` and `gateway` may be omitted; the chart resolves them (`dhcp.defaultGateway` in `_dhcp-helpers.tpl`) rather than passing the omission through, so the rendered body always carries concrete values. A non-/24 mask with no gateway fails the render.
-- **`helm/values.yaml` is the base of every merge** — a key set there cannot be unset by a site or cluster file, which is why `subnetMask`/`gateway` ship absent from it
+- **`helm/values.yaml` is the base of every merge** — a key set there cannot be unset by a site or cluster file. That is why it ships `dhcp_values` entirely commented out: a worked example there would give every hosted cluster the same `scopeName` and `network`, colliding on one Request object name. The whole template is gated on `dhcp_values.scopeName`, so a cluster with no DHCP block renders nothing.
 - **ProviderConfig** — configurable via `crossplane.providerConfigName` (default: `dhcp-http`)
 
 ## 5. API Contract
@@ -211,12 +222,52 @@ Never: return raw PS output to clients, swallow errors, execute partial operatio
 ## 9. Reconciliation
 
 GET → 404: POST. GET body differs from desired: PUT. CR deleted: DELETE.
-GET must serialize to byte-identical output as the desired PUT body when no change is intended. Both are `DhcpScopeBody`, so they cannot drift apart by construction.
+
+**How provider-http actually decides.** `expectedResponseCheck: DEFAULT` (what the chart uses)
+holds the scope up to date when the GET response **contains** the desired body — jq containment,
+not byte equality. Practical consequences:
+
+- Every field the body *does* carry must match the response exactly, including list order. Two
+  exclusions in a different order are a different value, so a values file that lists them out of
+  ascending IP order makes Crossplane PUT on every poll, forever. Same for `dnsServers`.
+- A field the body *omits* is not checked at all. So the derived-default rule (`subnetMask`,
+  `gateway`) is what actually matters: a body that said `gateway: null` against a server holding
+  `10.20.30.254` fails containment and re-PUTs forever, which is why the chart resolves them
+  rather than passing the omission through.
+- Removal uses `isRemovedCheck: DEFAULT` — the scope counts as gone when the OBSERVE GET returns
+  404, which the API does.
+
+Keeping GET byte-identical to the desired PUT body is stricter than provider-http requires, and
+still the right internal invariant: both are `DhcpScopeBody`, so they cannot drift apart by
+construction, and equality is far easier to test than containment.
 
 ## 10. Security
 
 - Bearer token auth via `DHCP_API_TOKEN` — optional; disabled when unset
 - Secrets never logged; PowerShell stderr sanitized before returning to clients
+
+**WinRM auth and the failover double hop.** `WINRM_AUTH` is `kerberos | ntlm | credssp`.
+The failover cmdlets in §6/§7 (`Add-DhcpServerv4Failover`,
+`Add-DhcpServerv4FailoverScope`, `Invoke-DhcpServerv4FailoverReplication`) act on the
+*partner* as the calling user. A `kerberos` or `ntlm` WinRM session is a network logon
+holding no credential to present there, so all three fail against the partner while the
+local half appears to succeed — verified on real servers, where the identical cmdlet
+fails under a network logon and succeeds under one carrying a credential. **Only
+`credssp` delegates a credential**, so it is required wherever the API manages failover.
+Kerberos can do it too, but only with delegation configured in AD (RBCD), which is
+directory configuration rather than anything this codebase controls.
+
+Consequences to respect:
+
+- Only the server the API *connects to* needs CredSSP enabled
+  (`Enable-WSManCredSSP -Role Server`). The partner is the target of the delegated
+  credential, not a CredSSP endpoint.
+- The credential becomes recoverable on the DHCP server. Use a dedicated account holding
+  only `DHCP Administrators` **on both servers** — never a Domain Admin.
+- Accounts in AD's `Protected Users` group cannot delegate at all, and `Domain Admins` is
+  commonly nested inside it. Check transitive membership before choosing an account.
+- `scripts/credssp-precheck.ps1` (read-only) reports whether policy would block CredSSP
+  on a target server.
 - All inputs validated at API boundary (Pydantic + subnet consistency checks). Subnet consistency spans path and body, so it runs when the two are composed in `validate_scope_request`; failures there are re-raised as `RequestValidationError` to return 422, not 500.
 
 ## 11. CI Validation

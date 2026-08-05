@@ -105,6 +105,28 @@ class TestTransportSettings:
                 WINRM_AUTH="basic",
             )
 
+    # CredSSP is the only auth mode that delegates a credential onward to the
+    # failover partner, so it carries the same credential requirement as ntlm.
+    def test_credssp_without_credentials_rejected(self):
+        with pytest.raises(ValidationError, match="WINRM_USERNAME and WINRM_PASSWORD"):
+            Settings(
+                _env_file=None,
+                DHCP_TRANSPORT="psrp",
+                DHCP_SERVER_HOST="dhcp01",
+                WINRM_AUTH="credssp",
+            )
+
+    def test_credssp_with_credentials_accepted(self):
+        s = Settings(
+            _env_file=None,
+            DHCP_TRANSPORT="psrp",
+            DHCP_SERVER_HOST="dhcp01",
+            WINRM_AUTH="credssp",
+            WINRM_USERNAME="svc",
+            WINRM_PASSWORD="pw",
+        )
+        assert s.WINRM_AUTH == "credssp"
+
 
 # ─── Transport selection ──────────────────────────────────────────────────────
 
@@ -196,6 +218,19 @@ class TestConnectionKwargs:
             WINRM_AUTH="ntlm", WINRM_USERNAME="svc", WINRM_PASSWORD="pw"
         ):
             kwargs = _connection_kwargs()
+        assert kwargs["username"] == "svc"
+        assert kwargs["password"] == "pw"
+
+    def test_credssp_sends_credentials(self):
+        """Without these, pypsrp cannot delegate and every failover cmdlet in
+        CLAUDE.md section 6/7 fails against the partner — verified on the real
+        servers, where the identical cmdlet succeeds only under a delegated
+        credential."""
+        with _psrp_settings(
+            WINRM_AUTH="credssp", WINRM_USERNAME="svc", WINRM_PASSWORD="pw"
+        ):
+            kwargs = _connection_kwargs()
+        assert kwargs["auth"] == "credssp"
         assert kwargs["username"] == "svc"
         assert kwargs["password"] == "pw"
 
