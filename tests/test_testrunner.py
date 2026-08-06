@@ -87,16 +87,22 @@ class TestChildEnvironment:
         assert env["WINRM_USERNAME"] == "svc-test"
         assert "production-secret" not in env.values()
 
-    def test_hermetic_run_gets_no_dhcp_or_winrm_variables_at_all(self):
+    def test_only_the_request_supplies_dhcp_and_winrm_variables(self):
+        """A pod setting the target does not set is scrubbed, not passed through.
+
+        Otherwise a key nobody thought about — a transport, a timeout, a future
+        DHCP_* — would still be steering the run.
+        """
         with patch.dict(
             "os.environ",
-            {"DHCP_SERVER_HOST": "dhcp-prod.lab.local", "WINRM_PASSWORD": "p"},
+            {"DHCP_TRANSPORT": "local", "DHCP_UNUSED_KNOB": "1", "WINRM_UNUSED": "1"},
             clear=False,
         ):
-            env = test_runner._child_env(None)
+            env = test_runner._child_env(_target())
 
-        leaked = [k for k in env if k.startswith(("DHCP_", "WINRM_"))]
-        assert leaked == [], f"hermetic run inherited {leaked}"
+        assert env["DHCP_TRANSPORT"] == "psrp"
+        leaked = [k for k in env if k in ("DHCP_UNUSED_KNOB", "WINRM_UNUSED")]
+        assert leaked == [], f"run inherited {leaked}"
 
     def test_unrelated_environment_is_preserved(self):
         """Scrubbing is targeted — PATH and friends must survive or python won't run."""
@@ -149,7 +155,7 @@ class TestProtectedHosts:
             resp = await _request(
                 "POST",
                 "/api/v1/test-runs",
-                json={"suite": "all", "target": {**TARGET, "dhcpServerHost": "dhcp-prod.lab.local"}},
+                json={"target": {**TARGET, "dhcpServerHost": "dhcp-prod.lab.local"}},
             )
 
         assert resp.status_code == 422
@@ -176,7 +182,9 @@ class TestRedaction:
         with patch.object(settings, "WINRM_PASSWORD", "production-secret"), patch.object(
             settings, "DHCP_API_TOKEN", "api-token-value"
         ):
-            out = test_runner._redact("saw production-secret and api-token-value", None)
+            out = test_runner._redact(
+                "saw production-secret and api-token-value", _target()
+            )
         assert "production-secret" not in out
         assert "api-token-value" not in out
 
@@ -191,46 +199,37 @@ class TestRedaction:
 
 class TestRequestContract:
 
-    def test_live_suite_requires_a_target(self):
-        with pytest.raises(ValueError, match="required"):
-            TestRunRequest(suite="live")
+    def test_a_target_is_required(self):
+        """Every run includes the live tests, so every run needs a server to run them on."""
+        with pytest.raises(ValueError, match="target"):
+            TestRunRequest()
 
-    def test_all_suite_requires_a_target(self):
-        with pytest.raises(ValueError, match="required"):
-            TestRunRequest(suite="all")
-
-    def test_hermetic_suite_rejects_a_target(self):
-        """A password sent for a suite that cannot use it crossed the wire for nothing."""
-        with pytest.raises(ValueError, match="must be omitted"):
+    def test_a_suite_selector_is_rejected_rather_than_ignored(self):
+        """`suite` is gone. A caller still sending it gets 422, not a silent
+        full run they did not ask for."""
+        with pytest.raises(ValueError):
             TestRunRequest(suite="hermetic", target=_target())
-
-    def test_hermetic_is_the_default(self):
-        assert TestRunRequest().suite == "hermetic"
 
     def test_unknown_fields_are_rejected(self):
         with pytest.raises(ValueError):
-            TestRunRequest(suite="hermetic", nonsense=1)
+            TestRunRequest(target=_target(), nonsense=1)
 
-    @pytest.mark.parametrize(
-        "suite,expected",
-        [
-            ("hermetic", "--ignore=tests/integration"),
-            ("live", "tests/integration"),
-        ],
-    )
-    def test_suite_maps_to_pytest_args(self, suite, expected):
-        assert expected in test_runner._pytest_args(suite)
-
-    def test_all_suite_restricts_nothing(self):
-        args = test_runner._pytest_args("all")
+    def test_every_run_is_the_whole_suite(self):
+        """No selection of any kind — no ignore, no path, so pytest collects
+        everything including tests/integration."""
+        args = test_runner._pytest_args()
         assert "--ignore=tests/integration" not in args
         assert "tests/integration" not in args
 
-    def test_tracebacks_are_truncated_in_every_suite(self):
+    def test_tracebacks_are_truncated(self):
         """--tb=line: a full traceback can echo locals, and a connection repr
         carries the credential."""
-        for suite in ("hermetic", "live", "all"):
-            assert "--tb=line" in test_runner._pytest_args(suite)
+        assert "--tb=line" in test_runner._pytest_args()
+
+    def test_the_live_half_actually_runs(self):
+        """Collecting tests/integration is not enough — it self-skips unless
+        DHCP_IT is set, which would make 'everything' quietly mean 'the mocked half'."""
+        assert test_runner._child_env(_target())["DHCP_IT"] == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -242,19 +241,28 @@ class TestEndpoints:
     @pytest.mark.asyncio
     async def test_accepted_run_returns_202_and_a_run_id(self):
         with patch.object(test_runner, "_execute", new=AsyncMock()):
-            resp = await _request("POST", "/api/v1/test-runs", json={"suite": "hermetic"})
+            resp = await _request("POST", "/api/v1/test-runs", json={"target": TARGET})
 
         assert resp.status_code == 202
         body = resp.json()
         assert body["status"] == "running"
         assert body["runId"]
-        assert body["targetHost"] is None
+        assert body["targetHost"] == "dhcp-test.lab.local"
+
+    @pytest.mark.asyncio
+    async def test_a_run_with_no_target_returns_422_and_starts_nothing(self):
+        """The endpoint refuses rather than picking a server for the caller."""
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as spawn:
+            resp = await _request("POST", "/api/v1/test-runs", json={})
+
+        assert resp.status_code == 422
+        spawn.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_second_run_while_one_is_active_returns_409(self):
         test_runner._active_run_id = "already-running"
         try:
-            resp = await _request("POST", "/api/v1/test-runs", json={"suite": "hermetic"})
+            resp = await _request("POST", "/api/v1/test-runs", json={"target": TARGET})
         finally:
             test_runner._active_run_id = None
 
@@ -271,7 +279,7 @@ class TestEndpoints:
     async def test_list_omits_captured_output(self):
         """Summaries are for scanning; output is fetched per run, after redaction."""
         with patch.object(test_runner, "_execute", new=AsyncMock()):
-            await _request("POST", "/api/v1/test-runs", json={"suite": "hermetic"})
+            await _request("POST", "/api/v1/test-runs", json={"target": TARGET})
 
         resp = await _request("GET", "/api/v1/test-runs")
         assert resp.status_code == 200
@@ -285,9 +293,7 @@ class TestEndpoints:
         with patch.object(settings, "DHCP_SERVER_HOST", "dhcp-prod.lab.local"), patch.object(
             test_runner, "_execute", new=AsyncMock()
         ):
-            resp = await _request(
-                "POST", "/api/v1/test-runs", json={"suite": "all", "target": TARGET}
-            )
+            resp = await _request("POST", "/api/v1/test-runs", json={"target": TARGET})
 
         assert resp.status_code == 202
         serialized = resp.text
@@ -298,7 +304,7 @@ class TestEndpoints:
     @pytest.mark.asyncio
     async def test_requires_a_token_when_one_is_configured(self):
         with patch.object(settings, "DHCP_API_TOKEN", "s3cret"):
-            resp = await _request("POST", "/api/v1/test-runs", json={"suite": "hermetic"})
+            resp = await _request("POST", "/api/v1/test-runs", json={"target": TARGET})
         assert resp.status_code == 401
 
     @pytest.mark.asyncio
@@ -309,7 +315,7 @@ class TestEndpoints:
             resp = await _request(
                 "POST",
                 "/api/v1/test-runs",
-                json={"suite": "hermetic"},
+                json={"target": TARGET},
                 headers={"Authorization": "Bearer s3cret"},
             )
         assert resp.status_code == 202
@@ -326,7 +332,7 @@ class TestEndpoints:
             "app.services.dhcp_service.validate_dhcp_environment",
             side_effect=DhcpEnvironmentError(DhcpEnvReason.UNSUPPORTED_OS, "linux"),
         ), patch.object(test_runner, "_execute", new=AsyncMock()):
-            resp = await _request("POST", "/api/v1/test-runs", json={"suite": "hermetic"})
+            resp = await _request("POST", "/api/v1/test-runs", json={"target": TARGET})
 
         assert resp.status_code == 202
 
@@ -356,7 +362,7 @@ class TestRunLifecycle:
         process = self._fake_process(b"687 passed, 30 skipped in 2.11s\n", 0)
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
-            run = await test_runner.start_run(TestRunRequest(suite="hermetic"))
+            run = await test_runner.start_run(TestRunRequest(target=_target()))
             await test_runner.wait_for_active_run()
 
         finished = test_runner.get_run(run.runId)
@@ -370,7 +376,7 @@ class TestRunLifecycle:
         process = self._fake_process(b"1 failed, 686 passed\n", 1)
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
-            run = await test_runner.start_run(TestRunRequest(suite="hermetic"))
+            run = await test_runner.start_run(TestRunRequest(target=_target()))
             await test_runner.wait_for_active_run()
 
         assert test_runner.get_run(run.runId).status == "failed"
@@ -382,7 +388,7 @@ class TestRunLifecycle:
         process = self._fake_process(b"ok\n", 0)
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
-            await test_runner.start_run(TestRunRequest(suite="hermetic"))
+            await test_runner.start_run(TestRunRequest(target=_target()))
             await test_runner.wait_for_active_run()
 
         assert test_runner._active_run_id is None
@@ -391,7 +397,7 @@ class TestRunLifecycle:
     async def test_the_slot_is_released_even_when_the_run_errors(self):
         """A crash that leaked the slot would wedge the endpoint at 409 forever."""
         with patch("asyncio.create_subprocess_exec", side_effect=OSError("no exec")):
-            run = await test_runner.start_run(TestRunRequest(suite="hermetic"))
+            run = await test_runner.start_run(TestRunRequest(target=_target()))
             await test_runner.wait_for_active_run()
 
         assert test_runner._active_run_id is None
@@ -405,7 +411,7 @@ class TestRunLifecycle:
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), \
              patch.object(settings, "TEST_RUNNER_TIMEOUT_SECONDS", 60):
-            run = await test_runner.start_run(TestRunRequest(suite="hermetic"))
+            run = await test_runner.start_run(TestRunRequest(target=_target()))
             await test_runner.wait_for_active_run()
 
         finished = test_runner.get_run(run.runId)
@@ -420,7 +426,7 @@ class TestRunLifecycle:
 
         with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
             for _ in range(test_runner._MAX_RUNS + 3):
-                await test_runner.start_run(TestRunRequest(suite="hermetic"))
+                await test_runner.start_run(TestRunRequest(target=_target()))
                 await test_runner.wait_for_active_run()
 
         assert len(test_runner._runs) == test_runner._MAX_RUNS

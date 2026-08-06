@@ -55,39 +55,35 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _pytest_args(suite: str) -> list[str]:
-    """Map a suite name to pytest arguments.
+def _pytest_args() -> list[str]:
+    """Arguments for the one and only kind of run: the whole suite.
+
+    No path selection — every run collects both the mocked tests and
+    tests/integration, and the live half actually executes because _child_env sets
+    DHCP_IT. There is no way to ask for a subset, so a passing run always means the
+    same thing.
 
     -p no:cacheprovider: /app is group-writable but writing .pytest_cache into the
     image's working directory is pointless noise.
     --tb=line: one line per failure. Full tracebacks can echo local variables, and
     a WinRM connection object's repr carries the credential.
     """
-    base = ["-q", "--tb=line", "-p", "no:cacheprovider"]
-    if suite == "hermetic":
-        return [*base, "--ignore=tests/integration"]
-    if suite == "live":
-        return [*base, "tests/integration"]
-    return base
+    return ["-q", "--tb=line", "-p", "no:cacheprovider"]
 
 
-def _child_env(target: TestTarget | None) -> dict[str, str]:
+def _child_env(target: TestTarget) -> dict[str, str]:
     """Build the subprocess environment from scratch.
 
     Scrubbing first is the point. Inheriting os.environ would leave this pod's own
     DHCP_SERVER_HOST and WINRM_PASSWORD visible to the suite, and the live tests
-    create and delete real scopes — an omitted or mistyped target would then quietly
-    run against whatever this deployment manages.
+    create and delete real scopes — a mistyped target field would then quietly fall
+    back to whatever this deployment manages.
     """
     env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(_TARGET_ENV_PREFIXES)
     }
-
-    if target is None:
-        # Hermetic: no DHCP_IT, so tests/integration skips itself even if collected.
-        return env
 
     env.update(
         {
@@ -105,17 +101,16 @@ def _child_env(target: TestTarget | None) -> dict[str, str]:
     return env
 
 
-def _redact(text: str, target: TestTarget | None) -> str:
+def _redact(text: str, target: TestTarget) -> str:
     """Strip this run's secrets from captured output before anyone can read it.
 
     pytest is not built to keep secrets. An assertion message, a connection error
     from pypsrp, or a stray print can carry the password even with --tb=line, and
     the output goes back over HTTP and into the logs.
     """
-    if target is not None:
-        password = target.winrmPassword.get_secret_value()
-        if password:
-            text = text.replace(password, "***")
+    password = target.winrmPassword.get_secret_value()
+    if password:
+        text = text.replace(password, "***")
     # The pod's own credential should never appear here — the child never receives
     # it — but redact it too rather than rely on that holding forever.
     if settings.WINRM_PASSWORD:
@@ -125,15 +120,14 @@ def _redact(text: str, target: TestTarget | None) -> str:
     return text
 
 
-def assert_target_allowed(target: TestTarget | None) -> None:
+def assert_target_allowed(target: TestTarget) -> None:
     """Refuse a target this deployment must not run destructive tests against.
 
     Checked before anything is started, and against a set that always includes this
-    pod's own DHCP_SERVER_HOST: the live suite creates and deletes scope 10.77.88.0,
-    which is not something to do on a server Crossplane is reconciling.
+    pod's own DHCP_SERVER_HOST: every run includes the live tests, which create and
+    delete scope 10.77.88.0 — not something to do on a server Crossplane is
+    reconciling.
     """
-    if target is None:
-        return
     host = target.dhcpServerHost.strip().lower()
     if host in settings.protected_dhcp_hosts:
         raise TestTargetRefusedError(target.dhcpServerHost)
@@ -161,7 +155,7 @@ async def _execute(run_id: str, request: TestRunRequest) -> None:
             sys.executable,
             "-m",
             "pytest",
-            *_pytest_args(request.suite),
+            *_pytest_args(),
             cwd=_PROJECT_ROOT,
             env=_child_env(target),
             stdout=asyncio.subprocess.PIPE,
@@ -191,13 +185,12 @@ async def _execute(run_id: str, request: TestRunRequest) -> None:
         _record(
             TestRun(
                 runId=run_id,
-                suite=request.suite,
                 status=status,
                 startedAt=started,
                 finishedAt=finished,
                 durationSeconds=round(time.monotonic() - t0, 2),
                 exitCode=exit_code,
-                targetHost=target.dhcpServerHost if target else None,
+                targetHost=target.dhcpServerHost,
                 output=_redact(output, target),
             )
         )
@@ -212,7 +205,7 @@ async def _execute(run_id: str, request: TestRunRequest) -> None:
 async def start_run(request: TestRunRequest) -> TestRun:
     """Accept a run and return immediately; the suite executes in the background.
 
-    One at a time: the live suite owns a single scope and deletes it before and
+    One at a time: the live tests own a single scope and delete it before and
     after every test, so two concurrent runs would delete each other's state.
     """
     global _active_run_id, _active_task
@@ -227,16 +220,20 @@ async def start_run(request: TestRunRequest) -> TestRun:
 
     run = TestRun(
         runId=run_id,
-        suite=request.suite,
         status="running",
         startedAt=_now(),
-        targetHost=request.target.dhcpServerHost if request.target else None,
+        targetHost=request.target.dhcpServerHost,
     )
     _record(run)
 
     logger.info(
         "Test run started",
-        extra={"operation": "test_run", "run_id": run_id, "suite": request.suite},
+        extra={
+            "operation": "test_run",
+            "run_id": run_id,
+            # The host only — never the account or the password.
+            "target_host": request.target.dhcpServerHost,
+        },
     )
     _active_task = asyncio.create_task(_execute(run_id, request))
     return run

@@ -130,7 +130,7 @@ still matches the payload shape in §5.
 | `DELETE` | `/api/v1/scopes/{scope}` | Delete scope (idempotent — 204 even if not found)      |
 | `GET`    | `/api/v1/scopes`         | List all scopes, sorted by scope address               |
 | `GET`    | `/healthz`               | Runtime capability check                               |
-| `POST`   | `/api/v1/test-runs`      | Run this service's own suite (§12) — 202 + `runId`     |
+| `POST`   | `/api/v1/test-runs`      | Run this service's whole suite (§12) — 202 + `runId`   |
 | `GET`    | `/api/v1/test-runs/{id}` | Run status, exit code, redacted output                 |
 | `GET`    | `/api/v1/test-runs`      | Recent runs, summaries only                            |
 
@@ -373,13 +373,19 @@ API runs its own suite: `POST /api/v1/test-runs` forks pytest in a subprocess. T
 only because `requirements.txt` carries pytest / pytest-asyncio / httpx and the Dockerfile
 does `COPY tests/` — keep both, or the endpoint has nothing to run.
 
-Three rules that are load-bearing, all covered by `tests/test_testrunner.py`:
+Four rules that are load-bearing, all covered by `tests/test_testrunner.py`:
 
+- **A run is always the whole suite.** There is no `suite` selector on the request — the
+  subprocess gets no `--ignore` and no path argument, so pytest collects the mocked tests
+  and `tests/integration` together. Selecting a subset meant a passing run could mean two
+  different things, and the cheap subset verified nothing about the server the release was
+  aimed at. `target` is consequently **required**: `tests/integration` self-skips unless
+  `DHCP_IT` is set, and only a target sets it, so a run without one would be "everything"
+  in name only. A body still carrying `suite` is rejected by `extra="forbid"`.
 - **The DHCP server under test comes from the request body, never from settings.** The
   subprocess environment is built by *stripping* every `DHCP_*`/`WINRM_*` key and setting
-  only what the request supplied. A target that could be omitted and fall back to this
-  deployment's own server would make the live suite — which creates and deletes real
-  scopes — a loaded gun.
+  only what the request supplied. A target that could fall back to this deployment's own
+  server would make the live tests — which create and delete real scopes — a loaded gun.
 - **A target matching `settings.DHCP_SERVER_HOST` or `TEST_RUNNER_DENY_HOSTS` is refused
   with 422** before anything starts.
 - **Captured pytest output is redacted** before it is returned or logged. `--tb=line`

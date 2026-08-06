@@ -264,7 +264,7 @@ There is one more group of routes, used only for on-demand test execution — se
 
 | Verb   | Path                       | Description                                                        |
 | ------ | -------------------------- | ------------------------------------------------------------------ |
-| `POST` | `/api/v1/test-runs`        | Start a run against a DHCP server named in the body → `202` + `runId` |
+| `POST` | `/api/v1/test-runs`        | Run the whole suite against the DHCP server named in the body → `202` + `runId` |
 | `GET`  | `/api/v1/test-runs/{id}`   | Status, exit code and redacted output of one run                    |
 | `GET`  | `/api/v1/test-runs`        | Recent runs, summaries only                                         |
 
@@ -941,7 +941,6 @@ the chart** — so no values file can aim the destructive live suite anywhere:
 curl -sX POST localhost:8080/api/v1/test-runs \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{
-        "suite": "all",
         "target": {
           "dhcpServerHost": "dhcp-test.lab.local",
           "winrmUsername": "svc-dhcp-test",
@@ -953,22 +952,26 @@ curl -sX POST localhost:8080/api/v1/test-runs \
 # → 202 {"runId":"a1b2c3d4e5f6","status":"running", ...}
 
 curl -s localhost:8080/api/v1/test-runs/a1b2c3d4e5f6 -H "Authorization: Bearer $TOKEN"
-# → {"status":"passed","exitCode":0,"output":"722 passed, 30 passed in 41.2s", ...}
+# → {"status":"passed","exitCode":0,"output":"721 passed, 30 passed in 41.2s", ...}
 ```
 
 `202` and polling rather than one blocking call: a live run takes minutes, far
 longer than an HTTP request should be held open.
 
-**Suites.** `hermetic` runs the 722 mocked tests and contacts no DHCP server — it
-takes no `target`, and supplying one is rejected rather than ignored, since a
-password sent for a suite that cannot use it crossed the wire for nothing. `live`
-runs `tests/integration` against the target. `all` runs both.
+**Every run is the whole suite** — the mocked tests and `tests/integration`
+together. There is no suite selector: with one, a green run meant two different
+things depending on a field nobody looked at afterwards, and the cheap option
+verified nothing about the server the release was pointed at. `target` is
+therefore **required**, and a request without one is `422` rather than a run that
+quietly skips the live half (`tests/integration` self-skips unless `DHCP_IT` is
+set, which only a target sets). A body still carrying `suite` is rejected by
+`extra="forbid"`, not ignored.
 
 #### What stops this being dangerous
 
 | Guard | Effect |
 | --- | --- |
-| Environment is rebuilt, not inherited | The subprocess gets no `DHCP_*`/`WINRM_*` from the pod, so an omitted target cannot silently fall back to the server this release manages |
+| Environment is rebuilt, not inherited | The subprocess gets no `DHCP_*`/`WINRM_*` from the pod, so a mistyped target cannot silently fall back to the server this release manages |
 | Protected hosts refused | A target matching `dhcp.serverHost`, or any `testRunner.denyHosts` entry, returns `422 TEST_TARGET_REFUSED` before anything starts |
 | Token required | Generated into a Secret by the chart; the app treats an empty token as auth disabled, so the chart never leaves one empty |
 | Credentials not persisted | `winrmPassword` is a `SecretStr` held only for the subprocess — never in the run registry, a response, or a log |

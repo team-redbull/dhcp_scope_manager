@@ -3,9 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-Suite = Literal["hermetic", "live", "all"]
 RunStatus = Literal["running", "passed", "failed", "timeout", "error"]
 
 
@@ -47,34 +46,17 @@ class TestRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     __test__ = False
 
-    suite: Suite = Field(
-        default="hermetic",
+    # There is no suite selector: a run is always the whole suite, mocked tests and
+    # tests/integration together. Selecting a subset meant a green run could mean
+    # two different things, and the one people reached for ("hermetic") verified
+    # nothing about the server the release was actually pointed at.
+    target: TestTarget = Field(
         description=(
-            "hermetic = no DHCP server contact. live = tests/integration only. "
-            "all = both."
+            "DHCP server the run is pointed at. Required — every run includes the "
+            "live tests, and there is deliberately no fallback to this "
+            "deployment's own DHCP settings."
         ),
     )
-    target: TestTarget | None = Field(
-        default=None,
-        description="Required for 'live' and 'all'; rejected for 'hermetic'",
-    )
-
-    @model_validator(mode="after")
-    def target_matches_suite(self) -> "TestRunRequest":
-        needs_server = self.suite in ("live", "all")
-        if needs_server and self.target is None:
-            raise ValueError(
-                f"suite '{self.suite}' contacts a real DHCP server, so 'target' is "
-                f"required. There is deliberately no fallback to this deployment's "
-                f"own DHCP settings."
-            )
-        if not needs_server and self.target is not None:
-            # Not pedantry: accepting credentials for a suite that cannot use them
-            # means a password crossed the wire for no reason.
-            raise ValueError(
-                "suite 'hermetic' contacts no DHCP server, so 'target' must be omitted"
-            )
-        return self
 
 
 class TestRun(BaseModel):
@@ -84,15 +66,15 @@ class TestRun(BaseModel):
     __test__ = False
 
     runId: str
-    suite: Suite
     status: RunStatus
     startedAt: datetime
     finishedAt: datetime | None = None
     durationSeconds: float | None = None
     exitCode: int | None = None
     # Only the host, never the account or password: enough to answer "what did this
-    # run touch?" without turning the registry into a credential store.
-    targetHost: str | None = None
+    # run touch?" without turning the registry into a credential store. Always
+    # present, since a run cannot be started without a target.
+    targetHost: str
     output: str | None = None
 
 
@@ -103,13 +85,12 @@ class TestRunSummary(BaseModel):
     __test__ = False
 
     runId: str
-    suite: Suite
     status: RunStatus
     startedAt: datetime
     finishedAt: datetime | None = None
     durationSeconds: float | None = None
     exitCode: int | None = None
-    targetHost: str | None = None
+    targetHost: str
 
 
 class TestRunListResponse(BaseModel):
