@@ -919,11 +919,19 @@ extra has to cross the air gap.
 Deploy a second release of the chart whose only job is running tests:
 
 ```bash
-helm install dhcp-tests . -f values-test.yaml -n dhcp-scope-manager-test
-TOKEN=$(oc get secret dhcp-tests-api-token -n dhcp-scope-manager-test \
+helm install dhcp-scope-manager-tests . -f values-test.yaml -n dhcp-scope-manager
+oc port-forward svc/dhcp-scope-manager-tests 8080:8080 -n dhcp-scope-manager &
+
+# One token for both releases — the test release reads the production release's
+# Secret rather than minting a second credential, which is why it installs into
+# the same namespace.
+TOKEN=$(oc get secret dhcp-scope-manager-api-token -n dhcp-scope-manager \
           -o jsonpath='{.data.api-token}' | base64 -d)
-oc port-forward svc/dhcp-tests 8080:8080 -n dhcp-scope-manager-test &
 ```
+
+The release name differs from production's, so every resource resolves to
+`dhcp-scope-manager-tests` and nothing collides. Install the production release
+first: the test pod mounts its Secret and will not start without it.
 
 Start a run. **The DHCP server under test is named in the request, never stored in
 the chart** — so no values file can aim the destructive live suite anywhere:
