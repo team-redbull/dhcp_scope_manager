@@ -24,13 +24,20 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 
 - POST must not fail if scope already exists — it is the create path, and must be
   safe to retry after a partially-failed create
-- POST converges options, PXE and exclusion *additions* on an existing scope, but
-  **not** `scopeName` / `leaseDurationDays` / `description` / `startRange` /
-  `endRange`, exclusion removals, or clearing a `gateway`. Those live only in
-  `Add-DhcpServerv4Scope`, which the already-exists path skips. Converging an
-  existing scope is PUT's job (§6) — Crossplane only POSTs after a `GET` 404, so
-  it reaches an existing scope only when retrying its own create, where those
-  fields were already written correctly. Documented in the README's POST section.
+- POST on an existing scope converges the **whole** desired state, by delegating to
+  `_converge_scope` — the same diff PUT runs (§6). It must not converge only part of
+  the payload: returning 200 while silently discarding fields is indistinguishable
+  from success, and a caller cannot detect it. (It previously skipped
+  `Add-DhcpServerv4Scope`, the only cmdlet carrying `scopeName` /
+  `leaseDurationDays` / `description` / `startRange` / `endRange`, and so dropped
+  all five plus exclusion removals and gateway clears.)
+- Sharing one convergence routine is what keeps POST and PUT from drifting apart.
+  `_converge_scope` assumes the caller holds `scope_locks.lock(scope)` —
+  ScopeLockManager hands out plain `asyncio.Lock`s, which are not reentrant, so it
+  must never acquire the lock itself.
+- Idempotency is a property of the *diff*, not of skipping work: a POST of state
+  that already matches issues no cmdlets. A POST that changes `subnetMask` on an
+  existing scope returns 409, exactly as PUT does.
 - DELETE must not fail if scope does not exist
 
 **Deterministic data**
@@ -54,10 +61,11 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 - Omitting the key derives it: `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`
 - Writing `null` or `""` is honoured as written — for `gateway` that means no DHCP option 3
 - Any mask other than `255.255.255.0` with no explicit gateway is a hard error, not a guess
-- Resolved identically in **three** places — Helm, the Pydantic model, and the CI validator.
-  The duplication is deliberate: GET reports the concrete value the DHCP server holds, so
-  the rendered PUT body must carry it too or the drift check in §9 never converges. Change
-  one, change all three.
+- Resolved identically in **three** places — the Pydantic model and the CI validator here,
+  and the chart's `_dhcp-helpers.tpl` in `helm-charts-hostedclusters-setup`. The duplication
+  is deliberate: GET reports the concrete value the DHCP server holds, so the rendered PUT
+  body must carry it too or the drift check in §9 never converges. Change one, change all
+  three — and one of the three is in another repo, so it will not fail your local tests.
 
 **Immutable on an existing scope** (`subnetMask`)
 
@@ -68,7 +76,10 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 **Reconciliation safety**
 
 - No hidden defaults inside the API beyond the two derived above; everything else comes from Helm / Git values
-- API is stateless
+- API is stateless **for every scope route**. The one exception is the test runner
+  (`/api/v1/test-runs`), which keeps a bounded in-memory registry so a run started by
+  `POST` can be polled by `GET`. That is why a release people actually post runs to must
+  be single-replica — a second pod has never heard of the run id.
 
 ## 3. GitOps Values Hierarchy
 
@@ -76,7 +87,7 @@ Merge order (last value wins), matching the `valueFiles` list Argo CD hands to H
 (`argocd-platform/hostedClusters/templates/hcAppset.yaml`):
 
 ```
-helm/values.yaml                                      (chart defaults — implicit base)
+the chart's values.yaml                               (chart defaults — implicit base)
   → sites/configValues.yaml                           (global)
     → sites/{site}/values.yaml
       → sites/{site}/mces/{mce}/values.yaml
@@ -85,7 +96,7 @@ helm/values.yaml                                      (chart defaults — implic
 
 - Helm performs all merging — the API receives a fully resolved payload
 - **`dhcp_values` is the only key the values repo owns.** `dhcp_api` and `crossplane` are
-  chart-owned (`helm/values.yaml`): one API per cluster is a platform constant, not per-cluster
+  chart-owned: one API per cluster is a platform constant, not per-cluster
   config. `_REQUIRED_PATHS` in the CI validator must therefore never demand them — that script
   walks the values repo, which never contains them.
 - All IPs in values files must be absolute (no offsets)
@@ -93,13 +104,20 @@ helm/values.yaml                                      (chart defaults — implic
 
 ## 4. Helm Chart Behavior
 
+**The chart is not in this repo.** The templates and their rendering tests live in
+`team-redbull/helm-charts-hostedclusters-setup` — this repo is the DHCP API only.
+What follows is the *contract* the API is written against, not a description of
+files here; §9 does not make sense without it. Changing any of it means changing
+that chart, and its `tests/test_render_parity.py` is what proves the rendered body
+still matches the payload shape in §5.
+
 - **Crossplane object name** — based only on `dhcp_values.network`: `dhcp-scope-{network-dashed}`. Changing `scopeName` does NOT create a new CR.
 - **Request URL** — `dhcp_values.network` is baked into `payload.baseUrl` at template time (`{dhcp_api.url}/api/v1/scopes/{network}`); all four mappings then use `(.payload.baseUrl)`. The address is deliberately absent from `payload.body`. Note `network` remains a required **values file** key — only the rendered request body drops it.
 - **`payload.body` is a JSON *string*, not a mapping** — provider-http types the field as a string and the API server rejects an object outright (`must be of type string`). `dhcp.payload` therefore emits JSON text, written field by field rather than piped through `toJson`, because Go marshals a map with its keys sorted and that would destroy the canonical field order in §5. The mappings parse it back with jq (`.payload.body`).
 - **Bearer token via a header placeholder** — `Authorization: "Bearer {{ name:namespace:key }}"`, resolved by provider-http against the live Secret at reconcile time and stored only in placeholder form in `spec`, `status.requestDetails` and its logs. **Not** `secretInjectionConfigs`: that field runs the opposite direction, extracting HTTP *response* fields into a Secret. All three of `dhcp_api.tokenSecretRef.{name,namespace,key}` are required or the header is omitted entirely — a half-resolved placeholder would be sent as literal text.
 - **Required fields** — `helm template` fails hard if missing: `dhcp_values.network`, `scopeName`, `startRange`, `endRange`, `leaseDurationDays`, `dns.servers`, `dhcp_api.url`
 - **Derived fields** — `subnetMask` and `gateway` may be omitted; the chart resolves them (`dhcp.defaultGateway` in `_dhcp-helpers.tpl`) rather than passing the omission through, so the rendered body always carries concrete values. A non-/24 mask with no gateway fails the render.
-- **`helm/values.yaml` is the base of every merge** — a key set there cannot be unset by a site or cluster file. That is why it ships `dhcp_values` entirely commented out: a worked example there would give every hosted cluster the same `scopeName` and `network`, colliding on one Request object name. The whole template is gated on `dhcp_values.scopeName`, so a cluster with no DHCP block renders nothing.
+- **The chart's `values.yaml` is the base of every merge** — a key set there cannot be unset by a site or cluster file. That is why it ships no `dhcp_values` at all: a worked example there would give every hosted cluster the same `scopeName` and `network`, colliding on one Request object name. The whole template is gated on `dhcp_values.scopeName`, so a cluster with no DHCP block renders nothing.
 - **ProviderConfig** — configurable via `crossplane.providerConfigName` (default: `dhcp-http`)
 
 ## 5. API Contract
@@ -112,6 +130,13 @@ helm/values.yaml                                      (chart defaults — implic
 | `DELETE` | `/api/v1/scopes/{scope}` | Delete scope (idempotent — 204 even if not found)      |
 | `GET`    | `/api/v1/scopes`         | List all scopes, sorted by scope address               |
 | `GET`    | `/healthz`               | Runtime capability check                               |
+| `POST`   | `/api/v1/test-runs`      | Run this service's own suite (§12) — 202 + `runId`     |
+| `GET`    | `/api/v1/test-runs/{id}` | Run status, exit code, redacted output                 |
+| `GET`    | `/api/v1/test-runs`      | Recent runs, summaries only                            |
+
+The `test-runs` routes take auth but **not** the DHCP environment guard: they drive a
+server named in the request, not this deployment's own, so a release returning 503 from
+every scope route can still run tests.
 
 `{scope}` = IPv4 network address — **the sole identifier of the resource**.
 
@@ -159,7 +184,15 @@ POST/PUT request body, and the GET response for a single scope — identical by 
 
 ## 6. Update Semantics (PUT)
 
-PUT is **diff-based convergence**, not full replace. Only changed sections trigger PowerShell:
+PUT is **diff-based convergence** in what it *writes* — only changed sections trigger
+PowerShell — but the body it diffs against is a **full replacement**, not a patch. An
+omitted optional field resolves to its default and is then applied: omitting `dnsDomain`,
+`nextServer` / `bootFile` or `exclusions` clears them on the server. That is deliberate
+and load-bearing for GitOps — if omission meant "leave alone", deleting a line from a
+values file could never remove anything, and Git would stop being authoritative. It is
+also a footgun for anyone calling the API by hand; `tests/integration/` pins it so it
+cannot change unnoticed. Required fields are `scopeName`, `startRange`, `endRange`,
+`leaseDurationDays`, `dnsServers`.
 
 | Section      | Changed when                       | PowerShell cmdlet                            |
 | ------------ | ---------------------------------- | -------------------------------------------- |
@@ -297,6 +330,53 @@ Validates: IP format, subnet consistency, range ordering, gateway in subnet, exc
 - `GET == PUT` roundtrip equality: `assert get_scope(id).model_dump() == put_payload.model_dump()`
 - Idempotent POST (scope exists) and DELETE (scope absent)
 - Exclusion sorting, failover `null`/object consistency, subnet validation
+
+**The unit suite mocks the PowerShell transport end to end.** It proves which cmdlet
+*strings* the service builds, never what Windows does with them. Anything that depends
+on real server behaviour — range transition rules, option removal, what a cmdlet
+actually persists — is invisible to it. Both the POST convergence bug and the silent
+field reset in an under-specified PUT lived in exactly that blind spot.
+
+`tests/integration/` closes it: the real ASGI app over a real PSRP connection, skipped
+unless `DHCP_IT=1`. It owns scope `10.77.88.0` alone and deletes it before and after
+every test. Setup is in `tests/integration/README.md`. Add a case there whenever a
+change depends on how Windows responds, not just on the command text.
+
+**Cover *changing* a field, not only clearing it.** They are different code paths: the
+diff decides whether to issue a cmdlet at all, so a diff that wrongly concludes
+"unchanged" issues nothing, returns 200, and leaves the server stale — which a
+reset-to-default test cannot detect. Every option in §6 needs both.
+
+**Chart rendering is not tested here.** The Crossplane Request templates live in
+`team-redbull/helm-charts-hostedclusters-setup` with their own suite, including the
+parity test asserting the rendered body matches §5. This repo asserts the other half —
+that GET returns that shape. Neither imports the other, so a change to the payload
+shape has to be made in both, deliberately.
+
+Its async fixtures must use `@pytest_asyncio.fixture`: the repo sets no `asyncio_mode`,
+so pytest-asyncio runs strict, where a plain `@pytest.fixture` on an async generator is
+never awaited and its body silently does not run.
+
+**Air-gapped runs.** There is no CI and no package index on that side, so the deployed
+API runs its own suite: `POST /api/v1/test-runs` forks pytest in a subprocess. This works
+only because `requirements.txt` carries pytest / pytest-asyncio / httpx and the Dockerfile
+does `COPY tests/` — keep both, or the endpoint has nothing to run.
+
+Three rules that are load-bearing, all covered by `tests/test_testrunner.py`:
+
+- **The DHCP server under test comes from the request body, never from settings.** The
+  subprocess environment is built by *stripping* every `DHCP_*`/`WINRM_*` key and setting
+  only what the request supplied. A target that could be omitted and fall back to this
+  deployment's own server would make the live suite — which creates and deletes real
+  scopes — a loaded gun.
+- **A target matching `settings.DHCP_SERVER_HOST` or `TEST_RUNNER_DENY_HOSTS` is refused
+  with 422** before anything starts.
+- **Captured pytest output is redacted** before it is returned or logged. `--tb=line`
+  because a full traceback can echo locals, and a WinRM connection repr carries the
+  credential.
+
+Live failover is still not testable: Windows refuses a failover relationship whose partner
+is the local server, so a single test server cannot exercise it at all.
 
 ## 13. Implementation Checklist
 

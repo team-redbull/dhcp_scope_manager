@@ -25,9 +25,19 @@ Git (values files — desired state)
           → Windows DHCP Server
 ```
 
-The API invokes PowerShell as a local subprocess, so it currently runs on the
-Windows DHCP server itself. Whether it should stay there in production, and
-whether it could instead run on Linux over WinRM/PSRP, is analysed in
+**Where the API runs is a config choice, not a fixed property.** `DHCP_TRANSPORT`
+selects it:
+
+- `psrp` (production) — the API runs on **Linux**, as a container on OpenShift, and
+  sends PowerShell text to the Windows DHCP server over WinRM. No PowerShell is
+  installed on the API host and none executes there; the cmdlets run in a runspace on
+  the DHCP server and return JSON. **Nothing this project ships runs on the Windows
+  box** — that is the whole reason WinRM is in the picture.
+- `local` (default) — the API runs *on* the Windows DHCP server and invokes
+  `powershell.exe` as a subprocess. This is what [test-env/](test-env/) deploys and
+  what the default exists for; it is not the production topology.
+
+The trade-off between the two is analysed in
 [docs/api-host-architecture.md](docs/api-host-architecture.md).
 
 A disposable Windows DHCP test environment for exercising the scope lifecycle
@@ -52,26 +62,22 @@ app/
     failover.py              DhcpFailover — failover relationship configuration
     exclusion.py             DhcpExclusion — exclusion range
     list_response.py         DhcpScopeListResponse / DhcpScopeListError — GET /scopes response
+    test_run.py              TestRunRequest / TestTarget / TestRun — the test-runner contract
   routers/
     __init__.py              Aggregates all sub-routers into a single router — main.py imports only this
     scopes.py                DHCP scope endpoints (POST/GET/PUT/DELETE /api/v1/scopes/{scope})
     health.py                /healthz runtime capability check
+    testrunner.py            On-demand test execution (POST/GET /api/v1/test-runs)
   services/
     dhcp_service.py          Runtime guard (OS / PowerShell / DHCP cmdlets check)
     ps_executor.py           Async PowerShell command runner with timeout/error handling
     ps_parsers.py            Single-process GET script builder and PowerShell JSON normalization
     scope_service.py         Core scope lifecycle logic (create / get / update / delete)
+    test_runner.py           Runs the pytest suite in a subprocess with a scrubbed environment
   utils/
     decorators.py            Async-aware lightweight logging decorator for service calls
     ip_utils.py              IP integer conversion and TimeSpan parsing helpers
     locks.py                 Async per-scope lock manager for serialized mutations
-
-helm/
-  Chart.yaml
-  values.yaml                Reference values file with all supported fields documented
-  templates/
-    dhcp-scope-request.yaml  Crossplane Request CR — all verbs (POST/GET/PUT/DELETE) on /{network}
-    _dhcp-helpers.tpl        Canonical payload rendering for provider-http
 
 scripts/
   validate_changed_clusters.py  CI entry point — detects changed files via git diff, resolves
@@ -79,6 +85,11 @@ scripts/
   validate_dhcp_values.py       Full validator — walks sites/ structure, validates folder layout,
                                 YAML content, and DHCP business rules on the merged inheritance chain
   requirements.txt              Minimal CI dependencies (pydantic, PyYAML)
+
+.github/
+  workflows/
+    test.yml                   CI — hermetic suite. Reusable: called by build.yml
+    build.yml                  CI — runs test.yml, then builds and pushes the image to GHCR
 
 tests/
   conftest.py
@@ -90,15 +101,19 @@ tests/
   test_validation.py             IP validation, subnet consistency, failover mode enforcement
   test_parsers.py                Single-process GET parsing, normalization, and injection safety
   test_ps_executor_unit.py       Focused ps_executor command construction and sanitization tests
+  test_ps_transport.py           Local subprocess and PSRP transports (pypsrp faked — no network)
+  test_windows_error_classification.py  Error classification against real captured Windows DHCP output
   test_diff.py                   Diff-based update logic
   test_dhcp_service.py           Runtime environment guard behavior
   test_parity.py                 GET/PUT parity — the main guard against Crossplane reconciliation loops
   test_edge_cases.py             Edge cases and boundary conditions
-  test_helm.py                   Helm-rendered Crossplane Request contract
   test_security.py               PowerShell escaping and response sanitization
   test_service_unit.py           Focused scope_service create/get/delete/list behavior
+  test_testrunner.py             Test-runner guards: env scrubbing, host refusal, redaction
   test_validate_dhcp_values.py        CI validator — structure, YAML checks, filtering, deep merge
   test_validate_changed_clusters.py   Changed-file detection, inheritance resolution, git integration
+  integration/                   Live suite — real app, real PSRP, real DHCP server. Skipped
+                                 unless DHCP_IT=1; see its README.md
 ```
 
 ## Runtime Requirements
@@ -244,6 +259,19 @@ All `/api/v1/scopes*` endpoints share two implicit checks that run before the ha
 - **Auth** — rejects requests when `DHCP_API_TOKEN` is set and the token is missing or wrong. Returns `401`.
 - **Environment guard** — rejects requests when DHCP automation cannot run. Under `local` that means the wrong OS, missing PowerShell, or no DHCP cmdlets; under `psrp` it means `pypsrp` missing, WinRM unreachable or unauthenticated, or no DHCP cmdlets on the target host. Returns `503`.
 
+There is one more group of routes, used only for on-demand test execution — see
+[Air-gapped environments](#air-gapped-environments):
+
+| Verb   | Path                       | Description                                                        |
+| ------ | -------------------------- | ------------------------------------------------------------------ |
+| `POST` | `/api/v1/test-runs`        | Start a run against a DHCP server named in the body → `202` + `runId` |
+| `GET`  | `/api/v1/test-runs/{id}`   | Status, exit code and redacted output of one run                    |
+| `GET`  | `/api/v1/test-runs`        | Recent runs, summaries only                                         |
+
+These take **auth but not the environment guard**: they drive a DHCP server named
+in the request rather than this deployment's own, so a release that manages no
+scopes (and returns `503` from every scope route) can still run tests.
+
 Scope APIs use a real async execution path:
 
 ```text
@@ -345,30 +373,37 @@ Returns all scopes sorted by network address (ascending). Uses **one PowerShell 
 
 ### `POST /api/v1/scopes/{scope}`
 
-Creates the scope if it does not exist, then converges options, exclusions, and failover to the desired state. Idempotent — never fails if the scope already exists.
+Creates the scope if it does not exist. If it already exists, POST converges the
+**whole** desired state by running the same diff `PUT` runs. Idempotent — never
+fails because the scope is already present, and a POST of state that already
+matches issues no cmdlets at all.
 
-> **POST does not fully converge a scope that already exists.** Reconciliation
-> is `PUT`'s job; `POST` is the create path and is only safe to *retry*, not to
-> use as a general update.
+> **POST on an existing scope converges every field.** The response body always
+> describes what the server now holds, which for an existing scope is what the
+> request asked for.
 >
-> When the scope is already present, POST skips `Add-DhcpServerv4Scope` — the
-> only cmdlet on this path that writes `scopeName`, `leaseDurationDays`,
-> `description`, `startRange` and `endRange` — so those five fields are left at
-> whatever the server already holds. Exclusions are added but never removed, and
-> a `gateway` of `null` does not clear an existing DHCP option 3. The fields that
-> do converge (`dnsServers`, `dnsDomain`, a changed `gateway`, `nextServer` /
-> `bootFile`, added exclusions) are the ones written by option cmdlets that run
-> on both the create and already-exists paths.
+> This was not always true. POST used to skip `Add-DhcpServerv4Scope` when the
+> scope existed — the only cmdlet on the create path that writes `scopeName`,
+> `leaseDurationDays`, `description`, `startRange` and `endRange` — so those five
+> fields were silently discarded, exclusions could be added but never removed,
+> and a `gateway` of `null` did not clear DHCP option 3. The call still returned
+> `200`, echoing the *old* state, so a caller had no way to tell the difference
+> between "converged" and "ignored".
 >
-> This is deliberate and does not affect GitOps reconciliation. Crossplane only
-> issues POST after a `GET` returns `404`, so POST reaches an existing scope only
-> when retrying its own partially-failed create — and there the skipped fields
-> were already written correctly by the create call it is retrying. Any real
-> drift is caught by the next `GET` and repaired with `PUT`.
+> Sharing one convergence routine with `PUT` means the two verbs cannot drift
+> apart: whichever one reaches an existing scope converges it identically.
+> Retry-after-partial-create is strictly safer than before — the retry now
+> repairs whatever the failed attempt left half-written, instead of leaving it.
 >
-> The consequence to be aware of: a POST sent **by hand** against an existing
-> scope with different values returns `200` while silently leaving those five
-> fields unchanged. Use `PUT` to update an existing scope.
+> Two consequences worth knowing:
+>
+> - A POST that changes `subnetMask` on an existing scope now returns `409`
+>   `IMMUTABLE_FIELD`, exactly as `PUT` does. Windows has no in-place mask change
+>   (see the `PUT` section), and silently ignoring the field is what this change
+>   set out to remove.
+> - POST is still the *create* path in GitOps terms. Crossplane only issues it
+>   after a `GET` returns `404`; ordinary drift is caught by `GET` and repaired
+>   with `PUT`.
 
 | Status | Body                                                               | When                                                                        |
 | ------ | ------------------------------------------------------------------ | --------------------------------------------------------------------------- |
@@ -549,7 +584,7 @@ list item has no URL of its own to identify it:
   | `null` or `""` | no DHCP option 3; GET returns `null` |
   | an IPv4 address | that address |
 
-  A `subnetMask` other than `255.255.255.0` with no explicit `gateway` is rejected — there is no `.254` convention to fall back on outside a /24. Both Helm and the API apply this rule, so the rendered PUT body and the GET response always agree.
+  A `subnetMask` other than `255.255.255.0` with no explicit `gateway` is rejected — there is no `.254` convention to fall back on outside a /24. The chart applies the same rule when it renders, so the PUT body and the GET response always agree.
 - **Gateway-in-range guard**: if `gateway` is set to an IP inside `[startRange, endRange]` and is not covered by an exclusion, the request is rejected with `422 VALIDATION_ERROR`. An unexcluded gateway inside the distribution pool would be leased to a client, causing a network outage.
 - DNS server order is preserved exactly (primary/secondary semantics — never sorted).
 - `description` defaults to `""` (never `null`).
@@ -568,55 +603,41 @@ Supported modes: `HotStandby`, `LoadBalance`
 | `HotStandby`  | `serverRole`         | `loadBalancePercent` → `0`                        |
 | `LoadBalance` | `loadBalancePercent` | `serverRole` → `"Active"`, `reservePercent` → `0` |
 
-Normalization at both the Helm template layer and the Pydantic model layer prevents GET/PUT drift
+Normalization in both the chart's template and the Pydantic model prevents GET/PUT drift
 when values include cross-mode fields.
 
-## Helm Chart
+## The Crossplane Request CR
 
-The chart under `helm/` renders a single Crossplane `Request` CR.
+**Rendered by a chart in another repo** — `team-redbull/helm-charts-hostedclusters-setup`.
+This repo is the DHCP API; it does not carry the chart, because one values file has to
+create both the hosted cluster and its DHCP scope, so the template belongs with the
+cluster's chart rather than with the service it calls.
 
-Key behaviors:
+What matters on this side is the contract the rendered CR holds the API to. Crossplane
+compares the `GET` response against `payload.body` roughly every 60 seconds and PUTs on
+any difference, so these properties are load-bearing here even though the file that
+produces them lives elsewhere:
 
-- **Crossplane object name** is based only on `dhcp_values.network` (`dhcp-scope-10-20-30-0`).
-  Changing `scopeName` does **not** create a new Crossplane CR or delete the live scope.
-- **Required fields** — strict DHCP payload validation is enforced by the backend/Pydantic model
-  and the optional CI validator, not by large Helm `required()` blocks. The chart keeps only the
-  minimal existing render-time checks needed to form the Request URL/name.
-- **Optional defaults** — `description`, `gateway`, and `dns.domain` can be written as `""`,
-  `exclusions` renders as `[]`, and disabled failover renders as `null`.
-- **Derived defaults** — omitting `subnetMask` or `gateway` renders the resolved value
-  (`255.255.255.0` and the subnet's `.254`) rather than passing the omission through to the
-  API. That is deliberate: Crossplane checks the GET response against this body, and GET
-  reports the concrete address the DHCP server holds, so a body that said `null` would diff
-  forever. A non-/24 mask with no gateway fails the render with an explicit message.
-- **`helm/values.yaml` is the base of every merge** — Helm always layers `-f` files on top of
-  it, so a key set there cannot be unset downstream. It therefore ships `dhcp_values` entirely
-  commented out (a worked example would give every hosted cluster the same `scopeName` and
-  `network`, colliding on one Request name) and carries only `dhcp_api` and `crossplane`, which
-  the values repo never sets.
-- **`payload.body` is a JSON string** — provider-http types the field as a string and rejects a
-  nested mapping. The chart writes the JSON field by field so the canonical field order survives.
-- **Bearer token** — set `dhcp_api.tokenSecretRef.{name,namespace,key}` and the chart renders
-  `Authorization: "Bearer {{ name:namespace:key }}"`, which provider-http resolves against the
-  live Secret at reconcile time, keeping the token out of git. All three keys or none.
-- **`providerConfigRef.name`** is configurable via `crossplane.providerConfigName`
-  (defaults to `dhcp-http`).
+- **Object name** comes only from `dhcp_values.network` (`dhcp-scope-10-20-30-0`).
+  Changing `scopeName` does not create a new CR or delete the live scope.
+- **The scope address is in `payload.baseUrl`, never in `payload.body`** — identity is
+  the URL, state is the body. That is what makes the body and the GET response directly
+  comparable.
+- **`payload.body` is a JSON string**, written field by field so the canonical field
+  order in [Canonical Payload Shape](#canonical-payload-shape) survives — piping a map
+  through `toJson` would sort the keys and break it.
+- **Derived defaults are resolved at render time**, not passed through as omissions.
+  `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`. GET reports the
+  concrete address the DHCP server holds, so a body that said `null` would diff forever.
+  A non-/24 mask with no explicit gateway fails the render.
+- **Bearer token** renders as `Authorization: "Bearer {{ name:namespace:key }}"`, which
+  provider-http resolves against the live Secret at reconcile time, keeping the token out
+  of git. All three of `dhcp_api.tokenSecretRef.{name,namespace,key}` or none.
 
-Reference chart render (single file):
-
-```bash
-helm template dhcp-request ./helm -f ./helm/values.yaml
-```
-
-Production render — the same four files Argo CD passes, later file wins:
-
-```bash
-helm template dhcp-scope-hc-workers ./helm \
-  -f sites/configValues.yaml \
-  -f sites/telAviv/values.yaml \
-  -f sites/telAviv/mces/prep-mce-tlv-a/values.yaml \
-  -f sites/telAviv/mces/prep-mce-tlv-a/hostedClusters/prep-tlv-gpu.yaml
-```
+The chart repo's `tests/test_render_parity.py` asserts the rendered body equals the
+payload shape below; this repo's `tests/test_parity.py` asserts `GET` returns it. Neither
+imports the other — both pin the documented shape — so **changing the payload shape means
+changing it in both repos**, and a local test run here will not catch the other half.
 
 ## HTTP Response Codes
 
@@ -809,7 +830,13 @@ Crossplane-specific behavior:
 .venv/bin/python -m pytest -v
 ```
 
-Test coverage includes:
+The repository virtualenv is preferred because the system Python may not have runtime dependencies such as `pydantic-settings` installed.
+
+The suite has two tiers, and the split is load-bearing.
+
+### Hermetic suite — `tests/`
+
+No DHCP server, no network, runs anywhere in seconds. Covers:
 
 - Endpoint contracts and HTTP status codes
 - Async runtime behavior, subprocess timeout handling, and concurrency limits
@@ -818,16 +845,156 @@ Test coverage includes:
 - Diff-based update semantics (only changed sections trigger cmdlets)
 - Runtime environment guard behavior
 - GET/PUT parity contract — the main guard against Crossplane reconciliation loops
-- Helm-rendered Crossplane Request contract
 - Security checks for PowerShell escaping and response sanitization
 - CI validator: all validators, YAML deep-merge, cluster discovery (old and new layouts), JSON reporter
 
-The repository virtualenv is preferred because the system Python may not have runtime dependencies such as `pydantic-settings` installed.
+It mocks the PowerShell transport end to end, which is what makes it hermetic and
+also what bounds it: it proves which cmdlet *strings* the service builds, never
+what Windows does with them.
+
+### Live suite — `tests/integration/`
+
+The real ASGI app over a real PSRP connection to a Windows DHCP server. **Skipped
+unless `DHCP_IT=1`** — nothing happens without the opt-in. It owns scope
+`10.77.88.0` alone and deletes it before and after every test, so it is
+order-independent and safe to re-run after a failure.
+
+It exists because anything that depends on real server behaviour is invisible to
+the mocked suite: the range-transition rules Windows enforces, whether a cleared
+option 66/67 is actually removed, what a cmdlet really persists. Two shipped bugs
+lived in exactly that blind spot — POST silently discarding half its payload on an
+existing scope, and an under-specified PUT wiping PXE options and exclusions.
+
+Setup and connection recipes: [tests/integration/README.md](tests/integration/README.md).
+
+```bash
+DHCP_IT=1 DHCP_TRANSPORT=psrp DHCP_SERVER_HOST=... pytest tests/integration -v
+```
+
+### CI
+
+`.github/workflows/test.yml` runs the hermetic suite: Python 3.12 (matching the
+Dockerfile, so a green run means green in the image that ships), then `pytest -q`.
+
+**It is a reusable workflow with no trigger of its own.** `build.yml` calls it and
+declares `needs: test` on the image build, which does two things at once:
+
+- **A red suite produces no image.** The GHCR push is gated on the tests, not run
+  alongside them.
+- **The suite runs once per commit.** `build.yml` already fires on push to every
+  branch, so a `pull_request:` trigger here would run everything a second time on
+  the same SHA. Check runs attach to a commit, not to an event, so the push-triggered
+  run is the one a PR displays — coverage is unchanged. The exception is fork PRs,
+  where no push event reaches this repo; add `pull_request:` back to `test.yml` if
+  the repo ever accepts them.
+
+`workflow_dispatch` is kept so the suite can still be run by hand from the Actions
+tab without pushing.
+
+The job needs no toolchain beyond Python. Chart rendering is tested in
+`team-redbull/helm-charts-hostedclusters-setup`, which runs its own workflow with
+`helm` installed — see [The Crossplane Request CR](#the-crossplane-request-cr).
+
+Dependencies are installed from both `requirements.txt` and
+`scripts/requirements.txt`. The second is not redundant: `tests/test_validate_*.py`
+import the validator scripts, which need PyYAML, and that reaches the environment
+today only as a transitive dependency of `uvicorn[standard]`.
+
+The live suite is deliberately **not** run in CI. It needs a Windows DHCP server
+to write to, and the test environment is brought up on demand rather than kept
+running, so the job would fail for reasons that have nothing to do with the change
+under test. `DHCP_IT` is never set in the workflow.
+
+`.gitlab-ci.yml` at the repo root is a separate pipeline for the *values* repo (see
+[GitLab CI](#gitlab-ci) under DHCP Values Validation). It validates YAML under
+`sites/`, which this repository does not contain.
+
+### Air-gapped environments
+
+There is no CI on the air-gapped side, and no package index to install a test
+runner from. Instead **the deployed API runs its own suite on request**: the image
+already installs `pytest` from `requirements.txt` and carries `tests/`, so nothing
+extra has to cross the air gap.
+
+Deploy a second release of the chart whose only job is running tests:
+
+```bash
+helm install dhcp-tests . -f values-test.yaml -n dhcp-scope-manager-test
+TOKEN=$(oc get secret dhcp-tests-api-token -n dhcp-scope-manager-test \
+          -o jsonpath='{.data.api-token}' | base64 -d)
+oc port-forward svc/dhcp-tests 8080:8080 -n dhcp-scope-manager-test &
+```
+
+Start a run. **The DHCP server under test is named in the request, never stored in
+the chart** — so no values file can aim the destructive live suite anywhere:
+
+```bash
+curl -sX POST localhost:8080/api/v1/test-runs \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{
+        "suite": "all",
+        "target": {
+          "dhcpServerHost": "dhcp-test.lab.local",
+          "winrmUsername": "svc-dhcp-test",
+          "winrmPassword": "...",
+          "winrmAuth": "ntlm",
+          "winrmCertValidation": false
+        }
+      }'
+# → 202 {"runId":"a1b2c3d4e5f6","status":"running", ...}
+
+curl -s localhost:8080/api/v1/test-runs/a1b2c3d4e5f6 -H "Authorization: Bearer $TOKEN"
+# → {"status":"passed","exitCode":0,"output":"722 passed, 30 passed in 41.2s", ...}
+```
+
+`202` and polling rather than one blocking call: a live run takes minutes, far
+longer than an HTTP request should be held open.
+
+**Suites.** `hermetic` runs the 722 mocked tests and contacts no DHCP server — it
+takes no `target`, and supplying one is rejected rather than ignored, since a
+password sent for a suite that cannot use it crossed the wire for nothing. `live`
+runs `tests/integration` against the target. `all` runs both.
+
+#### What stops this being dangerous
+
+| Guard | Effect |
+| --- | --- |
+| Environment is rebuilt, not inherited | The subprocess gets no `DHCP_*`/`WINRM_*` from the pod, so an omitted target cannot silently fall back to the server this release manages |
+| Protected hosts refused | A target matching `dhcp.serverHost`, or any `testRunner.denyHosts` entry, returns `422 TEST_TARGET_REFUSED` before anything starts |
+| Token required | Generated into a Secret by the chart; the app treats an empty token as auth disabled, so the chart never leaves one empty |
+| Credentials not persisted | `winrmPassword` is a `SecretStr` held only for the subprocess — never in the run registry, a response, or a log |
+| Output redacted | Captured pytest output has the run's secrets stripped before it is returned |
+| One run at a time | The suite owns a single scope; concurrent runs would delete each other's state |
+
+The live suite creates and deletes exactly one scope, `10.77.88.0`, and touches
+nothing else.
+
+#### Why a separate release
+
+The route exists on every deployment of this image, including production. Running
+it there would put a full pytest run — and its memory spike — inside the pod
+Crossplane reconciles every hosted cluster's scope through. `values-test.yaml`
+gives it its own pod, its own limits, and no DHCP credentials at rest.
+
+That release sets `dhcp.transport: local`, so its own `/api/v1/scopes/*` routes
+return `503`. That is correct: it exists to run tests, not to manage DHCP. Its
+readiness probe is TCP rather than `/healthz` for the same reason.
+
+**Failover still cannot be tested on a single DHCP server.** Windows failover is a
+relationship between two *distinct* servers — `Add-DhcpServerv4Failover` refuses a
+partner that is the local server. The failover logic is covered by 73 hermetic
+tests; what stays unverifiable without a partner is the CredSSP double hop and
+replication itself.
 
 ## Operational Notes
 
-- This service must run on a Windows host with DHCP cmdlets available.
-- Linux / macOS / WSL requests to scope endpoints return a structured `503` with a `reason` field.
-- `/healthz` is always safe to call regardless of OS.
+- The **DHCP server** is always Windows. The **API** is Windows-only under
+  `DHCP_TRANSPORT=local`; under `psrp` it runs on Linux and needs no PowerShell,
+  no DHCP cmdlets and no Windows anything.
+- Under `local` only, requests to scope endpoints from Linux / macOS / WSL return a
+  structured `503` with a `reason` field. Under `psrp` the OS check does not run —
+  the guard validates the WinRM target instead
+  ([app/services/dhcp_service.py](app/services/dhcp_service.py)).
+- `/healthz` is always safe to call regardless of OS or transport.
 - Scope deletion is fail-safe: failover is detached before scope removal to prevent orphaned relationships.
 - If failover detach fails, the delete is retried on the next Crossplane reconciliation cycle.

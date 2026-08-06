@@ -56,9 +56,33 @@ class Settings(BaseSettings):
     WINRM_CERT_VALIDATION: bool = True
     WINRM_CONNECTION_TIMEOUT_SECONDS: int = Field(default=30, ge=1)
 
+    # ------------------------------------------------------------------
+    # Test runner (POST /api/v1/test-runs)
+    # ------------------------------------------------------------------
+    # Wall clock for one pytest subprocess. The live suite is dominated by WinRM
+    # round trips, so this is generous by default rather than tuned.
+    TEST_RUNNER_TIMEOUT_SECONDS: int = Field(default=1800, ge=60)
+
+    # Hosts this deployment must never run destructive tests against, comma
+    # separated. DHCP_SERVER_HOST is refused implicitly — this covers the case the
+    # implicit rule cannot: a deployment that manages no scopes itself (the test
+    # release) still needs to be told the production hostname.
+    #
+    # A deny list is safe to keep in a values file in a way a *target* is not:
+    # misapplying it refuses too much, never too little.
+    TEST_RUNNER_DENY_HOSTS: str = ""
+
     @property
     def is_psrp(self) -> bool:
         return self.DHCP_TRANSPORT == "psrp"
+
+    @property
+    def protected_dhcp_hosts(self) -> frozenset[str]:
+        """Hosts the test runner refuses as a target, lowercased for comparison."""
+        hosts = {h.strip().lower() for h in self.TEST_RUNNER_DENY_HOSTS.split(",")}
+        if self.DHCP_SERVER_HOST:
+            hosts.add(self.DHCP_SERVER_HOST.strip().lower())
+        return frozenset(h for h in hosts if h)
 
     @model_validator(mode="after")
     def _validate_transport(self) -> "Settings":

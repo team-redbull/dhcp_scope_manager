@@ -30,6 +30,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 
+# The test suite ships in the image on purpose. requirements.txt already installs
+# pytest, pytest-asyncio and httpx, so this adds sources only — and it is what lets
+# POST /api/v1/test-runs execute the suite in an air-gapped environment, where there
+# is no CI and no package index to fetch anything from.
+#
+# scripts/ comes too: tests/test_validate_*.py load the values-repo validators by
+# path, so without it 96 tests fail to collect and the whole run errors out.
+COPY tests/ ./tests/
+COPY scripts/ ./scripts/
+
 # OpenShift's restricted-v2 SCC runs the container as an arbitrary UID from the
 # namespace's range, NOT as the USER declared below, and always with GID 0. Files
 # must therefore be group-owned by root and group-readable, or the process cannot
