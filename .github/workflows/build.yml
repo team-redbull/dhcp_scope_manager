@@ -10,7 +10,15 @@ permissions:
   packages: write
 
 jobs:
+  # The image is gated on the hermetic suite: a red test run must not produce a
+  # pushed tag. Same `if` as build below, so a `delete` event skips both rather
+  # than skipping the gate and running the build unguarded.
+  test:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/test.yml
+
   build:
+    needs: test
     if: github.event_name == 'push'
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
