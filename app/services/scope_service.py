@@ -280,26 +280,41 @@ async def create_scope(payload: DhcpScopePayload) -> DhcpScopePayload:
     logger.info("Creating DHCP scope", extra=_scope_extra(scope, "create_scope"))
 
     async with scope_locks.lock(scope):
-        already_existed = await scope_exists(scope)
-        if not already_existed:
-            await _run_ps(
-                f'Add-DhcpServerv4Scope '
-                f'-Name {ps_single_quote(payload.scopeName)} '
-                f'-StartRange {ps_ipv4(payload.startRange)} '
-                f'-EndRange {ps_ipv4(payload.endRange)} '
-                f'-SubnetMask {ps_ipv4(payload.subnetMask)} '
-                f'-State Active '
-                f'-LeaseDuration (New-TimeSpan -Days {payload.leaseDurationDays}) '
-                f'-Description {ps_single_quote(payload.description)}',
-                ignore_already_exists=True,
-                scope=scope,
-                operation="add_scope",
-            )
-        else:
+        # POST on an existing scope converges the *whole* desired state, by running
+        # the same diff PUT runs (§2). Previously this path skipped
+        # Add-DhcpServerv4Scope — the only cmdlet carrying scopeName, startRange,
+        # endRange, leaseDurationDays and description — and so returned 200 while
+        # silently discarding all five, plus exclusion removals and gateway clears.
+        # A 200 whose body contradicts the request is indistinguishable from a
+        # successful convergence, which is exactly the failure a caller cannot detect.
+        #
+        # Idempotency is unaffected: re-POSTing identical state diffs to nothing and
+        # issues no cmdlets. Retry-after-partial-create is strictly improved — the
+        # retry now repairs whatever the failed attempt left half-written instead of
+        # leaving it stale.
+        if await scope_exists(scope):
             logger.info(
                 "Scope already exists, converging desired state",
                 extra=_scope_extra(scope, "create_scope", status="already_exists"),
             )
+            return await _converge_scope(scope, payload)
+
+        # A scope that appeared between the check above and this Add — a concurrent
+        # create racing us — is tolerated rather than converged. The winner wrote the
+        # same desired state, since both requests render from the same Git source.
+        await _run_ps(
+            f'Add-DhcpServerv4Scope '
+            f'-Name {ps_single_quote(payload.scopeName)} '
+            f'-StartRange {ps_ipv4(payload.startRange)} '
+            f'-EndRange {ps_ipv4(payload.endRange)} '
+            f'-SubnetMask {ps_ipv4(payload.subnetMask)} '
+            f'-State Active '
+            f'-LeaseDuration (New-TimeSpan -Days {payload.leaseDurationDays}) '
+            f'-Description {ps_single_quote(payload.description)}',
+            ignore_already_exists=True,
+            scope=scope,
+            operation="add_scope",
+        )
 
         await run_ps(
             _set_options_command(scope_literal, payload),
@@ -309,7 +324,8 @@ async def create_scope(payload: DhcpScopePayload) -> DhcpScopePayload:
         )
 
         # PXE options 66/67. A scope with no PXE config costs zero extra calls here,
-        # which is the common case.
+        # which is the common case. No matching Remove is needed on this path: a
+        # freshly added scope cannot carry stale options.
         for cmd in _set_boot_options_commands(scope_literal, payload):
             await run_ps(
                 cmd,
@@ -317,18 +333,6 @@ async def create_scope(payload: DhcpScopePayload) -> DhcpScopePayload:
                 scope=scope,
                 operation="set_boot_options",
             )
-        # POST must converge, not just create (§2), so a pre-existing scope carrying
-        # stale boot options has them cleared when the desired state has none. Skipped
-        # for a freshly added scope, which cannot have any.
-        if already_existed and not payload.nextServer:
-            for cmd in _remove_boot_options_commands(scope_literal):
-                await _run_ps(
-                    cmd,
-                    parse_json=False,
-                    ignore_not_found=True,
-                    scope=scope,
-                    operation="remove_boot_options",
-                )
 
         for excl in payload.exclusions:
             await _run_ps(
@@ -354,178 +358,192 @@ async def get_scope(scope: str) -> DhcpScopePayload:
 
 @log_call
 async def update_scope(scope: str, desired: DhcpScopePayload) -> DhcpScopePayload:
-    scope_literal = ps_ipv4(scope)
     logger.info("Updating DHCP scope", extra=_scope_extra(scope, "update_scope"))
     async with scope_locks.lock(scope):
-        current = await _assemble_existing_scope(scope)
-        changed = False
+        return await _converge_scope(scope, desired)
 
-        # Guarded before any write: Windows has no in-place mask change, so the
-        # only honest answers are "refuse" or "recreate", and recreating drops
-        # every active lease on the subnet.
-        if current.subnetMask != desired.subnetMask:
-            raise ImmutableScopeFieldError(
-                "subnetMask", str(current.subnetMask), str(desired.subnetMask)
-            )
 
-        params_changed = (
-            current.scopeName != desired.scopeName
-            or current.leaseDurationDays != desired.leaseDurationDays
-            or current.description != desired.description
+async def _converge_scope(scope: str, desired: DhcpScopePayload) -> DhcpScopePayload:
+    """Diff current state against `desired` and apply only what differs.
+
+    The caller must already hold `scope_locks.lock(scope)` — ScopeLockManager hands
+    out plain asyncio.Locks, which are not reentrant, so acquiring it here would
+    deadlock the two callers that already hold it.
+
+    Shared by PUT (the update path) and by POST when the scope already exists, so
+    the two cannot drift apart: whichever verb reaches an existing scope converges
+    it identically.
+    """
+    scope_literal = ps_ipv4(scope)
+    current = await _assemble_existing_scope(scope)
+    changed = False
+
+    # Guarded before any write: Windows has no in-place mask change, so the
+    # only honest answers are "refuse" or "recreate", and recreating drops
+    # every active lease on the subnet.
+    if current.subnetMask != desired.subnetMask:
+        raise ImmutableScopeFieldError(
+            "subnetMask", str(current.subnetMask), str(desired.subnetMask)
         )
-        range_steps = _range_transition_steps(
-            (current.startRange, current.endRange),
-            (desired.startRange, desired.endRange),
+
+    params_changed = (
+        current.scopeName != desired.scopeName
+        or current.leaseDurationDays != desired.leaseDurationDays
+        or current.description != desired.description
+    )
+    range_steps = _range_transition_steps(
+        (current.startRange, current.endRange),
+        (desired.startRange, desired.endRange),
+    )
+
+    # Range before parameters, in its own cmdlet call. Windows applies the
+    # name/lease/description half of a combined call even when it goes on to
+    # reject the range, which would leave the scope matching neither the old
+    # nor the new desired state. Writing the range first means a refused
+    # range aborts before anything else has been touched.
+    for start, end in range_steps:
+        changed = True
+        logger.info(
+            "Updating DHCP scope range",
+            extra=_scope_extra(
+                scope, "set_scope_range", start_range=str(start), end_range=str(end)
+            ),
+        )
+        await run_ps(
+            f"Set-DhcpServerv4Scope -ScopeId {scope_literal} "
+            f"-StartRange {ps_ipv4(start)} "
+            f"-EndRange {ps_ipv4(end)}",
+            parse_json=False,
+            scope=scope,
+            operation="set_scope_range",
         )
 
-        # Range before parameters, in its own cmdlet call. Windows applies the
-        # name/lease/description half of a combined call even when it goes on to
-        # reject the range, which would leave the scope matching neither the old
-        # nor the new desired state. Writing the range first means a refused
-        # range aborts before anything else has been touched.
-        for start, end in range_steps:
-            changed = True
-            logger.info(
-                "Updating DHCP scope range",
-                extra=_scope_extra(
-                    scope, "set_scope_range", start_range=str(start), end_range=str(end)
-                ),
-            )
-            await run_ps(
-                f"Set-DhcpServerv4Scope -ScopeId {scope_literal} "
-                f"-StartRange {ps_ipv4(start)} "
-                f"-EndRange {ps_ipv4(end)}",
-                parse_json=False,
-                scope=scope,
-                operation="set_scope_range",
-            )
-
-        if params_changed:
-            changed = True
-            logger.info(
-                "Updating DHCP scope parameters",
-                extra=_scope_extra(scope, "set_scope_params"),
-            )
-            await run_ps(
-                f"Set-DhcpServerv4Scope -ScopeId {scope_literal} "
-                f"-Name {ps_single_quote(desired.scopeName)} "
-                f"-LeaseDuration (New-TimeSpan -Days {desired.leaseDurationDays}) "
-                f"-Description {ps_single_quote(desired.description)}",
-                parse_json=False,
-                scope=scope,
-                operation="set_scope_params",
-            )
-
-        options_changed = (
-            current.dnsServers != desired.dnsServers
-            or current.dnsDomain != desired.dnsDomain
-            or current.gateway != desired.gateway
+    if params_changed:
+        changed = True
+        logger.info(
+            "Updating DHCP scope parameters",
+            extra=_scope_extra(scope, "set_scope_params"),
         )
-        if options_changed:
-            changed = True
+        await run_ps(
+            f"Set-DhcpServerv4Scope -ScopeId {scope_literal} "
+            f"-Name {ps_single_quote(desired.scopeName)} "
+            f"-LeaseDuration (New-TimeSpan -Days {desired.leaseDurationDays}) "
+            f"-Description {ps_single_quote(desired.description)}",
+            parse_json=False,
+            scope=scope,
+            operation="set_scope_params",
+        )
+
+    options_changed = (
+        current.dnsServers != desired.dnsServers
+        or current.dnsDomain != desired.dnsDomain
+        or current.gateway != desired.gateway
+    )
+    if options_changed:
+        changed = True
+        logger.info(
+            "Updating DHCP scope options",
+            extra=_scope_extra(scope, "set_dns_options"),
+        )
+        # Single combined call: sets DNS servers, domain, and gateway (when not None).
+        # Merging DNS and gateway into one cmdlet call avoids a redundant PowerShell
+        # process when both change simultaneously.
+        await run_ps(
+            _set_options_command(scope_literal, desired),
+            parse_json=False,
+            scope=scope,
+            operation="set_dns_options",
+        )
+        # If gateway is being removed (transitioned to None), explicitly remove
+        # DHCP option 3. _set_options_command omits -Router when gateway is None,
+        # but Windows DHCP does not clear an existing router option automatically.
+        if current.gateway != desired.gateway and desired.gateway is None:
             logger.info(
-                "Updating DHCP scope options",
-                extra=_scope_extra(scope, "set_dns_options"),
+                "Removing DHCP router option",
+                extra=_scope_extra(scope, "remove_router_option"),
             )
-            # Single combined call: sets DNS servers, domain, and gateway (when not None).
-            # Merging DNS and gateway into one cmdlet call avoids a redundant PowerShell
-            # process when both change simultaneously.
-            await run_ps(
-                _set_options_command(scope_literal, desired),
+            await _run_ps(
+                f"Remove-DhcpServerv4OptionValue -ScopeId {scope_literal} "
+                f"-OptionId 3",
                 parse_json=False,
+                ignore_not_found=True,
                 scope=scope,
-                operation="set_dns_options",
+                operation="remove_router_option",
             )
-            # If gateway is being removed (transitioned to None), explicitly remove
-            # DHCP option 3. _set_options_command omits -Router when gateway is None,
-            # but Windows DHCP does not clear an existing router option automatically.
-            if current.gateway != desired.gateway and desired.gateway is None:
-                logger.info(
-                    "Removing DHCP router option",
-                    extra=_scope_extra(scope, "remove_router_option"),
+
+    # Boot options are diffed separately from the DNS/router block above: they need
+    # their own cmdlet calls either way, and keeping them apart means a PXE-only
+    # change does not re-issue the DNS write (and vice versa).
+    boot_options_changed = (
+        current.nextServer != desired.nextServer
+        or current.bootFile != desired.bootFile
+    )
+    if boot_options_changed:
+        changed = True
+        if desired.nextServer:
+            logger.info(
+                "Updating DHCP boot options",
+                extra=_scope_extra(scope, "set_boot_options"),
+            )
+            for cmd in _set_boot_options_commands(scope_literal, desired):
+                await run_ps(
+                    cmd,
+                    parse_json=False,
+                    scope=scope,
+                    operation="set_boot_options",
                 )
+        else:
+            logger.info(
+                "Removing DHCP boot options",
+                extra=_scope_extra(scope, "remove_boot_options"),
+            )
+            for cmd in _remove_boot_options_commands(scope_literal):
                 await _run_ps(
-                    f"Remove-DhcpServerv4OptionValue -ScopeId {scope_literal} "
-                    f"-OptionId 3",
+                    cmd,
                     parse_json=False,
                     ignore_not_found=True,
                     scope=scope,
-                    operation="remove_router_option",
+                    operation="remove_boot_options",
                 )
 
-        # Boot options are diffed separately from the DNS/router block above: they need
-        # their own cmdlet calls either way, and keeping them apart means a PXE-only
-        # change does not re-issue the DNS write (and vice versa).
-        boot_options_changed = (
-            current.nextServer != desired.nextServer
-            or current.bootFile != desired.bootFile
+    current_excl = {(e.startAddress, e.endAddress) for e in current.exclusions}
+    desired_excl = {(e.startAddress, e.endAddress) for e in desired.exclusions}
+
+    for start, end in current_excl - desired_excl:
+        changed = True
+        logger.info(
+            "Removing DHCP exclusion range",
+            extra=_scope_extra(scope, "remove_exclusion"),
         )
-        if boot_options_changed:
-            changed = True
-            if desired.nextServer:
-                logger.info(
-                    "Updating DHCP boot options",
-                    extra=_scope_extra(scope, "set_boot_options"),
-                )
-                for cmd in _set_boot_options_commands(scope_literal, desired):
-                    await run_ps(
-                        cmd,
-                        parse_json=False,
-                        scope=scope,
-                        operation="set_boot_options",
-                    )
-            else:
-                logger.info(
-                    "Removing DHCP boot options",
-                    extra=_scope_extra(scope, "remove_boot_options"),
-                )
-                for cmd in _remove_boot_options_commands(scope_literal):
-                    await _run_ps(
-                        cmd,
-                        parse_json=False,
-                        ignore_not_found=True,
-                        scope=scope,
-                        operation="remove_boot_options",
-                    )
+        await run_ps(
+            f"Remove-DhcpServerv4ExclusionRange -ScopeId {scope_literal} "
+            f"-StartRange {ps_ipv4(start)} -EndRange {ps_ipv4(end)}",
+            parse_json=False,
+            scope=scope,
+            operation="remove_exclusion",
+        )
 
-        current_excl = {(e.startAddress, e.endAddress) for e in current.exclusions}
-        desired_excl = {(e.startAddress, e.endAddress) for e in desired.exclusions}
+    for start, end in desired_excl - current_excl:
+        changed = True
+        logger.info(
+            "Adding DHCP exclusion range",
+            extra=_scope_extra(scope, "add_exclusion"),
+        )
+        await run_ps(
+            f"Add-DhcpServerv4ExclusionRange -ScopeId {scope_literal} "
+            f"-StartRange {ps_ipv4(start)} -EndRange {ps_ipv4(end)}",
+            parse_json=False,
+            scope=scope,
+            operation="add_exclusion",
+        )
 
-        for start, end in current_excl - desired_excl:
-            changed = True
-            logger.info(
-                "Removing DHCP exclusion range",
-                extra=_scope_extra(scope, "remove_exclusion"),
-            )
-            await run_ps(
-                f"Remove-DhcpServerv4ExclusionRange -ScopeId {scope_literal} "
-                f"-StartRange {ps_ipv4(start)} -EndRange {ps_ipv4(end)}",
-                parse_json=False,
-                scope=scope,
-                operation="remove_exclusion",
-            )
+    failover_changed = await _handle_failover_diff(scope, current.failover, desired.failover)
+    changed = changed or failover_changed
 
-        for start, end in desired_excl - current_excl:
-            changed = True
-            logger.info(
-                "Adding DHCP exclusion range",
-                extra=_scope_extra(scope, "add_exclusion"),
-            )
-            await run_ps(
-                f"Add-DhcpServerv4ExclusionRange -ScopeId {scope_literal} "
-                f"-StartRange {ps_ipv4(start)} -EndRange {ps_ipv4(end)}",
-                parse_json=False,
-                scope=scope,
-                operation="add_exclusion",
-            )
+    if changed and desired.failover is not None:
+        await _replicate_failover(scope, desired.failover.relationshipName)
 
-        failover_changed = await _handle_failover_diff(scope, current.failover, desired.failover)
-        changed = changed or failover_changed
-
-        if changed and desired.failover is not None:
-            await _replicate_failover(scope, desired.failover.relationshipName)
-
-        return await _assemble_existing_scope(scope)
+    return await _assemble_existing_scope(scope)
 
 
 @log_call

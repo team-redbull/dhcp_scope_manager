@@ -85,24 +85,97 @@ class TestCreateScope:
         commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
         assert not any("Add-DhcpServerv4Scope" in cmd for cmd in commands)
 
-    async def test_options_always_set_even_when_scope_exists(self):
-        """Set-DhcpServerv4OptionValue must always run, whether scope was added or was already there."""
-        payload = _make_scope()
-        result = _make_scope()
+    async def test_options_written_when_existing_scope_differs(self):
+        """POST on an existing scope converges options, not just creates them."""
+        payload = _make_scope(dnsDomain="new.local")
+        current = _make_scope(dnsDomain="stale.local")
 
         with patch("app.services.scope_service.run_ps") as mock_ps, \
-             patch("app.services.scope_service.assemble_scope_state", return_value=result):
+             patch(
+                 "app.services.scope_service.assemble_scope_state",
+                 side_effect=[current, payload],
+             ):
             mock_ps.side_effect = [
-                True,  # scope_exists: exists
-                None,  # Set-DhcpServerv4OptionValue
-                None,  # Remove-DhcpServerv4OptionValue -OptionId 66 (no PXE desired)
-                None,  # Remove-DhcpServerv4OptionValue -OptionId 67
+                True,  # scope_exists: exists → convergence path
+                None,  # Set-DhcpServerv4OptionValue (dnsDomain differs)
             ]
             from app.services import scope_service
             await scope_service.create_scope(payload)
 
         commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
-        assert any("Set-DhcpServerv4OptionValue" in cmd for cmd in commands)
+        assert any(
+            "Set-DhcpServerv4OptionValue" in cmd and "'new.local'" in cmd
+            for cmd in commands
+        )
+
+    async def test_post_on_identical_existing_scope_issues_no_writes(self):
+        """Idempotency (§2): re-POSTing state that already matches diffs to nothing.
+
+        Convergence must not mean "rewrite everything unconditionally" — Crossplane
+        retries POST after a failed create, and a no-op retry has to stay a no-op.
+        """
+        payload = _make_scope()
+        current = _make_scope()
+
+        with patch("app.services.scope_service.run_ps") as mock_ps, \
+             patch(
+                 "app.services.scope_service.assemble_scope_state",
+                 side_effect=[current, payload],
+             ):
+            mock_ps.side_effect = [True]  # scope_exists only — nothing else may run
+            from app.services import scope_service
+            await scope_service.create_scope(payload)
+
+        commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
+        writes = [
+            cmd for cmd in commands
+            if any(v in cmd for v in ("Set-", "Add-", "Remove-"))
+        ]
+        assert writes == [], f"identical re-POST must issue no writes, got {writes}"
+
+    async def test_post_on_existing_scope_converges_name_range_lease_description(self):
+        """The five fields that live only in Add-DhcpServerv4Scope must still converge.
+
+        Regression test for the reported bug: POST on an existing scope returned 200
+        while silently discarding scopeName, startRange, endRange, leaseDurationDays
+        and description, because the create path skipped the one cmdlet carrying them.
+        """
+        payload = _make_scope(
+            scopeName="new-name",
+            startRange="10.20.30.50",
+            endRange="10.20.30.250",
+            leaseDurationDays=99,
+            description="new description",
+        )
+        current = _make_scope()
+
+        with patch("app.services.scope_service.run_ps") as mock_ps, \
+             patch(
+                 "app.services.scope_service.assemble_scope_state",
+                 side_effect=[current, payload],
+             ):
+            mock_ps.side_effect = [
+                True,  # scope_exists: exists
+                None,  # Set-DhcpServerv4Scope (range — widened, single step)
+                None,  # Set-DhcpServerv4Scope (name / lease / description)
+            ]
+            from app.services import scope_service
+            await scope_service.create_scope(payload)
+
+        commands = [c.args[0] for c in mock_ps.call_args_list if c.args]
+        assert any(
+            "Set-DhcpServerv4Scope" in cmd
+            and "-StartRange '10.20.30.50'" in cmd
+            and "-EndRange '10.20.30.250'" in cmd
+            for cmd in commands
+        ), "range must converge on POST"
+        assert any(
+            "Set-DhcpServerv4Scope" in cmd
+            and "-Name 'new-name'" in cmd
+            and "-Days 99" in cmd
+            and "-Description 'new description'" in cmd
+            for cmd in commands
+        ), "name/lease/description must converge on POST"
 
     async def test_create_with_pxe_sets_options_66_and_67(self):
         """A scope with a PXE pair gets one Set call per option, after the DNS call."""
@@ -150,11 +223,14 @@ class TestCreateScope:
         test_create_without_pxe_issues_no_boot_option_calls.
         """
         payload = _make_scope()
-        result = _make_scope()
+        current = _make_scope(nextServer="boot.lab.local", bootFile="snponly.efi")
 
         with patch("app.services.scope_service.run_ps") as mock_ps, \
-             patch("app.services.scope_service.assemble_scope_state", return_value=result):
-            mock_ps.side_effect = [True, None, None, None]
+             patch(
+                 "app.services.scope_service.assemble_scope_state",
+                 side_effect=[current, payload],
+             ):
+            mock_ps.side_effect = [True, None, None]
             from app.services import scope_service
             await scope_service.create_scope(payload)
 
