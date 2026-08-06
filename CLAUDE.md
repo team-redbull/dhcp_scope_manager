@@ -279,6 +279,17 @@ construction, and equality is far easier to test than containment.
 - Bearer token auth via `DHCP_API_TOKEN` — optional; disabled when unset
 - Secrets never logged; PowerShell stderr sanitized before returning to clients
 
+**`/healthz` is the one route with no `verify_token`.** It is the Deployment's
+readiness probe, and a kubelet probe cannot send an Authorization header — it has no
+way to read a Secret. Behind auth it returned 401 to every probe, so the pod never
+became ready and never joined its Service; that is not theoretical, it is what the
+first token-generating release did. The response is a bare `{"status": "ok"}` or an
+error, so an anonymous caller learns only whether the DHCP server is reachable.
+Do not "fix" this by moving readiness to `tcpSocket`: that asks whether the process
+is up rather than whether this pod can reach the DHCP server, and would keep a pod
+that can serve nothing in the Service endpoints. Pinned by
+`test_healthz_needs_no_token_even_when_auth_is_on`.
+
 **WinRM auth and the failover double hop.** `WINRM_AUTH` is `kerberos | ntlm | credssp`.
 The failover cmdlets in §6/§7 (`Add-DhcpServerv4Failover`,
 `Add-DhcpServerv4FailoverScope`, `Invoke-DhcpServerv4FailoverReplication`) act on the

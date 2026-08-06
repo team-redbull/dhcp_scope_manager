@@ -459,6 +459,27 @@ async def test_healthz_endpoint():
     assert r.json()["status"] == "ok"
 
 
+async def test_healthz_needs_no_token_even_when_auth_is_on():
+    """/healthz is the readiness probe, and the kubelet cannot send a token.
+
+    Every other route requires one. This is the single exemption, and it is not
+    cosmetic: when /healthz was behind verify_token, a release that generated a
+    token failed every probe with 401, so the pod never became ready and never
+    joined its Service. The endpoint returns a bare {"status": "ok"}, so there
+    is nothing to protect.
+    """
+    import app.dependencies.auth as auth_mod
+    original = auth_mod.settings.DHCP_API_TOKEN
+    auth_mod.settings.DHCP_API_TOKEN = "secret-token"
+    try:
+        with patch("app.services.dhcp_service.validate_dhcp_environment"):
+            r = await client.get("/healthz")
+        assert r.status_code == 200
+        assert r.json() == {"status": "ok"}
+    finally:
+        auth_mod.settings.DHCP_API_TOKEN = original
+
+
 # ---------------------------------------------------------------------------
 # Critical: GET/PUT roundtrip test
 # ---------------------------------------------------------------------------

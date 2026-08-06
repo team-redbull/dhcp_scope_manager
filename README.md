@@ -256,7 +256,7 @@ own, so each carries a leading `scope` field to identify itself.
 
 All `/api/v1/scopes*` endpoints share two implicit checks that run before the handler:
 
-- **Auth** — rejects requests when `DHCP_API_TOKEN` is set and the token is missing or wrong. Returns `401`.
+- **Auth** — rejects requests when `DHCP_API_TOKEN` is set and the token is missing or wrong. Returns `401`. `/healthz` is deliberately outside this check, because it backs the readiness probe and a kubelet cannot send a token.
 - **Environment guard** — rejects requests when DHCP automation cannot run. Under `local` that means the wrong OS, missing PowerShell, or no DHCP cmdlets; under `psrp` it means `pypsrp` missing, WinRM unreachable or unauthenticated, or no DHCP cmdlets on the target host. Returns `503`.
 
 There is one more group of routes, used only for on-demand test execution — see
@@ -795,7 +795,8 @@ Dependencies are installed with `pip install -r scripts/requirements.txt` (pydan
 
 ## Security and Safety
 
-- Bearer token auth via `DHCP_API_TOKEN` — optional; disabled when unset
+- Bearer token auth via `DHCP_API_TOKEN` — optional; disabled when unset. `/healthz` is
+  the one exemption: it is the readiness probe, and a kubelet probe cannot send a token
 - Runtime environment guard rejects all scope operations on non-Windows / non-DHCP hosts
 - `-ErrorAction Stop` on every PowerShell command
 - PowerShell stderr is sanitized before returning to clients and before logging previews
