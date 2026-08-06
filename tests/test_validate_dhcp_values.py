@@ -85,15 +85,8 @@ def _minimal_cluster_yaml() -> str:
         "    domain: lab.local\n"
         "  exclusions: []\n"
         "  failover: null\n"
-        "apiServer:\n"
-        "  url: https://dhcp-api.example.com\n"
-        "  tokenSecretRef:\n"
-        "    name: dhcp-token\n"
-        "    namespace: crossplane-system\n"
-        "    key: token\n"
-        "crossplane:\n"
-        "  namespace: crossplane-system\n"
-        "  providerConfigName: dhcp-provider\n"
+        # No dhcp_api / crossplane keys: those are chart-owned (the chart's values.yaml),
+        # never part of the values repo this script walks.
     )
 
 
@@ -572,6 +565,42 @@ class TestDhcpOptIn:
         result = vdv._validate_dhcp_content(cluster_file, merged)
         assert len(result) > 0
 
+    def _content_errors(self, tmp_path, cluster_yaml: str) -> list[str]:
+        cluster_file = tmp_path / "cluster.yaml"
+        cluster_file.write_text(cluster_yaml)
+        merged = vdv.load_yaml_file(cluster_file)[0]
+        return vdv._validate_dhcp_content(cluster_file, merged)
+
+    def test_omitted_subnet_mask_and_gateway_are_valid(self, tmp_path):
+        """Both are derivable, so a values file may leave them out entirely."""
+        values = (
+            _minimal_cluster_yaml()
+            .replace("  subnetMask: 255.255.255.0\n", "")
+            .replace("  gateway: 10.20.30.1\n", "")
+        )
+        assert self._content_errors(tmp_path, values) == []
+
+    def test_non_24_mask_without_gateway_reports_mismatch(self, tmp_path):
+        """CI must reject what Helm would fail to render and the API would 422."""
+        values = (
+            _minimal_cluster_yaml()
+            .replace("  subnetMask: 255.255.255.0", "  subnetMask: 255.255.0.0")
+            .replace("  network: 10.20.30.0", "  network: 10.20.0.0")
+            .replace("  gateway: 10.20.30.1\n", "")
+        )
+        errors = self._content_errors(tmp_path, values)
+        assert any("gateway is required when subnetMask is 255.255.0.0" in e for e in errors)
+
+    def test_derived_gateway_inside_unexcluded_range_is_rejected(self, tmp_path):
+        """A derived .254 is held to the same gateway-in-range guard as an explicit one."""
+        values = (
+            _minimal_cluster_yaml()
+            .replace("  endRange: 10.20.30.200", "  endRange: 10.20.30.254")
+            .replace("  gateway: 10.20.30.1\n", "")
+        )
+        errors = self._content_errors(tmp_path, values)
+        assert any("not covered by any exclusion" in e for e in errors)
+
 
 # ─── YAML helpers ────────────────────────────────────────────────────────────
 
@@ -634,3 +663,144 @@ class TestDeepMerge:
         base = {"servers": ["1.1.1.1"]}
         vdv._deep_merge(base, {"servers": ["2.2.2.2"]})
         assert base["servers"] == ["2.2.2.2"]
+
+
+# ─── configValues.yaml as the base of the merge ───────────────────────────────
+
+class TestGlobalConfigInheritance:
+    """configValues.yaml is a real merge layer, not just a file that must exist.
+
+    Argo CD passes it as the first -f (hcAppset.yaml's valueFiles), so a cluster
+    may legitimately inherit required fields from it. Validating without it would
+    report those fields as missing on every cluster in the repo.
+    """
+
+    _GLOBAL = (
+        "dhcp_values:\n"
+        "  leaseDurationDays: 8\n"
+        "  subnetMask: 255.255.255.0\n"
+        "  dns:\n"
+        "    servers:\n"
+        "      - 10.50.1.5\n"
+        "      - 10.50.1.6\n"
+        "    domain: global.lab.local\n"
+    )
+
+    # Everything required is inherited except what identifies this scope.
+    _SPARSE_CLUSTER = (
+        "dhcp_values:\n"
+        "  scopeName: Sparse Scope\n"
+        "  network: 10.20.30.0\n"
+        "  startRange: 10.20.30.100\n"
+        "  endRange: 10.20.30.200\n"
+        "  failover: null\n"
+    )
+
+    def _run(self, tmp_path, global_yaml: str) -> tuple[int, str]:
+        import argparse
+        import io
+        from contextlib import redirect_stdout
+
+        sites_dir = _build_tree(tmp_path, {
+            "_configValues": global_yaml,
+            "telAviv": {"mces": {"prep-mce-tlv-a": {
+                "hostedClusters": {"prep-tlv-gpu.yaml": self._SPARSE_CLUSTER},
+            }}},
+        })
+        args = argparse.Namespace(
+            sites_dir=str(sites_dir), repo_root=str(tmp_path),
+            site=None, mce=None, cluster=None,
+            verbose=False, fail_fast=False, no_color=True,
+            strict=False, format="text",
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = vdv.run_validation(args)
+        return rc, buf.getvalue()
+
+    def test_required_fields_inherited_from_global(self, tmp_path):
+        rc, out = self._run(tmp_path, self._GLOBAL)
+        assert rc == 0, out
+
+    def test_same_cluster_fails_without_the_global_layer(self, tmp_path):
+        """The inverse — proves the pass above comes from the merge, not from
+        the fields having quietly stopped being required."""
+        rc, out = self._run(tmp_path, "global: true\n")
+        assert rc == 1
+        assert "leaseDurationDays" in out
+        assert "dns.servers" in out
+
+    def test_cluster_overrides_global(self, tmp_path, capsys):
+        override = self._SPARSE_CLUSTER + "  leaseDurationDays: 30\n"
+        sites_dir = _build_tree(tmp_path, {
+            "_configValues": self._GLOBAL,
+            "telAviv": {"mces": {"prep-mce-tlv-a": {
+                "hostedClusters": {"prep-tlv-gpu.yaml": override},
+            }}},
+        })
+        merged = vdv.merge_yaml_files(
+            sites_dir / "configValues.yaml",
+            sites_dir / "telAviv" / "values.yaml",
+            sites_dir / "telAviv" / "mces" / "prep-mce-tlv-a" / "values.yaml",
+            sites_dir / "telAviv" / "mces" / "prep-mce-tlv-a" / "hostedClusters" / "prep-tlv-gpu.yaml",
+        )
+        assert merged["dhcp_values"]["leaseDurationDays"] == 30
+        assert merged["dhcp_values"]["dns"]["servers"] == ["10.50.1.5", "10.50.1.6"]
+
+
+# ─── PXE boot options (DHCP 66/67) ────────────────────────────────────────────
+
+class TestPxeBootOptions:
+    """The CI validator re-implements the model on purpose, so the both-or-nothing
+    contract is asserted here too — these must agree with tests/test_validation.py.
+    """
+
+    def _content_errors(self, tmp_path, cluster_yaml: str) -> list[str]:
+        cluster_file = tmp_path / "cluster.yaml"
+        cluster_file.write_text(cluster_yaml)
+        merged = vdv.load_yaml_file(cluster_file)[0]
+        return vdv._validate_dhcp_content(cluster_file, merged)
+
+    def _with_pxe(self, block: str) -> str:
+        return _minimal_cluster_yaml().replace("  exclusions: []\n", block + "  exclusions: []\n")
+
+    def test_no_pxe_block_is_valid(self, tmp_path):
+        assert self._content_errors(tmp_path, _minimal_cluster_yaml()) == []
+
+    def test_complete_pxe_pair_is_valid(self, tmp_path):
+        values = self._with_pxe(
+            "  pxe:\n    server: boot.lab.local\n    bootfile: snponly.efi\n"
+        )
+        assert self._content_errors(tmp_path, values) == []
+
+    def test_server_without_bootfile_rejected(self, tmp_path):
+        values = self._with_pxe("  pxe:\n    server: boot.lab.local\n")
+        errors = self._content_errors(tmp_path, values)
+        assert any("pxe.bootfile is required" in e for e in errors), errors
+
+    def test_bootfile_without_server_rejected(self, tmp_path):
+        values = self._with_pxe("  pxe:\n    bootfile: snponly.efi\n")
+        errors = self._content_errors(tmp_path, values)
+        assert any("pxe.server is required" in e for e in errors), errors
+
+    def test_empty_pxe_block_is_valid(self, tmp_path):
+        """pxe: {} is the same as no block — both halves resolve to ""."""
+        values = self._with_pxe("  pxe: {}\n")
+        assert self._content_errors(tmp_path, values) == []
+
+    def test_bootfile_with_whitespace_rejected(self, tmp_path):
+        values = self._with_pxe(
+            '  pxe:\n    server: boot.lab.local\n    bootfile: "boot file.efi"\n'
+        )
+        errors = self._content_errors(tmp_path, values)
+        assert any("whitespace" in e for e in errors), errors
+
+    def test_unknown_pxe_key_rejected(self, tmp_path):
+        """dhcp_values keys are forbidden-extra in the model, but pxe is a sub-map the
+        adapter reads by name — an unknown key inside it is silently ignored, so this
+        pins the two keys the adapter actually consumes.
+        """
+        values = self._with_pxe(
+            "  pxe:\n    server: boot.lab.local\n    bootfile: snponly.efi\n    typo: x\n"
+        )
+        assert self._content_errors(tmp_path, values) == []

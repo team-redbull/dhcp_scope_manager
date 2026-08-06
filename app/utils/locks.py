@@ -21,17 +21,17 @@ class ScopeLockManager:
             self._guard_loop = loop
         return self._guard
 
-    async def _get_lock(self, scope_id: str) -> asyncio.Lock:
+    async def _get_lock(self, scope: str) -> asyncio.Lock:
         async with self._get_guard():
-            lock = self._locks.get(scope_id)
+            lock = self._locks.get(scope)
             if lock is None:
                 lock = asyncio.Lock()
-                self._locks[scope_id] = lock
+                self._locks[scope] = lock
             return lock
 
     @asynccontextmanager
-    async def lock(self, scope_id: str) -> AsyncIterator[None]:
-        lock = await self._get_lock(scope_id)
+    async def lock(self, scope: str) -> AsyncIterator[None]:
+        lock = await self._get_lock(scope)
         async with lock:
             yield
 

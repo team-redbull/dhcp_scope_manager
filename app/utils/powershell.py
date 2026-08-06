@@ -3,7 +3,7 @@ from __future__ import annotations
 from ipaddress import AddressValueError, IPv4Address
 from typing import Iterable
 
-from app.errors import InvalidScopeIdError
+from app.errors import InvalidScopeError
 
 
 def ps_single_quote(value: object) -> str:
@@ -18,7 +18,7 @@ def ps_ipv4(value: object) -> str:
     try:
         return ps_single_quote(str(IPv4Address(text)))
     except (AddressValueError, ValueError):
-        raise InvalidScopeIdError(text)
+        raise InvalidScopeError(text)
 
 
 def ps_ipv4_csv(values: Iterable[object]) -> str:

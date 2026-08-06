@@ -228,6 +228,12 @@ def _is_valid_k8s_label(name: str) -> bool:
     return len(name) <= 63 and bool(_K8S_DNS_LABEL_RE.match(name))
 
 
+# Mirrors DEFAULT_SUBNET_MASK in app/models/scope.py. This script deliberately
+# re-implements the model rather than importing it so CI can run without the app
+# installed — the two must be kept in step.
+_DEFAULT_SUBNET_MASK = IPv4Address("255.255.255.0")
+
+
 class _CiExclusion(BaseModel):
     model_config = ConfigDict(extra="forbid")
     startAddress: IPv4Address
@@ -277,7 +283,7 @@ class _CiScopePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     scopeName: str = Field(min_length=1, max_length=256)
     network: IPv4Address
-    subnetMask: IPv4Address
+    subnetMask: IPv4Address = _DEFAULT_SUBNET_MASK
     startRange: IPv4Address
     endRange: IPv4Address
     leaseDurationDays: int = Field(ge=1, le=3650)
@@ -285,6 +291,8 @@ class _CiScopePayload(BaseModel):
     gateway: Optional[IPv4Address] = None
     dnsServers: list[IPv4Address] = Field(default_factory=list, min_length=1)
     dnsDomain: str = Field(default="", max_length=256)
+    nextServer: str = Field(default="", max_length=255)
+    bootFile: str = Field(default="", max_length=255)
     exclusions: list[_CiExclusion] = Field(default_factory=list)
     failover: Optional[_CiFailover] = None
 
@@ -300,6 +308,11 @@ class _CiScopePayload(BaseModel):
     def normalize_description(cls, v: object) -> object:
         return "" if v is None else v
 
+    @field_validator("subnetMask", mode="before")
+    @classmethod
+    def normalize_subnet_mask(cls, v: object) -> object:
+        return _DEFAULT_SUBNET_MASK if v is None or v == "" else v
+
     @field_validator("gateway", mode="before")
     @classmethod
     def normalize_gateway(cls, v: object) -> object:
@@ -309,6 +322,40 @@ class _CiScopePayload(BaseModel):
     @classmethod
     def normalize_dns_domain(cls, v: object) -> object:
         return "" if v is None else v
+
+    @field_validator("nextServer", "bootFile", mode="before")
+    @classmethod
+    def normalize_boot_option(cls, v: object) -> object:
+        return "" if v is None else v
+
+    @field_validator("nextServer", "bootFile")
+    @classmethod
+    def boot_option_is_a_single_token(cls, v: str) -> str:
+        if not v:
+            return v
+        if v != v.strip():
+            raise ValueError("must not have leading or trailing whitespace")
+        if any(c.isspace() for c in v):
+            raise ValueError("must not contain whitespace")
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+            raise ValueError("must not contain control characters")
+        return v
+
+    # Mirrors DhcpScopeBody.pxe_options_set_together in app/models/scope.py — catches
+    # a half-configured PXE pair at PR time instead of at rack time.
+    @model_validator(mode="after")
+    def pxe_options_set_together(self) -> "_CiScopePayload":
+        if bool(self.nextServer) != bool(self.bootFile):
+            missing, present = (
+                ("pxe.bootfile", "pxe.server")
+                if self.nextServer
+                else ("pxe.server", "pxe.bootfile")
+            )
+            raise ValueError(
+                f"{missing} is required when {present} is set: DHCP options 66 and 67 "
+                f"must be set together, or both left unset"
+            )
+        return self
 
     @model_validator(mode="after")
     def no_duplicate_exclusions(self) -> "_CiScopePayload":
@@ -345,6 +392,22 @@ class _CiScopePayload(BaseModel):
             raise ValueError(
                 f"endRange {self.endRange} must be >= startRange {self.startRange}"
             )
+        return self
+
+    # Must run before validate_subnet_consistency and gateway_not_in_distribution_range
+    # so those see the resolved gateway. Mirrors
+    # DhcpScopePayload.resolve_default_gateway in app/models/scope.py.
+    @model_validator(mode="after")
+    def resolve_default_gateway(self) -> "_CiScopePayload":
+        if "gateway" in self.model_fields_set:
+            return self
+        if self.subnetMask != _DEFAULT_SUBNET_MASK:
+            raise ValueError(
+                f"gateway is required when subnetMask is {self.subnetMask}: the default "
+                f"gateway is only derivable for {_DEFAULT_SUBNET_MASK}. "
+                f'Set gateway explicitly, or set it to "" for no gateway.'
+            )
+        self.gateway = IPv4Address((int(self.network) & ~0xFF) | 254)
         return self
 
     @model_validator(mode="after")
@@ -416,18 +479,16 @@ def _nested_present(data: dict, *keys: str) -> bool:
     return current is not None
 
 
+# Only dhcp_values lives in the values repo. dhcp_api and crossplane are chart-owned
+# (the chart's values.yaml) — a platform-wide constant, not per-cluster config — so the merge
+# chain this script walks never contains them and must not demand them.
 _REQUIRED_PATHS: list[tuple[str, ...]] = [
     ("dhcp_values", "scopeName"),
     ("dhcp_values", "network"),
-    ("dhcp_values", "subnetMask"),
     ("dhcp_values", "startRange"),
     ("dhcp_values", "endRange"),
     ("dhcp_values", "leaseDurationDays"),
     ("dhcp_values", "dns", "servers"),
-    ("apiServer", "url"),
-    ("apiServer", "tokenSecretRef", "name"),
-    ("apiServer", "tokenSecretRef", "namespace"),
-    ("apiServer", "tokenSecretRef", "key"),
 ]
 
 
@@ -458,20 +519,27 @@ def _validate_dhcp_content(cluster_path: Path, merged: dict) -> list[str]:
 
     # Pydantic scope validation
     dns = dv.get("dns") or {}
+    pxe = dv.get("pxe") or {}
     kwargs = {
         "scopeName":         dv.get("scopeName"),
         "network":           dv.get("network"),
-        "subnetMask":        dv.get("subnetMask"),
         "startRange":        dv.get("startRange"),
         "endRange":          dv.get("endRange"),
         "leaseDurationDays": dv.get("leaseDurationDays"),
         "description":       dv.get("description") or "",
-        "gateway":           dv.get("gateway"),
         "dnsServers":        dns.get("servers") or [],
         "dnsDomain":         dns.get("domain") or "",
+        "nextServer":        pxe.get("server") or "",
+        "bootFile":          pxe.get("bootfile") or "",
         "exclusions":        dv.get("exclusions") or [],
         "failover":          dv.get("failover"),
     }
+    # Pass these two only when the values file actually wrote them. Setting them
+    # unconditionally would make every file look like an explicit null, and the
+    # derived defaults would never fire — see _CiScopePayload.resolve_default_gateway.
+    for key in ("subnetMask", "gateway"):
+        if key in dv:
+            kwargs[key] = dv[key]
     try:
         _CiScopePayload(**kwargs)
     except ValidationError as exc:
@@ -584,10 +652,11 @@ def run_validation(args: argparse.Namespace) -> int:
             _print_summary(all_errors, cluster_results, output_fmt, use_color)
             return 1
 
+    global_config_path = sites_dir / "configValues.yaml"
+
     if output_fmt == "text":
         print(f"Validating sites directory: {_c(str(sites_dir), _BOLD, use_color=use_color)}\n")
-        config_path = sites_dir / "configValues.yaml"
-        if config_path.exists():
+        if global_config_path.exists():
             print(f"Global config:\n  {_ok('configValues.yaml', use_color)}\n")
 
     # ── 2. Walk sites ────────────────────────────────────────────────────────
@@ -651,7 +720,12 @@ def run_validation(args: argparse.Namespace) -> int:
                 # DHCP content validation on merged chain
                 dhcp_skipped = False
                 if not struct_errors:
-                    chain = [p for p in (site_values_path, mce_values_path, cluster_path)
+                    # configValues.yaml is the base of the merge, matching the
+                    # valueFiles list Argo CD hands to Helm (hcAppset.yaml). Without
+                    # it, a cluster that inherits leaseDurationDays or dns.servers
+                    # from the global layer is reported as missing them.
+                    chain = [p for p in (global_config_path, site_values_path,
+                                         mce_values_path, cluster_path)
                              if p.exists()]
                     merged = merge_yaml_files(*chain)
                     cluster_data, _ = load_yaml_file(cluster_path)

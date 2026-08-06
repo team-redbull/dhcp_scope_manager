@@ -273,7 +273,7 @@ class TestRouteLevelProtection:
     async def test_post_route_also_protected(self):
         exc = DhcpEnvironmentError(DhcpEnvReason.WSL_DETECTED, "WSL")
         payload = {
-            "scopeName": "Test", "network": "10.20.30.0", "subnetMask": "255.255.255.0",
+            "scopeName": "Test", "subnetMask": "255.255.255.0",
             "startRange": "10.20.30.100", "endRange": "10.20.30.200",
             "leaseDurationDays": 8, "description": "", "gateway": "10.20.30.1",
             "dnsServers": ["10.0.0.53"], "dnsDomain": "", "exclusions": [], "failover": None,

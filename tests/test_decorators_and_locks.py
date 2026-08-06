@@ -255,8 +255,8 @@ class TestLogCallDecorator:
         import logging
 
         @log_call
-        def with_scope(scope_id: str, other: int = 0) -> str:
-            return scope_id
+        def with_scope(scope: str, other: int = 0) -> str:
+            return scope
 
         with caplog.at_level(logging.INFO):
             with_scope("10.20.30.0", other=5)
@@ -264,23 +264,23 @@ class TestLogCallDecorator:
         records = [r for r in caplog.records if "with_scope" in r.getMessage()]
         assert records
         for rec in records:
-            assert getattr(rec, "scope_id", None) == "10.20.30.0"
+            assert getattr(rec, "scope", None) == "10.20.30.0"
 
     @pytest.mark.asyncio
     async def test_async_scope_id_extracted_from_kwarg(self, caplog):
         import logging
 
         @log_call
-        async def async_with_scope(scope_id: str) -> str:
-            return scope_id
+        async def async_with_scope(scope: str) -> str:
+            return scope
 
         with caplog.at_level(logging.INFO):
-            await async_with_scope(scope_id="10.20.30.1")
+            await async_with_scope(scope="10.20.30.1")
 
         records = [r for r in caplog.records if "async_with_scope" in r.getMessage()]
         assert records
         for rec in records:
-            assert getattr(rec, "scope_id", None) == "10.20.30.1"
+            assert getattr(rec, "scope", None) == "10.20.30.1"
 
     def test_no_scope_id_param_omits_field(self, caplog):
         import logging
@@ -295,7 +295,7 @@ class TestLogCallDecorator:
         records = [r for r in caplog.records if "no_scope" in r.getMessage()]
         assert records
         for rec in records:
-            assert not hasattr(rec, "scope_id") or getattr(rec, "scope_id", None) is None
+            assert not hasattr(rec, "scope") or getattr(rec, "scope", None) is None
 
 
 # ─── ScopeLockManager ─────────────────────────────────────────────────────────
@@ -304,7 +304,7 @@ class TestScopeLockManager:
     pytestmark = pytest.mark.asyncio
 
     async def test_same_scope_id_reuses_same_lock(self):
-        """Two lock() calls for the same scope_id must return the same asyncio.Lock object."""
+        """Two lock() calls for the same scope must return the same asyncio.Lock object."""
         manager = ScopeLockManager()
         lock_a = await manager._get_lock("10.20.30.0")
         lock_b = await manager._get_lock("10.20.30.0")
@@ -358,9 +358,9 @@ class TestScopeLockManager:
         acquired_count = 0
         max_concurrent = 0
 
-        async def worker(scope_id: str):
+        async def worker(scope: str):
             nonlocal acquired_count, max_concurrent
-            async with manager.lock(scope_id):
+            async with manager.lock(scope):
                 acquired_count += 1
                 max_concurrent = max(max_concurrent, acquired_count)
                 await asyncio.sleep(0.01)

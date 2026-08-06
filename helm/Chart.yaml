@@ -1,6 +1,0 @@
-apiVersion: v2
-name: hosted-cluster-integration
-description: Render Crossplane provider-http Request CR for DHCP scope lifecycle
-type: application
-version: 0.1.0
-appVersion: "1.0.0"

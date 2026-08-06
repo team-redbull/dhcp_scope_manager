@@ -4,7 +4,7 @@ import logging.config
 
 
 _SAFE_EXTRA_FIELDS = (
-    "scope_id",
+    "scope",
     "operation",
     "relationship_name",
     "duration_ms",

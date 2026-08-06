@@ -1,0 +1,52 @@
+name: Tests
+
+# Runs the hermetic suite: no DHCP server, no AWS, no network, no toolchain beyond
+# Python. The Crossplane Request templates and their `helm template` tests live in
+# team-redbull/helm-charts-hostedclusters-setup, which runs its own workflow.
+#
+# The live-server suite in tests/integration/ is deliberately NOT run here. It
+# needs a Windows DHCP server to write to, and the test environment is brought up
+# on demand rather than kept running, so a CI job depending on it would fail for
+# reasons that have nothing to do with the change under test. Those tests gate on
+# DHCP_IT=1, which is never set in this workflow — see tests/integration/README.md.
+
+# Triggered only by build.yml, which calls this workflow and gates the image build
+# on it. It deliberately has no push/pull_request trigger of its own: build.yml
+# already runs on push to every branch, so a second trigger here would run the whole
+# suite twice for every commit on a PR branch — once for the push, once for the
+# pull_request event on the same SHA.
+#
+# PRs are still covered. Check runs attach to a commit SHA, not to an event, so the
+# run started by the push to the PR branch is the one the PR displays. The gap is
+# pull requests from forks, where no push event reaches this repo — add
+# `pull_request:` back here if the repo ever accepts them.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: Unit and chart tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Dockerfile, so a test passing here means it passes in the
+          # image that actually ships.
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            scripts/requirements.txt
+
+      - name: Install dependencies
+        # scripts/requirements.txt is not redundant: tests/test_validate_*.py import
+        # the validator scripts, which need PyYAML. It reaches the environment today
+        # only as a transitive dependency of uvicorn[standard] — installing it
+        # explicitly means a change to uvicorn's extras cannot quietly break CI.
+        run: pip install -r requirements.txt -r scripts/requirements.txt
+
+      - name: Run tests
+        run: pytest -q

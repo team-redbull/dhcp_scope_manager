@@ -6,6 +6,7 @@ import time
 from app.config import settings
 from app.errors import PowerShellError, PowerShellExecutionError, PowerShellTimeoutError, sanitize_powershell_text
 from app.services import dhcp_service
+from app.services.ps_transport import get_transport
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +33,57 @@ def _get_powershell_semaphore() -> asyncio.Semaphore:
     return _semaphore
 
 
+# The DhcpServer module does not describe failures in its messages: a missing
+# scope reports "Failed to get scope information for scope 10.20.30.0 on DHCP
+# server HOST", which contains no not-found wording at all. Matching on prose
+# alone therefore misclassifies every real DHCP error as a hard failure — GET
+# returns 500 instead of 404 and Crossplane never learns to POST.
+#
+# The reliable signals are the PowerShell error category and the DHCP error
+# number, both of which appear in stderr (console PowerShell prints them; the
+# PSRP transport reproduces them in _format_error_record). They are also
+# locale-independent, unlike the message text.
+#
+# Codes confirmed against Windows Server 2022, DHCP server version 10.0.
+_NOT_FOUND_MARKERS = (
+    "objectnotfound",   # category: missing scope, unset option, absent failover
+    "dhcp 20005",       # scope not found
+    "dhcp 20010",       # option value not set on scope
+    "dhcp 20116",       # no failover relationship for scope
+    # Retained for other cmdlets and older builds that do phrase it plainly.
+    "not found",
+    "does not exist",
+    "no dhcp scope",
+    "cannot find",
+)
+
+_ALREADY_EXISTS_MARKERS = (
+    "resourceexists",   # category: duplicate scope
+    "dhcp 20052",       # scope already exists
+    # Windows overloads DHCP 20023 across unrelated range failures: it is both
+    # "exclusion range already present" (Add-DhcpServerv4ExclusionRange) and
+    # "failed to set IP address range to a scope" (Set-DhcpServerv4Scope). The
+    # category is InvalidData for both, too broad to match on, so the code is
+    # matched instead. Only ever pass ignore_already_exists=True to a cmdlet
+    # where "already present" is the sole way 20023 can arise — never to a
+    # range-setting call, or a real failure will be silently swallowed.
+    "dhcp 20023",
+    "already exists",
+    "already been added",
+    "already in use",
+)
+
+
 def is_not_found_error(stderr: str) -> bool:
     """Return True if PowerShell stderr indicates the requested object does not exist."""
     lower = stderr.lower()
-    return any(kw in lower for kw in ("not found", "does not exist", "no dhcp scope", "cannot find"))
+    return any(kw in lower for kw in _NOT_FOUND_MARKERS)
 
 
 def is_already_exists_error(stderr: str) -> bool:
     """Return True if PowerShell stderr indicates the object already exists."""
     lower = stderr.lower()
-    return any(kw in lower for kw in ("already exists", "already been added", "already in use"))
+    return any(kw in lower for kw in _ALREADY_EXISTS_MARKERS)
 
 
 async def run_ps(
@@ -50,7 +92,7 @@ async def run_ps(
     *,
     append_error_action: bool = True,
     append_convert_to_json: bool = True,
-    scope_id: str | None = None,
+    scope: str | None = None,
     operation: str | None = None,
     relationship_name: str | None = None,
 ) -> dict | list | None:
@@ -81,61 +123,48 @@ async def run_ps(
         full_cmd += " | ConvertTo-Json -Depth 5 -Compress"
 
     log_extra = {
-        "scope_id": scope_id,
+        "scope": scope,
         "operation": operation or "powershell",
         "relationship_name": relationship_name,
     }
     logger.info("Running DHCP PowerShell command", extra=log_extra)
 
-    process: asyncio.subprocess.Process | None = None
     t0 = time.monotonic()
     try:
         async with _get_powershell_semaphore():
-            process = await asyncio.create_subprocess_exec(
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
+            result = await get_transport().execute(
                 full_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
-                timeout=settings.POWERSHELL_COMMAND_TIMEOUT_SECONDS,
+                settings.POWERSHELL_COMMAND_TIMEOUT_SECONDS,
             )
     except asyncio.TimeoutError as exc:
-        if process is not None and process.returncode is None:
-            process.kill()
-            await process.wait()
         raise PowerShellTimeoutError(
             command,
             settings.POWERSHELL_COMMAND_TIMEOUT_SECONDS,
             operation=operation,
-            scope_id=scope_id,
+            scope=scope,
         ) from exc
 
-    stdout = stdout_bytes.decode(errors="replace")
-    stderr = stderr_bytes.decode(errors="replace")
+    stdout = result.stdout
+    stderr = result.stderr
     duration_ms = round((time.monotonic() - t0) * 1000, 2)
 
-    if process.returncode != 0:
+    if result.returncode != 0:
         logger.error(
             "DHCP PowerShell command failed",
             extra={
                 **log_extra,
                 "duration_ms": duration_ms,
                 "status": "failed",
-                "returncode": process.returncode,
+                "returncode": result.returncode,
                 "stderr_preview": sanitize_powershell_text(stderr.strip()),
             },
         )
         raise PowerShellExecutionError(
             command,
             stderr.strip(),
-            process.returncode or 1,
+            result.returncode or 1,
             operation=operation,
-            scope_id=scope_id,
+            scope=scope,
         )
 
     logger.info(
@@ -154,5 +183,5 @@ async def run_ps(
             f"PowerShell returned non-JSON output: {exc}. stdout={stdout.strip()[:200]!r}",
             0,
             operation=operation,
-            scope_id=scope_id,
+            scope=scope,
         ) from exc

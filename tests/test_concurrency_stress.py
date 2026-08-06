@@ -44,7 +44,7 @@ def _make_scope(network: str = "10.20.30.0") -> DhcpScopePayload:
     prefix = ".".join(network.split(".")[:3]) + "."
     return DhcpScopePayload(
         scopeName="Scope",
-        network=network,
+        scope=network,
         subnetMask="255.255.255.0",
         startRange=f"{prefix}100",
         endRange=f"{prefix}200",
@@ -62,7 +62,6 @@ def _scope_body(network: str, name: str = "Scope") -> dict:
     prefix = ".".join(network.split(".")[:3]) + "."
     return dict(
         scopeName=name,
-        network=network,
         subnetMask="255.255.255.0",
         startRange=f"{prefix}100",
         endRange=f"{prefix}200",
@@ -84,8 +83,8 @@ class TestMassiveConcurrentGet:
         """100 concurrent GET /api/v1/scopes/{network} — all must return 200."""
         networks = [_network(i) for i in range(100)]
 
-        async def mock_get(scope_id: str) -> DhcpScopePayload:
-            return _make_scope(scope_id)
+        async def mock_get(scope: str) -> DhcpScopePayload:
+            return _make_scope(scope)
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -101,8 +100,8 @@ class TestMassiveConcurrentGet:
         """150 concurrent GETs stress-test the async machinery."""
         networks = [_network(i) for i in range(150)]
 
-        async def mock_get(scope_id: str) -> DhcpScopePayload:
-            return _make_scope(scope_id)
+        async def mock_get(scope: str) -> DhcpScopePayload:
+            return _make_scope(scope)
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -168,9 +167,9 @@ class TestDifferentScopeParallelism:
         max_concurrent = 0
         SCOPE_COUNT = 30
 
-        async def worker(scope_id: str):
+        async def worker(scope: str):
             nonlocal acquired_count, max_concurrent
-            async with manager.lock(scope_id):
+            async with manager.lock(scope):
                 acquired_count += 1
                 max_concurrent = max(max_concurrent, acquired_count)
                 await asyncio.sleep(0.01)
@@ -189,8 +188,8 @@ class TestDifferentScopeParallelism:
         """100 scopes each sleeping 0.01s must complete in well under 1s."""
         manager = ScopeLockManager()
 
-        async def worker(scope_id: str):
-            async with manager.lock(scope_id):
+        async def worker(scope: str):
+            async with manager.lock(scope):
                 await asyncio.sleep(0.01)
 
         scopes = [_network(i) for i in range(100)]
@@ -273,10 +272,10 @@ class TestErrorIsolation:
         bad_network = _network(99)
         all_networks = [bad_network] + good_networks
 
-        async def mock_get(scope_id: str) -> DhcpScopePayload:
-            if scope_id == bad_network:
+        async def mock_get(scope: str) -> DhcpScopePayload:
+            if scope == bad_network:
                 raise PowerShellExecutionError("cmd", "Access denied", 1)
-            return _make_scope(scope_id)
+            return _make_scope(scope)
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -296,10 +295,10 @@ class TestErrorIsolation:
         timeout_network = _network(50)
         all_networks = [timeout_network] + good_networks
 
-        async def mock_get(scope_id: str) -> DhcpScopePayload:
-            if scope_id == timeout_network:
+        async def mock_get(scope: str) -> DhcpScopePayload:
+            if scope == timeout_network:
                 raise PowerShellTimeoutError("cmd", 60)
-            return _make_scope(scope_id)
+            return _make_scope(scope)
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -319,10 +318,10 @@ class TestErrorIsolation:
         networks = [_network(i) for i in range(30)]
         fail_set = set(random.sample(networks, k=10))
 
-        async def mock_get(scope_id: str) -> DhcpScopePayload:
-            if scope_id in fail_set:
+        async def mock_get(scope: str) -> DhcpScopePayload:
+            if scope in fail_set:
                 raise PowerShellExecutionError("cmd", "err", 1)
-            return _make_scope(scope_id)
+            return _make_scope(scope)
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -346,16 +345,16 @@ class TestMixedVerbWorkload:
         """Simulate a Crossplane reconcile loop: GET → POST → PUT → GET → DELETE."""
         scopes = [_network(i) for i in range(50)]
 
-        async def mock_get(scope_id: str) -> DhcpScopePayload:
-            return _make_scope(scope_id)
+        async def mock_get(scope: str) -> DhcpScopePayload:
+            return _make_scope(scope)
 
         async def mock_create(payload: DhcpScopePayload) -> DhcpScopePayload:
             return payload
 
-        async def mock_update(scope_id: str, payload: DhcpScopePayload) -> DhcpScopePayload:
+        async def mock_update(scope: str, payload: DhcpScopePayload) -> DhcpScopePayload:
             return payload
 
-        async def mock_delete(scope_id: str) -> None:
+        async def mock_delete(scope: str) -> None:
             return None
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
@@ -424,8 +423,8 @@ class TestNoPendingTasks:
         networks = [_network(i) for i in range(50)]
         before = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
 
-        async def mock_get(scope_id: str) -> DhcpScopePayload:
-            return _make_scope(scope_id)
+        async def mock_get(scope: str) -> DhcpScopePayload:
+            return _make_scope(scope)
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -473,9 +472,9 @@ class TestDeterministicResults:
         random.seed(7)
         delays = {n: random.uniform(0, 0.02) for n in networks}
 
-        async def mock_get(scope_id: str) -> DhcpScopePayload:
-            await asyncio.sleep(delays[scope_id])
-            return _make_scope(scope_id)
+        async def mock_get(scope: str) -> DhcpScopePayload:
+            await asyncio.sleep(delays[scope])
+            return _make_scope(scope)
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -489,17 +488,17 @@ class TestDeterministicResults:
             r = by_network[network]
             assert r.status_code == 200, f"{network} → {r.status_code}"
             body = r.json()
-            assert body["network"] == network
+            assert "scope" not in body, "identity lives in the URL, not the body"
             assert body["subnetMask"] == "255.255.255.0"
 
     async def test_repeated_get_observe_loop_stable(self):
         """Simulate Crossplane's 60s observe loop: 20 repeated GETs for same scope are identical."""
         network = "10.20.30.0"
-        scope = _make_scope(network)
+        payload = _make_scope(network)
         responses = []
 
-        async def mock_get(scope_id: str) -> DhcpScopePayload:
-            return scope
+        async def mock_get(scope: str) -> DhcpScopePayload:
+            return payload
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
         async with AsyncClient(transport=transport, base_url="http://testserver") as client:

@@ -159,19 +159,42 @@ def test_failover_invalid_server_role():
 # ---------------------------------------------------------------------------
 
 def test_scope_payload_valid(sample_scope_payload):
-    assert str(sample_scope_payload.network) == "10.20.30.0"
+    assert str(sample_scope_payload.scope) == "10.20.30.0"
     assert str(sample_scope_payload.gateway) == "10.20.30.1"
 
 
-def test_scope_gateway_can_be_omitted():
+def test_scope_gateway_omitted_derives_dot_254():
+    """Omitting the key entirely derives the subnet's .254 address."""
     payload = DhcpScopePayload(
         scopeName="Test",
-        network="10.20.30.0",
+        scope="10.20.30.0",
         subnetMask="255.255.255.0",
         startRange="10.20.30.100",
         endRange="10.20.30.200",
         leaseDurationDays=8,
         description="",
+        dnsServers=["10.0.0.53"],
+        dnsDomain="",
+        exclusions=[],
+    )
+    assert str(payload.gateway) == "10.20.30.254"
+
+
+def test_scope_gateway_explicit_none_stays_none():
+    """An explicit null is honoured as written — no DHCP option 3.
+
+    This is the state that must stay distinguishable from omission, otherwise a
+    scope deliberately configured without a router option could never be expressed.
+    """
+    payload = DhcpScopePayload(
+        scopeName="Test",
+        scope="10.20.30.0",
+        subnetMask="255.255.255.0",
+        startRange="10.20.30.100",
+        endRange="10.20.30.200",
+        leaseDurationDays=8,
+        description="",
+        gateway=None,
         dnsServers=["10.0.0.53"],
         dnsDomain="",
         exclusions=[],
@@ -182,7 +205,7 @@ def test_scope_gateway_can_be_omitted():
 def test_scope_gateway_empty_string_normalizes_to_none():
     payload = DhcpScopePayload(
         scopeName="Test",
-        network="10.20.30.0",
+        scope="10.20.30.0",
         subnetMask="255.255.255.0",
         startRange="10.20.30.100",
         endRange="10.20.30.200",
@@ -200,7 +223,7 @@ def test_scope_end_range_before_start_range():
     with pytest.raises(ValidationError) as exc_info:
         DhcpScopePayload(
             scopeName="Test",
-            network="10.20.30.0",
+            scope="10.20.30.0",
             subnetMask="255.255.255.0",
             startRange="10.20.30.200",
             endRange="10.20.30.100",  # before startRange
@@ -218,7 +241,7 @@ def test_scope_invalid_network_ip():
     with pytest.raises(ValidationError):
         DhcpScopePayload(
             scopeName="Test",
-            network="10.20.999.0",
+            scope="10.20.999.0",
             subnetMask="255.255.255.0",
             startRange="10.20.30.100",
             endRange="10.20.30.200",
@@ -235,7 +258,7 @@ def test_scope_invalid_gateway_ip():
     with pytest.raises(ValidationError):
         DhcpScopePayload(
             scopeName="Test",
-            network="10.20.30.0",
+            scope="10.20.30.0",
             subnetMask="255.255.255.0",
             startRange="10.20.30.100",
             endRange="10.20.30.200",
@@ -252,7 +275,7 @@ def test_scope_invalid_dns_server_ip():
     with pytest.raises(ValidationError):
         DhcpScopePayload(
             scopeName="Test",
-            network="10.20.30.0",
+            scope="10.20.30.0",
             subnetMask="255.255.255.0",
             startRange="10.20.30.100",
             endRange="10.20.30.200",
@@ -269,7 +292,7 @@ def test_scope_lease_duration_zero():
     with pytest.raises(ValidationError):
         DhcpScopePayload(
             scopeName="Test",
-            network="10.20.30.0",
+            scope="10.20.30.0",
             subnetMask="255.255.255.0",
             startRange="10.20.30.100",
             endRange="10.20.30.200",
@@ -286,7 +309,7 @@ def test_scope_lease_duration_too_high():
     with pytest.raises(ValidationError):
         DhcpScopePayload(
             scopeName="Test",
-            network="10.20.30.0",
+            scope="10.20.30.0",
             subnetMask="255.255.255.0",
             startRange="10.20.30.100",
             endRange="10.20.30.200",
@@ -303,7 +326,7 @@ def test_scope_empty_name_invalid():
     with pytest.raises(ValidationError):
         DhcpScopePayload(
             scopeName="",
-            network="10.20.30.0",
+            scope="10.20.30.0",
             subnetMask="255.255.255.0",
             startRange="10.20.30.100",
             endRange="10.20.30.200",
@@ -319,7 +342,7 @@ def test_scope_empty_name_invalid():
 def test_scope_json_serialization_uses_strings(sample_scope_payload):
     """IPv4Address fields must serialize as plain strings in JSON output."""
     data = sample_scope_payload.model_dump(mode="json")
-    assert isinstance(data["network"], str)
+    assert isinstance(data["scope"], str)
     assert isinstance(data["gateway"], str)
     assert isinstance(data["subnetMask"], str)
     assert all(isinstance(ip, str) for ip in data["dnsServers"])
@@ -334,7 +357,7 @@ def _minimal_scope(**overrides):
     """Minimal valid DhcpScopePayload for subnet tests."""
     base = dict(
         scopeName="Test",
-        network="10.20.30.0",
+        scope="10.20.30.0",
         subnetMask="255.255.255.0",
         startRange="10.20.30.100",
         endRange="10.20.30.200",
@@ -357,7 +380,7 @@ def test_subnet_valid_config_passes():
 def test_subnet_network_with_host_bits_invalid():
     """network must be a network address — host bits must be zero."""
     with pytest.raises(ValidationError) as exc_info:
-        DhcpScopePayload(**_minimal_scope(network="10.20.30.5"))
+        DhcpScopePayload(**_minimal_scope(scope="10.20.30.5"))
     assert "valid subnet" in str(exc_info.value).lower()
 
 
@@ -403,6 +426,94 @@ def test_subnet_exclusion_end_outside_subnet():
             exclusions=[{"startAddress": "10.20.30.1", "endAddress": "10.20.31.10"}],
         ))
     assert "exclusions[0].endAddress" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Derived defaults for subnetMask and gateway
+# ---------------------------------------------------------------------------
+
+def _without(*keys, **overrides):
+    """_minimal_scope with the named keys removed, to model an omitted body key."""
+    scope = _minimal_scope(**overrides)
+    for key in keys:
+        scope.pop(key, None)
+    return scope
+
+
+@pytest.mark.parametrize("mask", [None, ""], ids=["null", "empty"])
+def test_subnet_mask_empty_forms_default(mask):
+    """subnetMask has no 'unset' meaning, so null and "" collapse to the default."""
+    payload = DhcpScopePayload(**_minimal_scope(subnetMask=mask))
+    assert str(payload.subnetMask) == "255.255.255.0"
+
+
+def test_subnet_mask_omitted_defaults():
+    payload = DhcpScopePayload(**_without("subnetMask"))
+    assert str(payload.subnetMask) == "255.255.255.0"
+
+
+def test_both_omitted_resolve_together():
+    payload = DhcpScopePayload(**_without("subnetMask", "gateway"))
+    assert str(payload.subnetMask) == "255.255.255.0"
+    assert str(payload.gateway) == "10.20.30.254"
+
+
+def test_gateway_derived_from_scope_not_hardcoded():
+    """The default tracks the scope address rather than a fixed prefix."""
+    payload = DhcpScopePayload(
+        **_without("gateway", scope="192.168.7.0", startRange="192.168.7.100",
+                   endRange="192.168.7.200")
+    )
+    assert str(payload.gateway) == "192.168.7.254"
+
+
+def test_non_24_mask_without_gateway_is_mismatch():
+    """No .254 convention exists off a /24 — reject rather than guess."""
+    with pytest.raises(ValidationError) as exc_info:
+        DhcpScopePayload(**_without(
+            "gateway", scope="10.20.0.0", subnetMask="255.255.0.0",
+            startRange="10.20.30.100", endRange="10.20.30.200",
+        ))
+    message = str(exc_info.value)
+    assert "gateway is required when subnetMask is 255.255.0.0" in message
+
+
+def test_non_24_mask_with_explicit_gateway_is_valid():
+    """The mismatch guard is scoped to the derive path, not to non-/24 masks generally."""
+    payload = DhcpScopePayload(**_minimal_scope(
+        scope="10.20.0.0", subnetMask="255.255.0.0", gateway="10.20.0.1",
+        startRange="10.20.30.100", endRange="10.20.30.200",
+    ))
+    assert str(payload.gateway) == "10.20.0.1"
+
+
+def test_non_24_mask_with_explicit_null_gateway_is_valid():
+    """Explicitly asking for no gateway is not a mismatch — nothing needs deriving."""
+    payload = DhcpScopePayload(**_minimal_scope(
+        scope="10.20.0.0", subnetMask="255.255.0.0", gateway=None,
+        startRange="10.20.30.100", endRange="10.20.30.200",
+    ))
+    assert payload.gateway is None
+
+
+def test_derived_gateway_still_subject_to_distribution_range_guard():
+    """A derived .254 gets the same safety checks as one written by hand.
+
+    Without this, a range ending at .254 would silently hand the router's address
+    out on a lease.
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        DhcpScopePayload(**_without("gateway", endRange="10.20.30.254"))
+    assert "not covered by any exclusion" in str(exc_info.value)
+
+
+def test_derived_gateway_accepted_when_excluded():
+    payload = DhcpScopePayload(**_without(
+        "gateway",
+        endRange="10.20.30.254",
+        exclusions=[{"startAddress": "10.20.30.250", "endAddress": "10.20.30.254"}],
+    ))
+    assert str(payload.gateway) == "10.20.30.254"
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +649,7 @@ def test_loadbalance_valid_full():
 def test_description_none_normalizes_to_empty_string():
     """description=None must normalize to '' — prevents Crossplane drift."""
     scope = DhcpScopePayload(
-        scopeName="Test", network="10.0.0.0", subnetMask="255.255.255.0",
+        scopeName="Test", scope="10.0.0.0", subnetMask="255.255.255.0",
         startRange="10.0.0.2", endRange="10.0.0.10", leaseDurationDays=8,
         description=None,  # explicit null
         gateway="10.0.0.1", dnsServers=["10.0.0.53"], dnsDomain="", exclusions=[],
@@ -549,7 +660,7 @@ def test_description_none_normalizes_to_empty_string():
 def test_description_empty_string_accepted():
     """description='' must be accepted and preserved."""
     scope = DhcpScopePayload(
-        scopeName="Test", network="10.0.0.0", subnetMask="255.255.255.0",
+        scopeName="Test", scope="10.0.0.0", subnetMask="255.255.255.0",
         startRange="10.0.0.2", endRange="10.0.0.10", leaseDurationDays=8,
         description="",
         gateway="10.0.0.1", dnsServers=["10.0.0.53"], dnsDomain="", exclusions=[],
@@ -655,7 +766,7 @@ def test_relationship_name_whitespace_only_rejected():
 def test_dns_domain_none_normalizes_to_empty_string():
     """dnsDomain=None must normalize to '' — consistent with description field."""
     scope = DhcpScopePayload(
-        scopeName="Test", network="10.0.0.0", subnetMask="255.255.255.0",
+        scopeName="Test", scope="10.0.0.0", subnetMask="255.255.255.0",
         startRange="10.0.0.2", endRange="10.0.0.10", leaseDurationDays=8,
         description="", gateway="10.0.0.1", dnsServers=["10.0.0.53"], dnsDomain=None, exclusions=[],
     )
@@ -743,3 +854,100 @@ def test_gateway_in_range_excluded_by_adjacent_range():
         ],
     ))
     assert str(scope.gateway) == "10.20.30.105"
+
+
+# ---------------------------------------------------------------------------
+# PXE boot options (DHCP 66/67) — optional, but both-or-nothing
+#
+# Three legal states and no fourth. Mirrored against the CI validator's duplicate
+# model in tests/test_validate_dhcp_values.py so the two cannot drift apart.
+# ---------------------------------------------------------------------------
+
+def test_pxe_omitted_entirely_is_valid():
+    """The ordinary no-PXE scope: both fields default to "" and nothing is written."""
+    scope = DhcpScopePayload(**_minimal_scope())
+    assert scope.nextServer == ""
+    assert scope.bootFile == ""
+
+
+def test_pxe_pair_set_together_is_valid():
+    scope = DhcpScopePayload(**_minimal_scope(
+        nextServer="boot.lab.local", bootFile="snponly.efi",
+    ))
+    assert scope.nextServer == "boot.lab.local"
+    assert scope.bootFile == "snponly.efi"
+
+
+def test_next_server_alone_rejected():
+    with pytest.raises(ValidationError) as exc_info:
+        DhcpScopePayload(**_minimal_scope(nextServer="boot.lab.local"))
+    assert "bootFile is required when nextServer is set" in str(exc_info.value)
+
+
+def test_boot_file_alone_rejected():
+    with pytest.raises(ValidationError) as exc_info:
+        DhcpScopePayload(**_minimal_scope(bootFile="snponly.efi"))
+    assert "nextServer is required when bootFile is set" in str(exc_info.value)
+
+
+def test_pxe_none_normalizes_to_empty_string():
+    """null in a values file must land on "" — an explicit null is still "no PXE"."""
+    scope = DhcpScopePayload(**_minimal_scope(nextServer=None, bootFile=None))
+    assert scope.nextServer == ""
+    assert scope.bootFile == ""
+
+
+def test_next_server_accepts_a_bare_ip():
+    """Option 66 is a string field, so an IP is just as valid as a host name."""
+    scope = DhcpScopePayload(**_minimal_scope(
+        nextServer="10.50.1.20", bootFile="snponly.efi",
+    ))
+    assert scope.nextServer == "10.50.1.20"
+
+
+def test_boot_file_accepts_a_url():
+    """iPXE HTTP chainloading puts a full URL in option 67 — must not be rejected."""
+    scope = DhcpScopePayload(**_minimal_scope(
+        nextServer="boot.lab.local", bootFile="http://boot.lab.local/ipxe.efi",
+    ))
+    assert scope.bootFile == "http://boot.lab.local/ipxe.efi"
+
+
+def test_boot_file_accepts_a_windows_style_path():
+    scope = DhcpScopePayload(**_minimal_scope(
+        nextServer="boot.lab.local", bootFile="boot\\x64\\wdsmgfw.efi",
+    ))
+    assert scope.bootFile == "boot\\x64\\wdsmgfw.efi"
+
+
+@pytest.mark.parametrize("bad", ["boot .efi", " boot.efi", "boot.efi ", "boot\tefi"])
+def test_boot_option_rejects_whitespace(bad):
+    """Whitespace is illegal in an option 66/67 string and usually means a typo."""
+    with pytest.raises(ValidationError):
+        DhcpScopePayload(**_minimal_scope(nextServer="boot.lab.local", bootFile=bad))
+
+
+def test_boot_option_rejects_control_characters():
+    with pytest.raises(ValidationError):
+        DhcpScopePayload(**_minimal_scope(
+            nextServer="boot.lab.local", bootFile="boot\x00.efi",
+        ))
+
+
+def test_boot_option_rejects_value_over_255_bytes():
+    """A DHCP option value is at most 255 octets."""
+    with pytest.raises(ValidationError):
+        DhcpScopePayload(**_minimal_scope(
+            nextServer="boot.lab.local", bootFile="a" * 256,
+        ))
+
+
+def test_pxe_fields_rejected_in_body_are_not_special():
+    """Both fields are ordinary body state — they round-trip through body()."""
+    scope = DhcpScopePayload(**_minimal_scope(
+        nextServer="boot.lab.local", bootFile="snponly.efi",
+    ))
+    body = scope.body().model_dump(mode="json")
+    assert body["nextServer"] == "boot.lab.local"
+    assert body["bootFile"] == "snponly.efi"
+    assert "scope" not in body

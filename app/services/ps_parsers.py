@@ -3,7 +3,7 @@ from ipaddress import AddressValueError, IPv4Address
 import logging
 from typing import Any
 
-from app.errors import DhcpConflictError, InvalidScopeIdError
+from app.errors import DhcpConflictError, InvalidScopeError
 from app.models import DhcpExclusion, DhcpFailover, DhcpScopePayload
 from app.services.ps_executor import run_ps
 from app.utils.decorators import log_call
@@ -99,12 +99,12 @@ def _parse_timespan_as_days(val: object, default: int = 8) -> int:
     return parse_timespan_days(str(val))
 
 
-def _validated_scope_id(scope_id: str) -> str:
-    scope_text = str(scope_id)
+def _validated_scope(scope: str) -> str:
+    scope_text = str(scope)
     try:
         return str(IPv4Address(scope_text))
     except (AddressValueError, ValueError):
-        raise InvalidScopeIdError(scope_text)
+        raise InvalidScopeError(scope_text)
 
 
 def build_get_all_scopes_script() -> str:
@@ -117,6 +117,10 @@ def build_get_all_scopes_script() -> str:
     Failover is resolved by fetching all relationships once before the loop and
     matching by ScopeId inside Python/PowerShell — this avoids treating a scope
     that is not in any failover relationship as a PowerShell error.
+
+    A relationship holding no scopes has a null ScopeId, and `@($null)` is a
+    one-element array containing $null, not an empty one — hence the
+    Where-Object guard before .ToString().
 
     PowerShell collapses a single-element array to a plain object in ConvertTo-Json.
     normalize_list() on the parsed result handles both cases transparently.
@@ -152,7 +156,7 @@ foreach ($s in $allScopes) {
 
     $failover = $null
     foreach ($fo in $allFailovers) {
-        $foScopes = @($fo.ScopeId) | ForEach-Object { $_.ToString() }
+        $foScopes = @($fo.ScopeId) | Where-Object { $null -ne $_ } | ForEach-Object { $_.ToString() }
         if ($foScopes -contains $sid) {
             $failover = $fo
             break
@@ -171,14 +175,18 @@ $result | ConvertTo-Json -Depth 10 -Compress
 """.strip()
 
 
-def build_get_scope_state_script(scope_id: str) -> str:
+def build_get_scope_state_script(scope: str) -> str:
     """Build a single PowerShell script that emits all scope state as JSON.
 
     Failover is resolved via an aggregate Get-DhcpServerv4Failover call (no -ScopeId)
     so that a scope not participating in any failover relationship is never treated as
     a PowerShell error — the filter simply yields $null, which normalizes to failover: null.
+
+    A relationship holding no scopes has a null ScopeId, and `@($null)` is a one-element
+    array containing $null, not an empty one — hence the Where-Object guard before
+    .ToString().
     """
-    scope_literal = ps_single_quote(_validated_scope_id(scope_id))
+    scope_literal = ps_single_quote(_validated_scope(scope))
     return (
         f"$ScopeId = {scope_literal}\n\n"
         + _PS_ABSENCE_HELPERS
@@ -209,7 +217,7 @@ try {{
 $allFailovers = @(Get-DhcpServerv4Failover -ErrorAction Stop)
 $failover = $null
 foreach ($fo in $allFailovers) {{
-    $foScopes = @($fo.ScopeId) | ForEach-Object {{ $_.ToString() }}
+    $foScopes = @($fo.ScopeId) | Where-Object {{ $null -ne $_ }} | ForEach-Object {{ $_.ToString() }}
     if ($foScopes -contains $ScopeId) {{
         $failover = $fo
         break
@@ -292,9 +300,9 @@ def normalize_get_scope_state(raw: Any) -> dict[str, Any]:
     }
 
 
-def build_payload_from_scope_state(scope_id: str, state: dict[str, Any]) -> DhcpScopePayload:
-    scope_id = _validated_scope_id(scope_id)
-    scope = state["scope"]
+def build_payload_from_scope_state(scope: str, state: dict[str, Any]) -> DhcpScopePayload:
+    scope = _validated_scope(scope)
+    scope_raw = state["scope"]
     options = state["options"]
     exclusions_list = state["exclusions"]
 
@@ -306,11 +314,11 @@ def build_payload_from_scope_state(scope_id: str, state: dict[str, Any]) -> Dhcp
             failover_obj = parse_failover(failover_entries[0])
 
     # Parse lease duration: handles string "8.00:00:00", JSON TimeSpan dict, or int
-    lease_days = _parse_timespan_as_days(scope.get("LeaseDuration"), default=8)
+    lease_days = _parse_timespan_as_days(scope_raw.get("LeaseDuration"), default=8)
     dns_servers = extract_option_list(options, 6)
     if not dns_servers:
         raise DhcpConflictError(
-            f"Observed DHCP scope {scope_id} is missing required DNS servers"
+            f"Observed DHCP scope {scope} is missing required DNS servers"
         )
 
     # Build sorted exclusions; skip any non-dict entries (e.g. null from PS)
@@ -328,35 +336,40 @@ def build_payload_from_scope_state(scope_id: str, state: dict[str, Any]) -> Dhcp
 
     raw_gateway = extract_optional_option(options, 3)
     return DhcpScopePayload(
-        scopeName=str(scope.get("Name") or ""),
-        network=IPv4Address(scope_id),
-        subnetMask=IPv4Address(_extract_ip_str(scope.get("SubnetMask", ""))),
-        startRange=IPv4Address(_extract_ip_str(scope.get("StartRange", ""))),
-        endRange=IPv4Address(_extract_ip_str(scope.get("EndRange", ""))),
+        scope=IPv4Address(scope),
+        scopeName=str(scope_raw.get("Name") or ""),
+        subnetMask=IPv4Address(_extract_ip_str(scope_raw.get("SubnetMask", ""))),
+        startRange=IPv4Address(_extract_ip_str(scope_raw.get("StartRange", ""))),
+        endRange=IPv4Address(_extract_ip_str(scope_raw.get("EndRange", ""))),
         leaseDurationDays=lease_days,
-        description=str(scope.get("Description") or ""),
+        description=str(scope_raw.get("Description") or ""),
         gateway=IPv4Address(raw_gateway) if raw_gateway else None,
         dnsServers=[IPv4Address(s) for s in dns_servers],
         dnsDomain=extract_option(options, 15),
+        # Options 66/67 are optional: extract_option returns "" when the server has
+        # no such option value, which is exactly the model's "no PXE" default, so an
+        # absent pair round-trips to the same "" the desired body carries.
+        nextServer=extract_option(options, 66),
+        bootFile=extract_option(options, 67),
         exclusions=exclusions,
         failover=failover_obj,
     )
 
 
 @log_call
-async def assemble_scope_state(scope_id: str) -> DhcpScopePayload:
+async def assemble_scope_state(scope: str) -> DhcpScopePayload:
     """Query Windows DHCP once and assemble the canonical DhcpScopePayload.
 
     This is the single source of truth for GET responses. The output MUST be
     byte-for-byte comparable to the PUT/POST body Crossplane sends.
     """
-    script = build_get_scope_state_script(scope_id)
+    script = build_get_scope_state_script(scope)
     raw = await run_ps(
         script,
         append_error_action=False,
         append_convert_to_json=False,
-        scope_id=scope_id,
+        scope=scope,
         operation="get_scope_state",
     )
     state = normalize_get_scope_state(raw)
-    return build_payload_from_scope_state(scope_id, state)
+    return build_payload_from_scope_state(scope, state)

@@ -10,15 +10,19 @@ If these two JSONs are not identical, Crossplane issues a PUT every 60 seconds f
 Each PUT triggers real PowerShell commands on the DHCP server.
 
 These tests trace every field from mock PowerShell output → parse → serialize → JSON
-and verify it matches exactly what the Helm template would render as the PUT body.
+and verify it matches the canonical payload shape (CLAUDE.md section 5) exactly.
+
+That shape is the interface between this repo and the chart that renders the CR.
+The other side of it — that the template renders the same shape — is asserted in
+team-redbull/helm-charts-hostedclusters-setup, tests/test_render_parity.py. Neither
+repo imports the other: each pins the documented shape independently, so changing it
+means changing it deliberately in both places.
 """
 import json
 import asyncio
 from unittest.mock import patch
-import pytest
-from app.models import DhcpExclusion, DhcpFailover, DhcpScopePayload
-from app.services.ps_parsers import assemble_scope_state, parse_failover
-from app.utils.ip_utils import parse_timespan_days, parse_timespan_minutes
+from app.models import DhcpScopePayload
+from app.services.ps_parsers import assemble_scope_state
 
 
 # ---------------------------------------------------------------------------
@@ -26,10 +30,13 @@ from app.utils.ip_utils import parse_timespan_days, parse_timespan_minutes
 # ---------------------------------------------------------------------------
 
 def _scope_json(**overrides) -> dict:
-    """The canonical desired-state dict — what Helm/Crossplane sends as PUT body."""
+    """The canonical desired-state dict — what Helm/Crossplane sends as PUT body.
+
+    Carries no scope address: the identity is in the URL, so the PUT body and the
+    GET response are both pure state. That is what makes them directly comparable.
+    """
     base = {
         "scopeName": "Cluster-A",
-        "network": "10.20.30.0",
         "subnetMask": "255.255.255.0",
         "startRange": "10.20.30.100",
         "endRange": "10.20.30.200",
@@ -38,6 +45,8 @@ def _scope_json(**overrides) -> dict:
         "gateway": "10.20.30.1",
         "dnsServers": ["10.50.1.5", "10.50.1.6"],
         "dnsDomain": "lab.local",
+        "nextServer": "",
+        "bootFile": "",
         "exclusions": [
             {"startAddress": "10.20.30.1", "endAddress": "10.20.30.10"},
             {"startAddress": "10.20.30.241", "endAddress": "10.20.30.254"},
@@ -104,7 +113,8 @@ def _assemble(scope_raw, options_raw, exclusions_raw, failover_raw=None) -> dict
     }
     with patch("app.services.ps_parsers.run_ps", return_value=state):
         result = asyncio.run(assemble_scope_state("10.20.30.0"))
-    return result.model_dump(mode="json")
+    # .body() is exactly what the single-scope endpoints return
+    return result.body().model_dump(mode="json")
 
 
 # ---------------------------------------------------------------------------
@@ -124,11 +134,22 @@ class TestScalarFieldParity:
         got = _assemble(_ps_scope(Name="My Production Scope"), _ps_options(), _ps_exclusions())
         assert got["scopeName"] == "My Production Scope"
 
-    def test_network_comes_from_path_not_ps(self):
-        """network is always the scope_id from the URL path, never from PS ScopeId field."""
-        # Even if PS returns a different ScopeId, we use the path scope_id
-        got = _assemble(_ps_scope(ScopeId="10.20.30.1"), _ps_options(), _ps_exclusions())
-        assert got["network"] == "10.20.30.0"  # path value, not PS value
+    def test_scope_comes_from_path_not_ps(self):
+        """The scope identity is always the address from the URL path, never PS ScopeId.
+
+        It is absent from the wire body entirely, so check the domain model, which
+        is where the identity is carried internally.
+        """
+        state = {
+            "scope": _ps_scope(ScopeId="10.20.30.1"),
+            "options": _ps_options(),
+            "exclusions": _ps_exclusions(),
+            "failover": None,
+        }
+        with patch("app.services.ps_parsers.run_ps", return_value=state):
+            result = asyncio.run(assemble_scope_state("10.20.30.0"))
+        assert str(result.scope) == "10.20.30.0"  # path value, not PS value
+        assert "scope" not in result.body().model_dump(mode="json")
 
     def test_subnet_mask(self):
         got = _assemble(_ps_scope(), _ps_options(), _ps_exclusions())
@@ -453,3 +474,36 @@ class TestFullPayloadParity:
         desired = _scope_json(exclusions=[], failover=None)
         got = _assemble(_ps_scope(), _ps_options(), None)
         assert got["exclusions"] == desired["exclusions"]
+
+
+# ---------------------------------------------------------------------------
+# Derived defaults — the end-to-end proof that omitting keys cannot loop
+# ---------------------------------------------------------------------------
+
+class TestDerivedDefaultParity:
+    """subnetMask and gateway may be omitted from a values file and derived.
+
+    Deriving them in only one place would be a reconciliation bug: GET always
+    reports the concrete values the DHCP server holds, so if the rendered PUT body
+    said null (or omitted the key), Crossplane would see a permanent diff and PUT
+    every 60 seconds forever.
+
+    The other half of that check — that the *chart* derives the same values — moved
+    to team-redbull/helm-charts-hostedclusters-setup along with the templates, where
+    tests/test_render_parity.py asserts the rendered body equals this same payload
+    shape. Neither repo imports the other; both pin the shape documented in
+    CLAUDE.md section 5. What stays here is the API's own half of the rule.
+    """
+
+    def test_api_derives_the_subnet_254_when_gateway_is_omitted(self):
+        """The API's half of the rule the chart must render identically."""
+        payload = DhcpScopePayload(
+            scope="10.20.30.0",
+            scopeName="Cluster-A",
+            startRange="10.20.30.100",
+            endRange="10.20.30.200",
+            leaseDurationDays=8,
+            dnsServers=["10.50.1.5"],
+        )
+        assert str(payload.subnetMask) == "255.255.255.0"
+        assert str(payload.gateway) == "10.20.30.254"
