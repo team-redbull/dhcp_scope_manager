@@ -16,7 +16,8 @@ sites/configValues.yaml                                       # global defaults
       → sites/{site}/mces/{mce}/hostedClusters/{cluster}.yaml # cluster-specific values
 ```
 
-The chart's own `helm/values.yaml` sits underneath all of them as an implicit base. It carries
+The chart's own `values.yaml` (in `team-redbull/helm-charts-hostedclusters-setup`) sits
+underneath all of them as an implicit base. It carries
 `dhcp_api` and `crossplane` — which the values repo never sets, one API per cluster being a
 platform constant — and ships `dhcp_values` commented out, so nothing here is inherited by
 accident.
@@ -134,7 +135,7 @@ Crossplane checks the GET response against the rendered body: GET reports the co
 address the DHCP server holds, so a body that said `null` would diff on every cycle and
 trigger a PUT every 60 seconds forever.
 
-Note that `helm/values.yaml` is the base of every Helm merge, so a key set there cannot be
+Note that the chart's `values.yaml` is the base of every Helm merge, so a key set there cannot be
 unset by a site or cluster file. Both keys ship absent from it for that reason.
 
 ---

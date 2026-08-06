@@ -480,7 +480,7 @@ def _nested_present(data: dict, *keys: str) -> bool:
 
 
 # Only dhcp_values lives in the values repo. dhcp_api and crossplane are chart-owned
-# (helm/values.yaml) — a platform-wide constant, not per-cluster config — so the merge
+# (the chart's values.yaml) — a platform-wide constant, not per-cluster config — so the merge
 # chain this script walks never contains them and must not demand them.
 _REQUIRED_PATHS: list[tuple[str, ...]] = [
     ("dhcp_values", "scopeName"),

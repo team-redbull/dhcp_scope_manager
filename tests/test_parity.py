@@ -10,20 +10,19 @@ If these two JSONs are not identical, Crossplane issues a PUT every 60 seconds f
 Each PUT triggers real PowerShell commands on the DHCP server.
 
 These tests trace every field from mock PowerShell output → parse → serialize → JSON
-and verify it matches exactly what the Helm template would render as the PUT body.
+and verify it matches the canonical payload shape (CLAUDE.md section 5) exactly.
+
+That shape is the interface between this repo and the chart that renders the CR.
+The other side of it — that the template renders the same shape — is asserted in
+team-redbull/helm-charts-hostedclusters-setup, tests/test_render_parity.py. Neither
+repo imports the other: each pins the documented shape independently, so changing it
+means changing it deliberately in both places.
 """
 import json
 import asyncio
-import shutil
-import subprocess
-import tempfile
-import textwrap
 from unittest.mock import patch
-import pytest
-import yaml
-from app.models import DhcpExclusion, DhcpFailover, DhcpScopePayload
-from app.services.ps_parsers import assemble_scope_state, parse_failover
-from app.utils.ip_utils import parse_timespan_days, parse_timespan_minutes
+from app.models import DhcpScopePayload
+from app.services.ps_parsers import assemble_scope_state
 
 
 # ---------------------------------------------------------------------------
@@ -487,90 +486,17 @@ class TestDerivedDefaultParity:
     Deriving them in only one place would be a reconciliation bug: GET always
     reports the concrete values the DHCP server holds, so if the rendered PUT body
     said null (or omitted the key), Crossplane would see a permanent diff and PUT
-    every 60 seconds forever. These tests render the *actual* chart and compare it
-    to the *actual* GET assembly — the two independent implementations of the rule.
+    every 60 seconds forever.
+
+    The other half of that check — that the *chart* derives the same values — moved
+    to team-redbull/helm-charts-hostedclusters-setup along with the templates, where
+    tests/test_render_parity.py asserts the rendered body equals this same payload
+    shape. Neither repo imports the other; both pin the shape documented in
+    CLAUDE.md section 5. What stays here is the API's own half of the rule.
     """
 
-    _VALUES = textwrap.dedent("""\
-        dhcp_api:
-          url: https://dhcp-api.lab.local
-          tokenSecretRef: null
-        dhcp_values:
-          scopeName: "Cluster-A"
-          network: "10.20.30.0"
-          startRange: "10.20.30.100"
-          endRange: "10.20.30.200"
-          leaseDurationDays: 8
-          description: ""
-          dns:
-            servers:
-              - "10.50.1.5"
-              - "10.50.1.6"
-            domain: "lab.local"
-          exclusions:
-            - startAddress: "10.20.30.1"
-              endAddress: "10.20.30.10"
-            - startAddress: "10.20.30.241"
-              endAddress: "10.20.30.254"
-          failover: null
-    """)
-
-    @staticmethod
-    def _rendered_body(values: str) -> dict:
-        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as fh:
-            fh.write(values)
-            path = fh.name
-        result = subprocess.run(
-            ["helm", "template", "parity", "helm", "-f", path],
-            capture_output=True, text=True,
-        )
-        assert result.returncode == 0, result.stderr
-        cr = next(iter(yaml.safe_load_all(result.stdout)))
-        # payload.body is a JSON string (provider-http types it as one), so the
-        # comparison against the GET assembly happens on the parsed object.
-        return json.loads(cr["spec"]["forProvider"]["payload"]["body"])
-
-    @pytest.mark.skipif(shutil.which("helm") is None, reason="helm CLI not available")
-    def test_rendered_defaults_match_get_response(self):
-        """The whole point: rendered body == GET response, byte for byte."""
-        desired = self._rendered_body(self._VALUES)
-        # What the DHCP server holds after the API applied that body.
-        got = _assemble(
-            _ps_scope(Name="Cluster-A", SubnetMask="255.255.255.0"),
-            _ps_options(options=[
-                {"OptionId": 3, "Value": ["10.20.30.254"]},
-                {"OptionId": 6, "Value": ["10.50.1.5", "10.50.1.6"]},
-                {"OptionId": 15, "Value": ["lab.local"]},
-            ]),
-            _ps_exclusions(),
-        )
-        assert got == desired, (
-            f"GET/PUT mismatch on derived defaults!\n"
-            f"PUT body: {json.dumps(desired, indent=2)}\n"
-            f"GET resp: {json.dumps(got, indent=2)}"
-        )
-
-    @pytest.mark.skipif(shutil.which("helm") is None, reason="helm CLI not available")
-    def test_rendered_empty_gateway_matches_scope_without_option_3(self):
-        """The no-gateway path must stay loop-free too.
-
-        gateway: "" renders null, and a scope with no DHCP option 3 reads back as
-        null — so the pair still agrees.
-        """
-        desired = self._rendered_body(self._VALUES + '  gateway: ""\n')
-        got = _assemble(
-            _ps_scope(Name="Cluster-A"),
-            _ps_options(options=[
-                {"OptionId": 6, "Value": ["10.50.1.5", "10.50.1.6"]},
-                {"OptionId": 15, "Value": ["lab.local"]},
-            ]),
-            _ps_exclusions(),
-        )
-        assert desired["gateway"] is None
-        assert got == desired
-
-    def test_api_derives_the_same_address_helm_does(self):
-        """Both implementations of the .254 rule agree, without needing helm."""
+    def test_api_derives_the_subnet_254_when_gateway_is_omitted(self):
+        """The API's half of the rule the chart must render identically."""
         payload = DhcpScopePayload(
             scope="10.20.30.0",
             scopeName="Cluster-A",

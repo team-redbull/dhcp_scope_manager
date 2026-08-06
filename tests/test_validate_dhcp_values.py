@@ -85,7 +85,7 @@ def _minimal_cluster_yaml() -> str:
         "    domain: lab.local\n"
         "  exclusions: []\n"
         "  failover: null\n"
-        # No dhcp_api / crossplane keys: those are chart-owned (helm/values.yaml),
+        # No dhcp_api / crossplane keys: those are chart-owned (the chart's values.yaml),
         # never part of the values repo this script walks.
     )
 
