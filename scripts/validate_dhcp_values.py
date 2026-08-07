@@ -520,6 +520,18 @@ def _validate_dhcp_content(cluster_path: Path, merged: dict) -> list[str]:
     # Pydantic scope validation
     dns = dv.get("dns") or {}
     pxe = dv.get("pxe") or {}
+
+    # relationshipName defaults to <scopeName>-failover, the same derivation the
+    # chart's dhcp.payload makes. Resolve it here too or a values file that omits
+    # the key renders fine and fails CI. Copied, not mutated in place: `merged` is
+    # reused by the exclusion checks below and by the caller's reporting.
+    # max_length=64 on _CiFailover is what rejects a derived name Windows would refuse.
+    failover = dv.get("failover")
+    if isinstance(failover, dict) and not failover.get("relationshipName"):
+        scope_name = dv.get("scopeName")
+        if isinstance(scope_name, str) and scope_name:
+            failover = {**failover, "relationshipName": f"{scope_name}-failover"}
+
     kwargs = {
         "scopeName":         dv.get("scopeName"),
         "network":           dv.get("network"),
@@ -527,12 +539,16 @@ def _validate_dhcp_content(cluster_path: Path, merged: dict) -> list[str]:
         "endRange":          dv.get("endRange"),
         "leaseDurationDays": dv.get("leaseDurationDays"),
         "description":       dv.get("description") or "",
-        "dnsServers":        dns.get("servers") or [],
+        # Globals then per-site additions, the same concatenation the chart does.
+        # A site file cannot append to dns.servers — Helm replaces lists on merge —
+        # so extraServers carries what the site adds. Validate the joined list, or
+        # CI would pass IPs that the render then sends to the DHCP server unchecked.
+        "dnsServers":        (dns.get("servers") or []) + (dns.get("extraServers") or []),
         "dnsDomain":         dns.get("domain") or "",
         "nextServer":        pxe.get("server") or "",
         "bootFile":          pxe.get("bootfile") or "",
         "exclusions":        dv.get("exclusions") or [],
-        "failover":          dv.get("failover"),
+        "failover":          failover,
     }
     # Pass these two only when the values file actually wrote them. Setting them
     # unconditionally would make every file look like an explicit null, and the

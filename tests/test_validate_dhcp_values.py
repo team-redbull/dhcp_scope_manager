@@ -748,6 +748,146 @@ class TestGlobalConfigInheritance:
         assert merged["dhcp_values"]["dns"]["servers"] == ["10.50.1.5", "10.50.1.6"]
 
 
+# ─── dns.extraServers ─────────────────────────────────────────────────────────
+
+class TestDnsExtraServers:
+    """Per-site DNS servers, added without displacing the globals.
+
+    Helm deep-merges mappings but replaces lists, so a site file writing
+    dns.servers wipes what configValues.yaml set rather than extending it.
+    extraServers is the append-able half, and the chart concatenates
+    servers + extraServers. This validator has to see the same joined list or
+    it silently stops checking the site's own resolvers.
+    """
+
+    _GLOBAL = (
+        "dhcp_values:\n"
+        "  leaseDurationDays: 8\n"
+        "  dns:\n"
+        "    servers:\n"
+        "      - 10.50.1.5\n"
+        "      - 10.50.1.6\n"
+        "    domain: global.lab.local\n"
+    )
+
+    _CLUSTER = (
+        "dhcp_values:\n"
+        "  scopeName: Sparse Scope\n"
+        "  network: 10.20.30.0\n"
+        "  startRange: 10.20.30.100\n"
+        "  endRange: 10.20.30.200\n"
+        "  failover: null\n"
+    )
+
+    def _errors(self, tmp_path, site_yaml: str) -> list[str]:
+        sites_dir = _build_tree(tmp_path, {
+            "_configValues": self._GLOBAL,
+            "telAviv": {"_values": site_yaml, "mces": {"prep-mce-tlv-a": {
+                "hostedClusters": {"prep-tlv-gpu.yaml": self._CLUSTER},
+            }}},
+        })
+        mce = sites_dir / "telAviv" / "mces" / "prep-mce-tlv-a"
+        cluster_file = mce / "hostedClusters" / "prep-tlv-gpu.yaml"
+        merged = vdv.merge_yaml_files(
+            sites_dir / "configValues.yaml",
+            sites_dir / "telAviv" / "values.yaml",
+            mce / "values.yaml",
+            cluster_file,
+        )
+        return vdv._validate_dhcp_content(cluster_file, merged)
+
+    def test_site_extra_servers_are_validated(self, tmp_path):
+        site = "dhcp_values:\n  dns:\n    extraServers:\n      - 10.50.1.7\n"
+        assert self._errors(tmp_path, site) == []
+
+    def test_a_bad_extra_server_is_caught(self, tmp_path):
+        """The point of joining the lists — an unchecked extraServers would let
+        this reach the DHCP server."""
+        site = "dhcp_values:\n  dns:\n    extraServers:\n      - not-an-ip\n"
+        errors = self._errors(tmp_path, site)
+        assert any("dnsServers" in e for e in errors), errors
+
+    def test_globals_alone_still_validate(self, tmp_path):
+        assert self._errors(tmp_path, "site: true\n") == []
+
+    def test_site_extra_servers_do_not_replace_the_globals(self, tmp_path):
+        """The merge keeps both halves — this is what dns.servers could not do."""
+        sites_dir = _build_tree(tmp_path, {
+            "_configValues": self._GLOBAL,
+            "telAviv": {
+                "_values": "dhcp_values:\n  dns:\n    extraServers:\n      - 10.50.1.7\n",
+                "mces": {"prep-mce-tlv-a": {
+                    "hostedClusters": {"prep-tlv-gpu.yaml": self._CLUSTER},
+                }},
+            },
+        })
+        mce = sites_dir / "telAviv" / "mces" / "prep-mce-tlv-a"
+        merged = vdv.merge_yaml_files(
+            sites_dir / "configValues.yaml",
+            sites_dir / "telAviv" / "values.yaml",
+            mce / "values.yaml",
+            mce / "hostedClusters" / "prep-tlv-gpu.yaml",
+        )
+        dns = merged["dhcp_values"]["dns"]
+        assert dns["servers"] == ["10.50.1.5", "10.50.1.6"]
+        assert dns["extraServers"] == ["10.50.1.7"]
+
+
+# ─── failover.relationshipName default ────────────────────────────────────────
+
+class TestFailoverRelationshipNameDefault:
+    """Omitting relationshipName derives <scopeName>-failover.
+
+    Mirrors the chart's dhcp.payload. Resolved in both places because each has to
+    work without the other: the render must carry a concrete name for the
+    containment check, and CI must not reject a values file the chart renders fine.
+    """
+
+    def _errors(self, tmp_path, cluster_yaml: str) -> list[str]:
+        cluster_file = tmp_path / "cluster.yaml"
+        cluster_file.write_text(cluster_yaml)
+        merged = vdv.load_yaml_file(cluster_file)[0]
+        return vdv._validate_dhcp_content(cluster_file, merged)
+
+    def _with_failover(self, body: str, scope_name: str = "Test Scope") -> str:
+        return (
+            _minimal_cluster_yaml()
+            .replace("  failover: null\n", "  failover:\n" + body)
+            .replace("  scopeName: Test Scope\n", f"  scopeName: {scope_name}\n")
+        )
+
+    _HOTSTANDBY = (
+        "    partnerServer: dhcp02.lab.local\n"
+        "    mode: HotStandby\n"
+        "    serverRole: Active\n"
+        "    reservePercent: 5\n"
+        "    maxClientLeadTimeMinutes: 60\n"
+    )
+
+    def test_omitted_relationship_name_is_accepted(self, tmp_path):
+        assert self._errors(tmp_path, self._with_failover(self._HOTSTANDBY)) == []
+
+    def test_explicit_relationship_name_is_still_accepted(self, tmp_path):
+        values = self._with_failover(
+            self._HOTSTANDBY + "    relationshipName: hand-picked\n"
+        )
+        assert self._errors(tmp_path, values) == []
+
+    def test_derived_name_over_64_chars_is_rejected(self, tmp_path):
+        """Windows caps the name at 64 — catch it here, not on the DHCP server."""
+        values = self._with_failover(self._HOTSTANDBY, scope_name="x" * 60)
+        errors = self._errors(tmp_path, values)
+        assert any("relationshipName" in e for e in errors), errors
+
+    def test_blank_relationship_name_still_derives(self, tmp_path):
+        """An empty string is an omission, not a name — same as the chart's
+        `default`, which treats "" as absent."""
+        values = self._with_failover(
+            self._HOTSTANDBY + '    relationshipName: ""\n'
+        )
+        assert self._errors(tmp_path, values) == []
+
+
 # ─── PXE boot options (DHCP 66/67) ────────────────────────────────────────────
 
 class TestPxeBootOptions:

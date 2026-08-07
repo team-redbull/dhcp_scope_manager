@@ -56,16 +56,33 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 - Per-architecture boot files (BIOS vs UEFI) need Windows DHCP *policies* matching option 93
   and are deliberately **not** modelled here
 
-**Derived defaults** (`subnetMask`, `gateway` — the only two)
+**Derived defaults** (`subnetMask`, `gateway`, `failover.relationshipName` — the only three)
 
-- Omitting the key derives it: `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`
+- Omitting the key derives it: `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`,
+  `relationshipName` → `<scopeName>-failover`
 - Writing `null` or `""` is honoured as written — for `gateway` that means no DHCP option 3
 - Any mask other than `255.255.255.0` with no explicit gateway is a hard error, not a guess
+- `relationshipName` only applies when a `failover` block is present; `failover: null` stays
+  `null`. Windows caps the name at 64 chars, so a `scopeName` long enough to overflow that
+  fails the render and CI rather than being truncated
 - Resolved identically in **three** places — the Pydantic model and the CI validator here,
   and the chart's `_dhcp-helpers.tpl` in `helm-charts-hostedclusters-setup`. The duplication
   is deliberate: GET reports the concrete value the DHCP server holds, so the rendered PUT
   body must carry it too or the drift check in §9 never converges. Change one, change all
   three — and one of the three is in another repo, so it will not fail your local tests.
+- `relationshipName` is the exception to "three places": the API model keeps it **required**,
+  because the API only ever receives a resolved value. Only the chart and the CI validator
+  derive it.
+
+**`dns.extraServers`** — the append-able half of `dns.servers`
+
+- Helm deep-merges mappings but *replaces* lists, so a site file writing `dns.servers`
+  discards the globals from `sites/configValues.yaml` instead of extending them
+- `extraServers` is a separate key so the merge keeps both; the chart concatenates
+  `servers` then `extraServers`, and that order is the wire order
+- It never reaches the API as a distinct field — the payload carries one flat `dnsServers`
+  list. The CI validator must validate the *joined* list or the site's own resolvers go
+  unchecked
 
 **Immutable on an existing scope** (`subnetMask`)
 

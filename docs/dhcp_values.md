@@ -88,6 +88,7 @@ dhcp_values:
 | `subnetMask`  | IPv4           | `255.255.255.0`     | Contiguous mask; combined with `network` must form a valid subnet. `null` and `""` also mean the default — there is no "no subnet mask". |
 | `gateway`     | IPv4 or `""`   | the subnet's `.254` | Default gateway/router option. **Omit it** to derive `.254`; write `""` or `null` for no option 3. When set, must be in the subnet. If inside `[startRange, endRange]`, must be covered by an exclusion. |
 | `dns.domain`  | string         | `""`                | Can be omitted or set to `""` if no domain suffix is needed.               |
+| `dns.extraServers` | list of IPv4 | `[]`             | Appended **after** `dns.servers` in the order written. For a site or MCE that adds its own resolver on top of the global ones (see below). |
 | `pxe.server`  | string         | `""`                | PXE boot server host name or IP (DHCP option 66). Required if `pxe.bootfile` is set (see section below). |
 | `pxe.bootfile`| string         | `""`                | PXE boot file path or URL (DHCP option 67). Required if `pxe.server` is set (see section below). |
 | `exclusions`  | list           | `[]`                | IP ranges excluded from distribution (see section below).                  |
@@ -95,9 +96,47 @@ dhcp_values:
 
 ---
 
-## Derived defaults: `subnetMask` and `gateway`
+## Adding DNS servers at a site or MCE: `dns.extraServers`
 
-These two are the only fields the stack fills in for you. **Omitting the key is what
+Helm deep-merges mappings but **replaces lists**. A site file that writes `dns.servers`
+therefore does not add to what `sites/configValues.yaml` set — it discards it:
+
+```yaml
+# sites/configValues.yaml
+dhcp_values:
+  dns:
+    servers: ["10.50.1.5", "10.50.1.6"]
+
+# sites/<site>/values.yaml — WRONG, this is the whole list now
+dhcp_values:
+  dns:
+    servers: ["10.50.1.7"]      # -> dnsServers: ["10.50.1.7"]
+```
+
+`dns.extraServers` is a separate key, so the merge keeps both halves:
+
+```yaml
+# sites/<site>/values.yaml — right
+dhcp_values:
+  dns:
+    extraServers: ["10.50.1.7"]  # -> dnsServers: ["10.50.1.5","10.50.1.6","10.50.1.7"]
+```
+
+Globals come first and keep the primary/secondary slots. The order is part of the
+contract, not cosmetic: option 6 is ordered, and Crossplane compares the list element by
+element, so reordering it makes every poll issue a PUT.
+
+Every layer's `extraServers` is subject to the same rule — an MCE file setting it
+replaces the site's, it does not stack. There is one appendable slot, not one per level.
+
+Mappings need none of this. A cluster file's `failover` block deep-merges onto the global
+`partnerServer` / `mode` / `serverRole` exactly as you would expect.
+
+---
+
+## Derived defaults: `subnetMask`, `gateway` and `failover.relationshipName`
+
+These three are the only fields the stack fills in for you. **Omitting the key is what
 triggers the default** — anything you actually write is honoured as written.
 
 ```yaml
@@ -137,6 +176,23 @@ trigger a PUT every 60 seconds forever.
 
 Note that the chart's `values.yaml` is the base of every Helm merge, so a key set there cannot be
 unset by a site or cluster file. Both keys ship absent from it for that reason.
+
+`failover.relationshipName` follows the same pattern, deriving `<scopeName>-failover`:
+
+```yaml
+dhcp_values:
+  scopeName: "cluster-a-workers"
+  failover:
+    partnerServer: "dhcp02.lab.local"
+    mode: "HotStandby"
+    serverRole: "Active"
+    maxClientLeadTimeMinutes: 60
+    # relationshipName -> cluster-a-workers-failover
+```
+
+Windows caps the name at 64 characters, so a `scopeName` long enough to overflow that is
+a hard error in both the render and CI rather than a silent truncation. It only applies
+when a `failover` block is present at all — `failover: null` stays `null`.
 
 ---
 
@@ -319,7 +375,7 @@ failover:
 | Field                      | Type    | Required for | Constraints                       | Description                                                   |
 | -------------------------- | ------- | ------------ | --------------------------------- | ------------------------------------------------------------- |
 | `partnerServer`            | string  | both modes   | 1–255 chars                       | FQDN of the partner DHCP server                               |
-| `relationshipName`         | string  | both modes   | 1–64 chars                        | Unique name for this failover relationship on the DHCP server |
+| `relationshipName`         | string  | optional     | 1–64 chars                        | Unique name for this failover relationship on the DHCP server. Omit it to derive `<scopeName>-failover`. |
 | `mode`                     | string  | both modes   | `"HotStandby"` or `"LoadBalance"` | Failover mode                                                 |
 | `serverRole`               | string  | HotStandby   | `"Active"` or `"Standby"`         | Role of THIS server in HotStandby mode                        |
 | `reservePercent`           | integer | —            | 0–100, default 0                  | % of IPs reserved for standby (HotStandby only)               |
