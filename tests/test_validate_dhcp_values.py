@@ -833,6 +833,116 @@ class TestDnsExtraServers:
         assert dns["extraServers"] == ["10.50.1.7"]
 
 
+# ─── scopeName default ────────────────────────────────────────────────────────
+
+class TestScopeNameDefault:
+    """Omitting scopeName derives it from the cluster file's own name.
+
+    One values file is one hosted cluster is one DHCP scope, so the file name already
+    carries the name. Mirrors the chart's dhcp.scopeName, which derives the same value
+    from the clusterName parameter hcAppset.yaml passes it — Helm never sees file names,
+    so the appset has to inject it. Resolved in both places because each has to work
+    without the other.
+    """
+
+    def _errors(self, tmp_path, cluster_yaml: str, stem: str = "cluster") -> list[str]:
+        cluster_file = tmp_path / f"{stem}.yaml"
+        cluster_file.write_text(cluster_yaml)
+        merged = vdv.load_yaml_file(cluster_file)[0]
+        return vdv._validate_dhcp_content(cluster_file, merged)
+
+    def _payload(self, tmp_path, cluster_yaml: str, stem: str = "cluster"):
+        """The scopeName that would reach the API, by capturing what the validator
+        hands to _CiScopePayload."""
+        cluster_file = tmp_path / f"{stem}.yaml"
+        cluster_file.write_text(cluster_yaml)
+        merged = vdv.load_yaml_file(cluster_file)[0]
+        captured = {}
+        real = vdv._CiScopePayload
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            return real(**kwargs)
+
+        vdv._CiScopePayload = spy
+        try:
+            vdv._validate_dhcp_content(cluster_file, merged)
+        finally:
+            vdv._CiScopePayload = real
+        return captured
+
+    _NO_SCOPE_NAME = _minimal_cluster_yaml().replace("  scopeName: Test Scope\n", "")
+
+    def test_omitted_scope_name_is_accepted(self, tmp_path):
+        assert self._errors(tmp_path, self._NO_SCOPE_NAME) == []
+
+    def test_omitted_scope_name_derives_the_file_stem(self, tmp_path):
+        captured = self._payload(tmp_path, self._NO_SCOPE_NAME, stem="prep-tlv-gpu")
+        assert captured["scopeName"] == "prep-tlv-gpu"
+
+    def test_explicit_scope_name_beats_the_file_name(self, tmp_path):
+        captured = self._payload(
+            tmp_path, _minimal_cluster_yaml(), stem="prep-tlv-gpu"
+        )
+        assert captured["scopeName"] == "Test Scope"
+
+    def test_blank_scope_name_still_derives(self, tmp_path):
+        """An empty string is an omission, not a name — same as the chart's
+        `default`, which treats "" as absent."""
+        values = _minimal_cluster_yaml().replace(
+            "  scopeName: Test Scope\n", '  scopeName: ""\n'
+        )
+        captured = self._payload(tmp_path, values, stem="prep-tlv-gpu")
+        assert captured["scopeName"] == "prep-tlv-gpu"
+
+    def test_scope_name_is_no_longer_a_required_field(self, tmp_path):
+        """It has a default now, so demanding it would reject the very files this
+        change exists to allow."""
+        errors = self._errors(tmp_path, self._NO_SCOPE_NAME)
+        assert not any("required field missing: dhcp_values.scopeName" in e for e in errors)
+        assert ("dhcp_values", "scopeName") not in vdv._REQUIRED_PATHS
+
+    def test_derived_name_feeds_the_failover_relationship_name(self, tmp_path):
+        values = self._NO_SCOPE_NAME.replace(
+            "  failover: null\n",
+            "  failover:\n"
+            "    partnerServer: dhcp02.lab.local\n"
+            "    mode: HotStandby\n"
+            "    serverRole: Active\n"
+            "    reservePercent: 5\n"
+            "    maxClientLeadTimeMinutes: 60\n",
+        )
+        captured = self._payload(tmp_path, values, stem="prep-tlv-gpu")
+        assert captured["failover"]["relationshipName"] == "prep-tlv-gpu-failover"
+
+    def test_derived_relationship_name_over_64_chars_names_the_file(self, tmp_path):
+        """Windows caps the relationship name at 64, so a derived one caps the file
+        stem at 55. The error has to say the name came from the file, or it points at
+        a key the values file never wrote.
+        """
+        values = self._NO_SCOPE_NAME.replace(
+            "  failover: null\n",
+            "  failover:\n"
+            "    partnerServer: dhcp02.lab.local\n"
+            "    mode: HotStandby\n"
+            "    serverRole: Active\n"
+            "    reservePercent: 5\n"
+            "    maxClientLeadTimeMinutes: 60\n",
+        )
+        errors = self._errors(tmp_path, values, stem="x" * 60)
+        assert any("relationshipName" in e for e in errors), errors
+        assert any("derived from the file name" in e for e in errors), errors
+
+    def test_explicit_scope_name_error_does_not_blame_the_file_name(self, tmp_path):
+        """The hint is only correct when the name was actually derived."""
+        values = _minimal_cluster_yaml().replace(
+            "  scopeName: Test Scope\n", f"  scopeName: {'x' * 300}\n"
+        )
+        errors = self._errors(tmp_path, values)
+        assert any("scopeName" in e for e in errors), errors
+        assert not any("derived from the file name" in e for e in errors), errors
+
+
 # ─── failover.relationshipName default ────────────────────────────────────────
 
 class TestFailoverRelationshipNameDefault:

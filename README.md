@@ -627,9 +627,19 @@ produces them lives elsewhere:
   order in [Canonical Payload Shape](#canonical-payload-shape) survives — piping a map
   through `toJson` would sort the keys and break it.
 - **Derived defaults are resolved at render time**, not passed through as omissions.
-  `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`. GET reports the
-  concrete address the DHCP server holds, so a body that said `null` would diff forever.
-  A non-/24 mask with no explicit gateway fails the render.
+  `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`, `scopeName` → the
+  hosted cluster's own name. GET reports the concrete value the DHCP server holds, so a
+  body that said `null` would diff forever. A non-/24 mask with no explicit gateway
+  fails the render.
+- **`scopeName` comes from the cluster's values-file name.** One values file is one
+  hosted cluster is one DHCP scope, so `<cluster>.yaml` already carries the name; writing
+  it in the file is only an override. Helm has no notion of which file a value came from,
+  so the ApplicationSet injects it as a `clusterName` Helm parameter — deliberately a
+  chart-owned key rather than `--set dhcp_values.scopeName`, since parameters outrank
+  `valueFiles` and would make an explicit value impossible to honour.
+- **The template is gated on `dhcp_values.network`**, the one key only a cluster's own
+  file sets, so a cluster with no DHCP block renders nothing instead of failing. It
+  cannot be gated on `scopeName` any more — that now resolves for every cluster.
 - **Bearer token** renders as `Authorization: "Bearer {{ name:namespace:key }}"`, which
   provider-http resolves against the live Secret at reconcile time, keeping the token out
   of git. All three of `dhcp_api.tokenSecretRef.{name,namespace,key}` or none.

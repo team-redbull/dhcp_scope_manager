@@ -56,23 +56,43 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 - Per-architecture boot files (BIOS vs UEFI) need Windows DHCP *policies* matching option 93
   and are deliberately **not** modelled here
 
-**Derived defaults** (`subnetMask`, `gateway`, `failover.relationshipName` — the only three)
+**Derived defaults** (`subnetMask`, `gateway`, `scopeName`, `failover.relationshipName` — the only four)
 
 - Omitting the key derives it: `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`,
-  `relationshipName` → `<scopeName>-failover`
-- Writing `null` or `""` is honoured as written — for `gateway` that means no DHCP option 3
+  `scopeName` → the hosted cluster's own name, `relationshipName` → `<scopeName>-failover`
+- Writing `null` or `""` is honoured as written — for `gateway` that means no DHCP option 3.
+  `scopeName` and `relationshipName` are the exceptions: `""` counts as omitted and derives,
+  matching Helm's `default`, because a nameless scope is not a state anything can hold
 - Any mask other than `255.255.255.0` with no explicit gateway is a hard error, not a guess
 - `relationshipName` only applies when a `failover` block is present; `failover: null` stays
   `null`. Windows caps the name at 64 chars, so a `scopeName` long enough to overflow that
-  fails the render and CI rather than being truncated
+  fails the render and CI rather than being truncated — which caps a *derived* `scopeName`,
+  and so a cluster file name, at 55
 - Resolved identically in **three** places — the Pydantic model and the CI validator here,
   and the chart's `_dhcp-helpers.tpl` in `helm-charts-hostedclusters-setup`. The duplication
   is deliberate: GET reports the concrete value the DHCP server holds, so the rendered PUT
   body must carry it too or the drift check in §9 never converges. Change one, change all
   three — and one of the three is in another repo, so it will not fail your local tests.
-- `relationshipName` is the exception to "three places": the API model keeps it **required**,
-  because the API only ever receives a resolved value. Only the chart and the CI validator
-  derive it.
+- `scopeName` and `relationshipName` are the exception to "three places": the API model keeps
+  both **required**, because the API only ever receives a resolved value. Only the chart and
+  the CI validator derive them.
+
+**`scopeName` comes from the cluster's file name**
+
+- One values file *is* one hosted cluster *is* one DHCP scope, so `<cluster>.yaml` already
+  carries the name. Repeating it inside the file could only ever be redundant or wrong
+- An explicit `scopeName` anywhere in the merge chain still wins, so nothing already written
+  had to change when this landed
+- **Helm has no notion of which file a value came from** — it merges the four `valueFiles`
+  into one flat `.Values`. So the name cannot be derived inside the chart from the values
+  alone: `hcAppset.yaml` injects it as a `clusterName` Helm *parameter*, from the same
+  `.path.filename | trimSuffix` expression that names the Application. The CI validator has
+  the path in hand and uses `cluster_path.stem` instead
+- It must be a chart-owned key, **not** `--set dhcp_values.scopeName`: helm parameters
+  outrank `valueFiles`, so injected there an explicit `scopeName` in a values file could
+  never win
+- `clusterName` is chart-owned like `dhcp_api` and `crossplane` — it never appears in a
+  values file, so `_REQUIRED_PATHS` must never demand it
 
 **`dns.extraServers`** — the append-able half of `dns.servers`
 
@@ -112,10 +132,16 @@ the chart's values.yaml                               (chart defaults — implic
 ```
 
 - Helm performs all merging — the API receives a fully resolved payload
-- **`dhcp_values` is the only key the values repo owns.** `dhcp_api` and `crossplane` are
-  chart-owned: one API per cluster is a platform constant, not per-cluster
-  config. `_REQUIRED_PATHS` in the CI validator must therefore never demand them — that script
+- **`dhcp_values` is the only key the values repo owns.** `dhcp_api`, `crossplane` and
+  `clusterName` are chart-owned: one API per cluster is a platform constant, not per-cluster
+  config, and `clusterName` is injected by the ApplicationSet (§2).
+  `_REQUIRED_PATHS` in the CI validator must therefore never demand them — that script
   walks the values repo, which never contains them.
+- **The cluster file's own name is load-bearing, not just a label.** `scopeName` derives from
+  it (§2), so renaming a file renames the scope. That is already a destructive operation for
+  a different reason — the Argo Application is named after the file too, so a `git mv`
+  deletes and recreates the Application, and with it the Request and the live scope. See the
+  risk table in `argocd-platform/README.md`.
 - All IPs in values files must be absolute (no offsets)
 - `failover: null` removes an inherited failover — `failover: {}` does NOT (Helm deep-merges `{}`)
 
@@ -132,9 +158,14 @@ still matches the payload shape in §5.
 - **Request URL** — `dhcp_values.network` is baked into `payload.baseUrl` at template time (`{dhcp_api.url}/api/v1/scopes/{network}`); all four mappings then use `(.payload.baseUrl)`. The address is deliberately absent from `payload.body`. Note `network` remains a required **values file** key — only the rendered request body drops it.
 - **`payload.body` is a JSON *string*, not a mapping** — provider-http types the field as a string and the API server rejects an object outright (`must be of type string`). `dhcp.payload` therefore emits JSON text, written field by field rather than piped through `toJson`, because Go marshals a map with its keys sorted and that would destroy the canonical field order in §5. The mappings parse it back with jq (`.payload.body`).
 - **Bearer token via a header placeholder** — `Authorization: "Bearer {{ name:namespace:key }}"`, resolved by provider-http against the live Secret at reconcile time and stored only in placeholder form in `spec`, `status.requestDetails` and its logs. **Not** `secretInjectionConfigs`: that field runs the opposite direction, extracting HTTP *response* fields into a Secret. All three of `dhcp_api.tokenSecretRef.{name,namespace,key}` are required or the header is omitted entirely — a half-resolved placeholder would be sent as literal text.
-- **Required fields** — `helm template` fails hard if missing: `dhcp_values.network`, `scopeName`, `startRange`, `endRange`, `leaseDurationDays`, `dns.servers`, `dhcp_api.url`
-- **Derived fields** — `subnetMask` and `gateway` may be omitted; the chart resolves them (`dhcp.defaultGateway` in `_dhcp-helpers.tpl`) rather than passing the omission through, so the rendered body always carries concrete values. A non-/24 mask with no gateway fails the render.
-- **The chart's `values.yaml` is the base of every merge** — a key set there cannot be unset by a site or cluster file. That is why it ships no `dhcp_values` at all: a worked example there would give every hosted cluster the same `scopeName` and `network`, colliding on one Request object name. The whole template is gated on `dhcp_values.scopeName`, so a cluster with no DHCP block renders nothing.
+- **Required fields** — `helm template` fails hard if missing: `dhcp_values.network`, `startRange`, `endRange`, `leaseDurationDays`, `dns.servers`, `dhcp_api.url`
+- **Derived fields** — `subnetMask`, `gateway` and `scopeName` may be omitted; the chart resolves them (`dhcp.defaultGateway` and `dhcp.scopeName` in `_dhcp-helpers.tpl`) rather than passing the omission through, so the rendered body always carries concrete values. A non-/24 mask with no gateway fails the render. `scopeName` resolves from the `clusterName` parameter (§2); with neither that nor an explicit value the render fails rather than silently skipping — a skip is what the old gate did, and it hid the misconfiguration.
+- **The chart's `values.yaml` is the base of every merge** — a key set there cannot be unset by a site or cluster file. That is why it ships no `dhcp_values` at all: a worked example there would give every hosted cluster the same `scopeName` and `network`, colliding on one Request object name.
+- **The whole template is gated on `dhcp_values.network`**, so a cluster with no DHCP block renders nothing. Three things make that the right key and not a workaround:
+  - It is the scope's identity (§5) and the only `dhcp_values` key a cluster's *own* file ever sets. `sites/configValues.yaml` gives every cluster a `dhcp_values` block (lease, DNS, failover defaults), so inheriting one is not opting in — having a subnet is.
+  - It was gated on `scopeName` until that gained a default. Now that `scopeName` resolves for every cluster, leaving the gate there would be the same as deleting it.
+  - Deleting it is not an option: the air-gapped copy of this chart also carries the `HostedCluster` / `NodePool`, so an ungated Request would make the `required` on `network` fail the **whole** render for a cluster that never asked for a scope.
+  - Gated on `hasKey`, not truthiness, so an absent `network` (no scope wanted) and `network: ""` (a malformed scope) stay different: the first renders nothing, the second reaches the `required` guard instead of disappearing silently.
 - **ProviderConfig** — configurable via `crossplane.providerConfigName` (default: `dhcp-http`)
 
 ## 5. API Contract

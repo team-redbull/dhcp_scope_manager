@@ -481,9 +481,13 @@ def _nested_present(data: dict, *keys: str) -> bool:
 
 # Only dhcp_values lives in the values repo. dhcp_api and crossplane are chart-owned
 # (the chart's values.yaml) — a platform-wide constant, not per-cluster config — so the merge
-# chain this script walks never contains them and must not demand them.
+# chain this script walks never contains them and must not demand them. Same for clusterName,
+# which hcAppset.yaml passes to the chart with --set and which never appears in a values file.
+#
+# scopeName is absent because it defaults to the cluster file's own stem — see
+# _validate_dhcp_content. Demanding it here would reject exactly the files this is meant
+# to allow.
 _REQUIRED_PATHS: list[tuple[str, ...]] = [
-    ("dhcp_values", "scopeName"),
     ("dhcp_values", "network"),
     ("dhcp_values", "startRange"),
     ("dhcp_values", "endRange"),
@@ -521,19 +525,27 @@ def _validate_dhcp_content(cluster_path: Path, merged: dict) -> list[str]:
     dns = dv.get("dns") or {}
     pxe = dv.get("pxe") or {}
 
+    # scopeName defaults to the cluster file's own name, the same derivation the chart's
+    # dhcp.scopeName makes from the clusterName parameter hcAppset.yaml passes it. One
+    # values file is one hosted cluster is one DHCP scope, so the file name already *is*
+    # the name. An explicit scopeName anywhere in the merge chain still wins; falsy
+    # (including "") counts as omitted, matching Helm's `default`.
+    scope_name_was_derived = not dv.get("scopeName")
+    scope_name = dv.get("scopeName") or cluster_path.stem
+
     # relationshipName defaults to <scopeName>-failover, the same derivation the
     # chart's dhcp.payload makes. Resolve it here too or a values file that omits
     # the key renders fine and fails CI. Copied, not mutated in place: `merged` is
     # reused by the exclusion checks below and by the caller's reporting.
-    # max_length=64 on _CiFailover is what rejects a derived name Windows would refuse.
+    # max_length=64 on _CiFailover is what rejects a derived name Windows would refuse —
+    # which caps a derived scopeName, and so a cluster file name, at 55 characters.
     failover = dv.get("failover")
     if isinstance(failover, dict) and not failover.get("relationshipName"):
-        scope_name = dv.get("scopeName")
         if isinstance(scope_name, str) and scope_name:
             failover = {**failover, "relationshipName": f"{scope_name}-failover"}
 
     kwargs = {
-        "scopeName":         dv.get("scopeName"),
+        "scopeName":         scope_name,
         "network":           dv.get("network"),
         "startRange":        dv.get("startRange"),
         "endRange":          dv.get("endRange"),
@@ -563,6 +575,13 @@ def _validate_dhcp_content(cluster_path: Path, merged: dict) -> list[str]:
             loc = ".".join(str(p) for p in error["loc"])
             msg = error["msg"].removeprefix("Value error, ")
             path = f"dhcp_values.{loc}" if loc else "dhcp_values"
+            # A derived name makes these two point at keys the file never wrote, so say
+            # where the value actually came from and how to override it.
+            if scope_name_was_derived and loc in ("scopeName", "failover.relationshipName"):
+                msg += (
+                    f" (scopeName was derived from the file name {cluster_path.name}; "
+                    "set dhcp_values.scopeName explicitly to override)"
+                )
             errors.append(f"{path}: {msg}")
 
     # Exclusion order warning (becomes error in strict mode)

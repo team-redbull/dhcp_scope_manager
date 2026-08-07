@@ -30,8 +30,10 @@ somewhere in the chain.
 ## Full Example
 
 ```yaml
+# sites/site1/mces/prep-mce-tlv-a/hostedClusters/cluster-a-workers.yaml
 dhcp_values:
-  scopeName: "cluster-a-workers"
+  # scopeName is omitted: it derives from this file's name, "cluster-a-workers".
+  # Set it only to override that.
   network: "10.20.30.0"
   subnetMask: "255.255.255.0" # optional; this is the default, so it can be omitted
   startRange: "10.20.30.11"
@@ -73,7 +75,6 @@ dhcp_values:
 
 | Field               | Type         | Constraints                                     | Description                                                          |
 | ------------------- | ------------ | ----------------------------------------------- | -------------------------------------------------------------------- |
-| `scopeName`         | string       | 1–256 chars, not blank                          | Display name for the scope on the DHCP server                        |
 | `network`           | IPv4         | must be exact network address                   | Scope ID — used in all PowerShell cmdlets and the Crossplane CR name |
 | `startRange`        | IPv4         | in subnet, not network/broadcast                | First IP in the DHCP distribution range                              |
 | `endRange`          | IPv4         | in subnet, not network/broadcast, >= startRange | Last IP in the DHCP distribution range                               |
@@ -84,6 +85,7 @@ dhcp_values:
 
 | Field         | Type           | Default             | Description                                                                |
 | ------------- | -------------- | ------------------- | -------------------------------------------------------------------------- |
+| `scopeName`   | string         | the cluster's file name, without `.yaml` | Display name for the scope on the DHCP server. 1–256 chars, not blank. Set it only to override the file name — see below. |
 | `description` | string         | `""`                | Free-text scope description. `null` and omitting are both treated as `""`. |
 | `subnetMask`  | IPv4           | `255.255.255.0`     | Contiguous mask; combined with `network` must form a valid subnet. `null` and `""` also mean the default — there is no "no subnet mask". |
 | `gateway`     | IPv4 or `""`   | the subnet's `.254` | Default gateway/router option. **Omit it** to derive `.254`; write `""` or `null` for no option 3. When set, must be in the subnet. If inside `[startRange, endRange]`, must be covered by an exclusion. |
@@ -177,7 +179,50 @@ trigger a PUT every 60 seconds forever.
 Note that the chart's `values.yaml` is the base of every Helm merge, so a key set there cannot be
 unset by a site or cluster file. Both keys ship absent from it for that reason.
 
-`failover.relationshipName` follows the same pattern, deriving `<scopeName>-failover`:
+### `scopeName` comes from the file name
+
+One values file is one hosted cluster is one DHCP scope, so `<cluster>.yaml` already carries
+the scope's name. Omit the key and it derives:
+
+```yaml
+# sites/site1/mces/prep-mce-tlv-a/hostedClusters/cluster-a-workers.yaml
+dhcp_values:
+  network: "10.20.30.0"
+  # scopeName -> cluster-a-workers
+```
+
+Write it only to override:
+
+```yaml
+dhcp_values:
+  scopeName: "legacy-name-kept-for-continuity"
+  network: "10.20.30.0"
+```
+
+An explicit value anywhere in the merge chain wins, and `""` counts as omitted (there is no
+"nameless scope" state to express). Helm never sees the names of the files it is handed, so
+the ApplicationSet injects the cluster's name as a `clusterName` parameter; the CI validator
+takes it from the file path directly.
+
+> **Renaming a cluster file renames the scope — but that is the least of it.** The Argo
+> Application is named after the file too, so a `git mv` deletes and recreates the
+> Application, its `Request`, and the live scope, dropping every lease on the subnet. That
+> was already true before names derived. See the risk table in `argocd-platform/README.md`.
+
+Two clusters in different sites may share a file name and so a derived `scopeName`. Harmless
+for the scope itself — Windows keys scopes by ScopeId, not name — but their derived
+*relationship* names would collide on the shared server pair, so set `relationshipName`
+explicitly if both use failover.
+
+> **How to stop managing a scope changed with this.** Deleting `scopeName` no longer does
+> anything — it just derives again. Remove the whole `dhcp_values` block, or at minimum
+> `network`, which is what the template is gated on. With `prune: false` the existing
+> `Request` is left orphaned rather than deleted, so this stops managing the scope without
+> removing it from the DHCP server.
+
+### `failover.relationshipName`
+
+Follows the same pattern, deriving `<scopeName>-failover`:
 
 ```yaml
 dhcp_values:
@@ -191,7 +236,8 @@ dhcp_values:
 ```
 
 Windows caps the name at 64 characters, so a `scopeName` long enough to overflow that is
-a hard error in both the render and CI rather than a silent truncation. It only applies
+a hard error in both the render and CI rather than a silent truncation. When the `scopeName`
+is itself derived that caps the **file name** at 55 characters. It only applies
 when a `failover` block is present at all — `failover: null` stays `null`.
 
 ---
