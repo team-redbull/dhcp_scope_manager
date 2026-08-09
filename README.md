@@ -659,7 +659,17 @@ produces them lives elsewhere:
   cannot be gated on `scopeName` any more — that now resolves for every cluster.
 - **Bearer token** renders as `Authorization: "Bearer {{ name:namespace:key }}"`, which
   provider-http resolves against the live Secret at reconcile time, keeping the token out
-  of git. All three of `dhcp_api.tokenSecretRef.{name,namespace,key}` or none.
+  of git. `name` and `key` are both required or the header is omitted; `namespace` defaults
+  to the CR's own namespace. It is written in by the chart rather than inherited —
+  provider-http's parser demands three literal segments and never sees the CR's namespace,
+  and a placeholder it cannot parse is passed through as literal text with no error, so the
+  symptom is a 401 rather than anything naming the Secret.
+- **The Request is namespaced** — `http.m.crossplane.io/v1alpha2`, Crossplane v2's `.m.`
+  group, which provider-http ships alongside a separate cluster-scoped `Request` in the
+  legacy `http.crossplane.io` group. So `metadata.namespace` is always rendered,
+  `providerConfigRef` carries a required `kind` naming an object in the `.m.` group, and
+  `spec.deletionPolicy` is absent — that field does not exist on this kind and would be
+  silently pruned; deletion is governed by `managementPolicies`.
 
 The chart repo's `tests/test_render_parity.py` asserts the rendered body equals the
 payload shape below; this repo's `tests/test_parity.py` asserts `GET` returns it. Neither
