@@ -374,6 +374,9 @@ class _StubRunspace:
         self.runs = 0
         self._run_raises = run_raises
         self._block = block
+        # Set by a test to make the *next* run fail once, which is how a pooled
+        # runspace whose server-side session died behaves.
+        self.fail_next: Exception | None = None
         _StubRunspace.instances.append(self)
 
     def open(self):
@@ -383,6 +386,9 @@ class _StubRunspace:
         self.runs += 1
         if self._block is not None:
             self._block.wait(timeout=5)
+        if self.fail_next is not None:
+            exc, self.fail_next = self.fail_next, None
+            raise exc
         if self._run_raises:
             raise self._run_raises
         return PsResult(returncode=0, stdout="ok", stderr="")
@@ -396,6 +402,24 @@ def _stub_runspaces():
     _StubRunspace.instances = []
     yield _StubRunspace
     _StubRunspace.instances = []
+
+
+def _age_pool(transport, seconds: float) -> None:
+    """Backdate every pooled runspace's check-in time by ``seconds``.
+
+    The pool stamps check-in with ``time.monotonic()``, so rewinding the stored
+    timestamp simulates an idle gap without sleeping through one.
+    """
+    items = []
+    while True:
+        try:
+            last_used, runspace = transport._idle.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        items.append((last_used - seconds, runspace))
+    # LIFO: re-insert oldest-first so the original stack order survives.
+    for item in reversed(items):
+        transport._idle.put_nowait(item)
 
 
 class TestPsrpTransportPooling:
@@ -452,6 +476,102 @@ class TestPsrpTransportPooling:
             await transport.execute("Get-Item", 30)
         await transport.aclose()
         assert _StubRunspace.instances[0].closed
+
+
+# ─── Stale pooled sessions ────────────────────────────────────────────────────
+#
+# A cached runspace can die without this process noticing: the server reaps its
+# half of an idle WinRM session and the next command on it gets a 401 that
+# re-authentication cannot recover (under CredSSP, "Server did not response with
+# a CredSSP token after step Credential exchange"). Observed as a request failing
+# after an idle gap and the identical retry succeeding.
+
+class TestStalePooledRunspace:
+    pytestmark = pytest.mark.asyncio
+
+    async def test_dead_pooled_runspace_is_retried_on_a_fresh_session(self, _stub_runspaces):
+        transport = PsrpTransport()
+        with patch.object(psrp_pool, "_Runspace", _StubRunspace):
+            await transport.execute("Get-Item", 30)          # pools runspace 0
+            _StubRunspace.instances[0].fail_next = RuntimeError("HTTP 401")
+            result = await transport.execute("Get-Item", 30)  # 0 fails → retry on 1
+
+        assert result.stdout == "ok", "the retry's result must reach the caller"
+        assert len(_StubRunspace.instances) == 2
+        assert _StubRunspace.instances[0].closed
+        assert _StubRunspace.instances[1].runs == 1
+
+    async def test_fresh_runspace_failure_is_not_retried(self, _stub_runspaces):
+        """Only a *pooled* runspace is suspect. Retrying a fresh one would
+        double every genuine failure."""
+        transport = PsrpTransport()
+        with patch.object(
+            psrp_pool, "_Runspace", lambda: _StubRunspace(run_raises=RuntimeError("boom"))
+        ):
+            with pytest.raises(RuntimeError):
+                await transport.execute("Get-Item", 30)
+
+        assert len(_StubRunspace.instances) == 1, "must not open a second runspace"
+        assert _StubRunspace.instances[0].runs == 1
+
+    async def test_expired_runspace_is_reopened_without_being_used(self, _stub_runspaces):
+        transport = PsrpTransport()
+        with _psrp_settings(WINRM_RUNSPACE_MAX_IDLE_SECONDS=60), patch.object(
+            psrp_pool, "_Runspace", _StubRunspace
+        ):
+            await transport.execute("Get-Item", 30)
+            _age_pool(transport, 120)                 # past the limit
+            await transport.execute("Get-Item", 30)
+
+        assert len(_StubRunspace.instances) == 2
+        assert _StubRunspace.instances[0].runs == 1, "expired runspace must not be reused"
+        assert _StubRunspace.instances[1].runs == 1
+
+    async def test_fresh_enough_runspace_is_still_reused(self, _stub_runspaces):
+        """The expiry must not defeat pooling for traffic that keeps arriving."""
+        transport = PsrpTransport()
+        with _psrp_settings(WINRM_RUNSPACE_MAX_IDLE_SECONDS=60), patch.object(
+            psrp_pool, "_Runspace", _StubRunspace
+        ):
+            await transport.execute("Get-Item", 30)
+            _age_pool(transport, 5)                   # well inside the limit
+            await transport.execute("Get-Item", 30)
+
+        assert len(_StubRunspace.instances) == 1
+        assert _StubRunspace.instances[0].runs == 2
+
+    async def test_checkin_resets_the_idle_clock(self, _stub_runspaces):
+        """Age is measured from the last check-in, not from when the runspace
+        was opened — otherwise a busy pool would still expire on a timer."""
+        transport = PsrpTransport()
+        with _psrp_settings(WINRM_RUNSPACE_MAX_IDLE_SECONDS=60), patch.object(
+            psrp_pool, "_Runspace", _StubRunspace
+        ):
+            await transport.execute("Get-Item", 30)
+            _age_pool(transport, 50)      # inside the limit, so it is reused...
+            await transport.execute("Get-Item", 30)
+            _age_pool(transport, 50)      # ...and its clock restarted on check-in
+            await transport.execute("Get-Item", 30)
+
+        assert len(_StubRunspace.instances) == 1, "check-in must restart the idle clock"
+        assert _StubRunspace.instances[0].runs == 3
+
+    async def test_timeout_on_a_pooled_runspace_is_not_retried(self, _stub_runspaces):
+        """The script may still be executing on the server, so a timeout must
+        surface rather than run it a second time."""
+        gate = threading.Event()
+        transport = PsrpTransport()
+        with patch.object(psrp_pool, "_Runspace", _StubRunspace):
+            await transport.execute("Get-Item", 30)       # pools runspace 0
+        try:
+            _StubRunspace.instances[0]._block = gate      # next run blocks
+            with patch.object(psrp_pool, "_Runspace", _StubRunspace):
+                with pytest.raises(asyncio.TimeoutError):
+                    await transport.execute("Get-Item", 0.05)
+        finally:
+            gate.set()
+
+        assert len(_StubRunspace.instances) == 1, "a timeout must not open a retry runspace"
 
 
 # ─── Remote environment check ─────────────────────────────────────────────────

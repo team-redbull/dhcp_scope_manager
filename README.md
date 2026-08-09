@@ -185,11 +185,28 @@ pip install -r requirements.txt
 | `DHCP_SERVER_HOST`                  | _(empty)_ | Target DHCP server. **Required** when `DHCP_TRANSPORT=psrp`.                       |
 | `WINRM_PORT`                        | `5986`    | WinRM port.                                                                       |
 | `WINRM_USE_SSL`                     | `true`    | Use HTTPS for WinRM.                                                              |
-| `WINRM_AUTH`                        | `kerberos`| `kerberos` or `ntlm`.                                                             |
-| `WINRM_USERNAME`                    | _(empty)_ | Required for `ntlm`. Optional for `kerberos` (an explicit principal).             |
-| `WINRM_PASSWORD`                    | _(empty)_ | Required for `ntlm`. Leave unset with Kerberos — no password is stored.           |
+| `WINRM_AUTH`                        | `kerberos`| `kerberos`, `ntlm` or `credssp`. Managing failover requires `credssp` — see [Security](#security). |
+| `WINRM_USERNAME`                    | _(empty)_ | Required for `ntlm` / `credssp`. Optional for `kerberos` (an explicit principal).  |
+| `WINRM_PASSWORD`                    | _(empty)_ | Required for `ntlm` / `credssp`. Leave unset with Kerberos — no password is stored.|
 | `WINRM_CERT_VALIDATION`             | `true`    | Validate the WinRM TLS certificate.                                               |
 | `WINRM_CONNECTION_TIMEOUT_SECONDS`  | `30`      | WinRM connection timeout.                                                         |
+| `WINRM_RUNSPACE_MAX_IDLE_SECONDS`   | `60`      | Reopen a pooled WinRM session rather than reuse it after this long idle.          |
+
+**Pooled sessions expire on purpose.** The API caches open WinRM runspaces, but
+the *server* decides how long its half lives: HTTP.SYS reaps an idle connection
+after 120s by default, a GPO may shorten WinRM's own `IdleTimeout`, and a CredSSP
+security context has its own lifetime. Whichever expires first leaves this side
+holding a session the server has forgotten, and the next command on it fails —
+under CredSSP with `Server did not response with a CredSSP token after step
+Credential exchange`. The signature is unmistakable: **the first request after an
+idle gap fails, the identical retry succeeds, and it then works until traffic
+pauses again**, on every verb including `GET`.
+
+`WINRM_RUNSPACE_MAX_IDLE_SECONDS` is the client giving up on a session before the
+server does, so it must stay *below* the shortest server-side timeout. If the
+"failed after Ns idle, retrying" warning keeps appearing, lower it to under the
+`N` it reports. The transport also retries once on a fresh session, which covers
+the timeouts this setting cannot predict.
 
 `DHCP_SERVER_HOST` is deliberately a single explicit host, not a DNS alias or
 load balancer. Under failover either peer can answer a read, and replication lag

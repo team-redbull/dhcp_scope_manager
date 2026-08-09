@@ -56,6 +56,22 @@ class Settings(BaseSettings):
     WINRM_CERT_VALIDATION: bool = True
     WINRM_CONNECTION_TIMEOUT_SECONDS: int = Field(default=30, ge=1)
 
+    # How long a pooled PSRP runspace may sit idle before it is reopened rather
+    # than reused. The runspace pool caches open WinRM sessions, but the *server*
+    # decides how long its half lives: HTTP.SYS reaps an idle connection after
+    # 120s by default, a GPO may shorten WinRM's own IdleTimeout, and a CredSSP
+    # security context has its own lifetime. When any of those expire first, the
+    # next command on that runspace gets an HTTP 401, and re-authenticating on a
+    # half-dead connection fails outright — for CredSSP with
+    # "Server did not response with a CredSSP token after step Credential
+    # exchange". The failure is invisible until a request lands after an idle
+    # gap, which is why it reads as "fails once, works on retry".
+    #
+    # Kept under the 120s HTTP.SYS default so the client gives up on a runspace
+    # before the server does. PsrpTransport also retries once on a fresh
+    # runspace, which covers the shorter timeouts this cannot predict.
+    WINRM_RUNSPACE_MAX_IDLE_SECONDS: int = Field(default=60, ge=1)
+
     # ------------------------------------------------------------------
     # Test runner (POST /api/v1/test-runs)
     # ------------------------------------------------------------------

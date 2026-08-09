@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from app.config import settings
-from app.errors import DhcpEnvReason, DhcpEnvironmentError
+from app.errors import DhcpEnvReason, DhcpEnvironmentError, sanitize_powershell_text
 from app.services.ps_transport import PsResult
 
 logger = logging.getLogger(__name__)
@@ -204,17 +205,65 @@ class PsrpTransport:
             self._idle_loop = loop
         return self._idle
 
-    async def execute(self, script: str, timeout_seconds: int) -> PsResult:
-        idle = self._get_idle()
+    def _checkin(self, idle: asyncio.LifoQueue, runspace: "_Runspace") -> None:
+        """Return a runspace to the pool, stamped with the time it went idle.
 
-        try:
-            runspace = idle.get_nowait()
-        except asyncio.QueueEmpty:
-            runspace = _Runspace()
-            await asyncio.to_thread(runspace.open)
+        The timestamp lives here rather than on ``_Runspace`` because it is a
+        property of the *caching*, not of the session: how long this process is
+        willing to trust a cached runspace is the pool's policy alone.
+        """
+        idle.put_nowait((time.monotonic(), runspace))
 
+    def _checkout(self, idle: asyncio.LifoQueue) -> "tuple[_Runspace, float] | None":
+        """Take a reusable runspace from the pool, discarding expired ones.
+
+        Returns the runspace and how long it sat idle, or ``None`` when nothing
+        usable is left and the caller should open a fresh one. The queue is
+        LIFO, so the first item out is the most recently used: once that one is
+        too old, everything behind it is older still, and the loop drains the
+        pool.
+        """
+        loop = asyncio.get_running_loop()
+        max_idle = settings.WINRM_RUNSPACE_MAX_IDLE_SECONDS
+        now = time.monotonic()
+
+        while True:
+            try:
+                last_used, runspace = idle.get_nowait()
+            except asyncio.QueueEmpty:
+                return None
+
+            idle_for = now - last_used
+            if idle_for < max_idle:
+                return runspace, idle_for
+
+            # Past the point where the server is likely to still hold its half
+            # open. Closed in the background so draining a stale pool does not
+            # add its round trips to this request's latency.
+            loop.run_in_executor(None, runspace.close)
+
+    def _discard_idle(self, idle: asyncio.LifoQueue) -> None:
+        """Drop every idle runspace after one has proved dead.
+
+        LIFO again: everything still queued was used *earlier* than the one that
+        just failed, so if that one's session was gone, theirs is too. Without
+        this, a burst of requests arriving after an idle gap would each pay the
+        same failure and retry in turn.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                _, stale = idle.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            loop.run_in_executor(None, stale.close)
+
+    async def _run_on(
+        self, runspace: "_Runspace", script: str, timeout_seconds: int
+    ) -> PsResult:
+        """Run one script on one runspace, closing it on any failure."""
         try:
-            result = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 asyncio.to_thread(runspace.run, script),
                 timeout=timeout_seconds,
             )
@@ -229,7 +278,60 @@ class PsrpTransport:
             await asyncio.to_thread(runspace.close)
             raise
 
-        idle.put_nowait(runspace)
+    async def execute(self, script: str, timeout_seconds: int) -> PsResult:
+        """Run a script, retrying once if a *pooled* runspace turns out to be dead.
+
+        A cached runspace can be dead through no fault of this request: the
+        server reaps its half of an idle WinRM session (HTTP.SYS keep-alive, the
+        WinRM IdleTimeout, or the CredSSP context lifetime, whichever is
+        shortest), and the next command on it gets a 401 that re-authentication
+        cannot recover. See WINRM_RUNSPACE_MAX_IDLE_SECONDS in config.py.
+
+        The retry is deliberately narrow. It fires only for a runspace taken
+        from the pool — a freshly opened one failing is a real error, and
+        retrying it would just double every genuine failure. A timeout never
+        retries, since the script may still be running on the server.
+
+        PowerShell *script* errors do not reach here: ``run`` returns them as
+        ``PsResult(returncode=1)``, so any exception it raises is transport
+        level and the script did not produce a result. It may still have
+        executed — a session that died mid-Receive rather than on the opening
+        401 would re-run the script on retry — which is safe here only because
+        every cmdlet path this transport carries is convergence-idempotent
+        (CLAUDE.md §2).
+        """
+        idle = self._get_idle()
+
+        checked_out = self._checkout(idle)
+        if checked_out is not None:
+            runspace, idle_for = checked_out
+            try:
+                result = await self._run_on(runspace, script, timeout_seconds)
+            except asyncio.TimeoutError:
+                raise
+            except Exception as exc:
+                # Sanitized like any other transport text: a pypsrp/requests
+                # exception can carry a connection repr, and that repr carries
+                # the WinRM credential (CLAUDE.md §10, §12).
+                logger.warning(
+                    "Pooled PSRP runspace failed after %.0fs idle; retrying on a "
+                    "fresh session. Lower WINRM_RUNSPACE_MAX_IDLE_SECONDS (now "
+                    "%ds) if this repeats: %s",
+                    idle_for,
+                    settings.WINRM_RUNSPACE_MAX_IDLE_SECONDS,
+                    sanitize_powershell_text(str(exc)),
+                )
+                self._discard_idle(idle)
+            else:
+                self._checkin(idle, runspace)
+                return result
+
+        # Reached either because the pool held nothing usable, or because a
+        # pooled runspace just proved dead and this is the single retry.
+        runspace = _Runspace()
+        await asyncio.to_thread(runspace.open)
+        result = await self._run_on(runspace, script, timeout_seconds)
+        self._checkin(idle, runspace)
         return result
 
     async def aclose(self) -> None:
@@ -238,7 +340,7 @@ class PsrpTransport:
             return
         while True:
             try:
-                runspace = self._idle.get_nowait()
+                _, runspace = self._idle.get_nowait()
             except asyncio.QueueEmpty:
                 break
             await asyncio.to_thread(runspace.close)
