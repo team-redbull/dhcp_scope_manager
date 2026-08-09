@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 import pytest
 from pydantic import ValidationError
@@ -500,6 +501,30 @@ class TestStalePooledRunspace:
         assert len(_StubRunspace.instances) == 2
         assert _StubRunspace.instances[0].closed
         assert _StubRunspace.instances[1].runs == 1
+
+    async def test_a_dead_pooled_runspace_drains_the_rest_of_the_pool(self, _stub_runspaces):
+        """Everything still queued was checked in *earlier* than the one that
+        just died, so it is at least as stale. Without the drain, a burst
+        arriving after an idle gap would each pay the same failure and retry."""
+        transport = PsrpTransport()
+        with patch.object(psrp_pool, "_Runspace", _StubRunspace):
+            await transport.execute("Get-Item", 30)      # pools runspace 0
+            # A second idle runspace, as concurrent traffic would have left.
+            # Queued last, so LIFO checks *it* out first.
+            newer = _StubRunspace()                      # instances[1]
+            transport._idle.put_nowait((time.monotonic(), newer))
+            newer.fail_next = RuntimeError("HTTP 401")
+
+            result = await transport.execute("Get-Item", 30)
+
+        assert result.stdout == "ok"
+        assert transport._idle.qsize() == 1, (
+            "the pool must hold only the retry's fresh runspace — runspace 0 "
+            "was queued behind the dead one and must have been drained"
+        )
+        assert _StubRunspace.instances[0].runs == 1, "drained runspace must not be reused"
+        assert len(_StubRunspace.instances) == 3        # 0, newer, and the retry
+        assert _StubRunspace.instances[2].runs == 1
 
     async def test_fresh_runspace_failure_is_not_retried(self, _stub_runspaces):
         """Only a *pooled* runspace is suspect. Retrying a fresh one would

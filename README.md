@@ -185,7 +185,7 @@ pip install -r requirements.txt
 | `DHCP_SERVER_HOST`                  | _(empty)_ | Target DHCP server. **Required** when `DHCP_TRANSPORT=psrp`.                       |
 | `WINRM_PORT`                        | `5986`    | WinRM port.                                                                       |
 | `WINRM_USE_SSL`                     | `true`    | Use HTTPS for WinRM.                                                              |
-| `WINRM_AUTH`                        | `kerberos`| `kerberos`, `ntlm` or `credssp`. Managing failover requires `credssp` — see [Security](#security). |
+| `WINRM_AUTH`                        | `kerberos`| `kerberos`, `ntlm` or `credssp`. Managing failover requires `credssp` — see [Security and Safety](#security-and-safety). |
 | `WINRM_USERNAME`                    | _(empty)_ | Required for `ntlm` / `credssp`. Optional for `kerberos` (an explicit principal).  |
 | `WINRM_PASSWORD`                    | _(empty)_ | Required for `ntlm` / `credssp`. Leave unset with Kerberos — no password is stored.|
 | `WINRM_CERT_VALIDATION`             | `true`    | Validate the WinRM TLS certificate.                                               |
