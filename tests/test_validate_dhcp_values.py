@@ -601,6 +601,78 @@ class TestDhcpOptIn:
         errors = self._content_errors(tmp_path, values)
         assert any("not covered by any exclusion" in e for e in errors)
 
+    def _without_range(self) -> str:
+        """The minimal cluster file with no range and no gateway — the day-1 shape."""
+        return (
+            _minimal_cluster_yaml()
+            .replace("  startRange: 10.20.30.100\n", "")
+            .replace("  endRange: 10.20.30.200\n", "")
+            .replace("  gateway: 10.20.30.1\n", "")
+        )
+
+    def test_omitted_range_is_valid(self, tmp_path):
+        """The whole point: a cluster file may carry network and nothing else positional."""
+        assert self._content_errors(tmp_path, self._without_range()) == []
+
+    def test_omitted_range_derives_dot_1_to_dot_253(self, tmp_path):
+        """CI resolves the same bounds as the API and the chart, not merely 'no error'.
+
+        Asserting the values rather than the absence of errors is what would catch the
+        three implementations drifting apart — a wrong-but-valid range passes the
+        error check and still makes Crossplane re-PUT forever.
+        """
+        cluster_file = tmp_path / "cluster.yaml"
+        cluster_file.write_text(self._without_range())
+        merged = vdv.load_yaml_file(cluster_file)[0]
+        dv = merged["dhcp_values"]
+        payload = vdv._CiScopePayload(
+            scopeName=dv["scopeName"],
+            network=dv["network"],
+            leaseDurationDays=dv["leaseDurationDays"],
+            dnsServers=dv["dns"]["servers"],
+        )
+        assert str(payload.startRange) == "10.20.30.1"
+        assert str(payload.endRange) == "10.20.30.253"
+
+    def test_range_is_no_longer_a_required_field(self, tmp_path):
+        """It derives, so demanding it would reject exactly the files this enables."""
+        errors = self._content_errors(tmp_path, self._without_range())
+        assert not any("required field missing: dhcp_values.startRange" in e for e in errors)
+        assert not any("required field missing: dhcp_values.endRange" in e for e in errors)
+
+    def test_half_specified_range_is_rejected(self, tmp_path):
+        """One bound alone is still an error — it is just not a missing-field error."""
+        values = self._without_range().replace(
+            "  leaseDurationDays: 8\n", "  startRange: 10.20.30.100\n  leaseDurationDays: 8\n"
+        )
+        errors = self._content_errors(tmp_path, values)
+        assert any("endRange is required when startRange is set" in e for e in errors)
+
+    def test_non_24_mask_without_range_reports_mismatch(self, tmp_path):
+        values = (
+            self._without_range()
+            .replace("  subnetMask: 255.255.255.0", "  subnetMask: 255.255.0.0")
+            .replace("  network: 10.20.30.0", "  network: 10.20.0.0")
+            .replace("  leaseDurationDays: 8\n", "  gateway: 10.20.0.1\n  leaseDurationDays: 8\n")
+        )
+        errors = self._content_errors(tmp_path, values)
+        assert any(
+            "startRange and endRange are required when subnetMask is 255.255.0.0" in e
+            for e in errors
+        )
+
+    def test_derived_range_with_unexcluded_low_gateway_is_rejected(self, tmp_path):
+        """Omitting the range widens the pool over .1 — an unexcluded gateway there fails.
+
+        Fail-closed by design: the derived range is the one case where a gateway a
+        values file has always had suddenly lands inside the distribution pool.
+        """
+        values = self._without_range().replace(
+            "  leaseDurationDays: 8\n", "  gateway: 10.20.30.1\n  leaseDurationDays: 8\n"
+        )
+        errors = self._content_errors(tmp_path, values)
+        assert any("not covered by any exclusion" in e for e in errors)
+
 
 # ─── YAML helpers ────────────────────────────────────────────────────────────
 

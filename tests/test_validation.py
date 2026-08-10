@@ -517,6 +517,122 @@ def test_derived_gateway_accepted_when_excluded():
 
 
 # ---------------------------------------------------------------------------
+# Derived defaults for startRange and endRange
+# ---------------------------------------------------------------------------
+
+def test_range_omitted_derives_dot_1_to_dot_253():
+    # gateway goes too: _minimal_scope pins it at .1, which the derived range now
+    # covers — the interaction has its own test below.
+    payload = DhcpScopePayload(**_without("startRange", "endRange", "gateway"))
+    assert str(payload.startRange) == "10.20.30.1"
+    assert str(payload.endRange) == "10.20.30.253"
+
+
+def test_derived_range_tracks_the_scope_address():
+    """The default follows the scope address rather than a fixed prefix."""
+    payload = DhcpScopePayload(
+        **_without("startRange", "endRange", "gateway", scope="192.168.7.0")
+    )
+    assert str(payload.startRange) == "192.168.7.1"
+    assert str(payload.endRange) == "192.168.7.253"
+
+
+@pytest.mark.parametrize("bound", [None, ""], ids=["null", "empty"])
+def test_range_empty_forms_derive(bound):
+    """A range bound has no 'unset' meaning, so null and "" derive like an omission.
+
+    This is subnetMask's rule, not gateway's: there is no such thing as a scope that
+    distributes no addresses, so there is no third state to keep distinguishable.
+    """
+    payload = DhcpScopePayload(**_without("gateway", startRange=bound, endRange=bound))
+    assert str(payload.startRange) == "10.20.30.1"
+    assert str(payload.endRange) == "10.20.30.253"
+
+
+@pytest.mark.parametrize(
+    "present,missing",
+    [("startRange", "endRange"), ("endRange", "startRange")],
+)
+def test_half_specified_range_is_rejected(present, missing):
+    """Both bounds or neither — a half-specified range is never silently completed.
+
+    Deriving the missing edge would put a subnet-wide default opposite a deliberate
+    one, which is exactly the fail-open case the .1–.253 rule is shaped to avoid.
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        DhcpScopePayload(**_without(missing))
+    assert f"{missing} is required when {present} is set" in str(exc_info.value)
+
+
+def test_non_24_mask_without_range_is_mismatch():
+    """The .1–.253 convention only holds for a /24 — reject rather than guess."""
+    with pytest.raises(ValidationError) as exc_info:
+        DhcpScopePayload(**_without(
+            "startRange", "endRange",
+            scope="10.20.0.0", subnetMask="255.255.0.0", gateway="10.20.0.1",
+        ))
+    assert "startRange and endRange are required when subnetMask is 255.255.0.0" in str(
+        exc_info.value
+    )
+
+
+def test_derived_range_stops_short_of_the_derived_gateway():
+    """The two derivations must not collide.
+
+    A minimal body — nothing but identity, lease and DNS — has to resolve to a valid
+    scope. Ending the range at .254 would put the derived gateway inside the
+    distribution pool with no exclusion covering it, so every such body would 422.
+    """
+    payload = DhcpScopePayload(**_without("startRange", "endRange", "gateway"))
+    assert str(payload.gateway) == "10.20.30.254"
+    assert int(payload.endRange) < int(payload.gateway)
+
+
+def test_derived_range_ignores_exclusions():
+    """Exclusions carve holes inside the range; they do not move its edges.
+
+    Fixed bounds are what keeps this derivation reproducible in the CI validator and
+    the chart without either of them having to reimplement exclusion arithmetic.
+    """
+    payload = DhcpScopePayload(**_without(
+        "startRange", "endRange", "gateway",
+        exclusions=[
+            {"startAddress": "10.20.30.1", "endAddress": "10.20.30.10"},
+            {"startAddress": "10.20.30.241", "endAddress": "10.20.30.254"},
+        ],
+    ))
+    assert str(payload.startRange) == "10.20.30.1"
+    assert str(payload.endRange) == "10.20.30.253"
+
+
+def test_derived_range_with_explicit_low_gateway_needs_an_exclusion():
+    """The derived range covers .1, so a gateway there must be excluded — fail-closed.
+
+    Omitting the range widens the pool over the low addresses, and a router sitting in
+    a leasable pool is the outage this guard exists for. The error names the fix.
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        DhcpScopePayload(**_without("startRange", "endRange", gateway="10.20.30.1"))
+    assert "not covered by any exclusion" in str(exc_info.value)
+
+
+def test_derived_range_with_explicit_low_gateway_accepted_when_excluded():
+    payload = DhcpScopePayload(**_without(
+        "startRange", "endRange",
+        gateway="10.20.30.1",
+        exclusions=[{"startAddress": "10.20.30.1", "endAddress": "10.20.30.10"}],
+    ))
+    assert str(payload.startRange) == "10.20.30.1"
+    assert str(payload.gateway) == "10.20.30.1"
+
+
+def test_explicit_range_is_used_as_written():
+    payload = DhcpScopePayload(**_minimal_scope())
+    assert str(payload.startRange) == "10.20.30.100"
+    assert str(payload.endRange) == "10.20.30.200"
+
+
+# ---------------------------------------------------------------------------
 # Network/broadcast address role enforcement
 # ---------------------------------------------------------------------------
 

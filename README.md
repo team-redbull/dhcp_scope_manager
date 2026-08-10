@@ -602,7 +602,16 @@ list item has no URL of its own to identify it:
   | an IPv4 address | that address |
 
   A `subnetMask` other than `255.255.255.0` with no explicit `gateway` is rejected — there is no `.254` convention to fall back on outside a /24. The chart applies the same rule when it renders, so the PUT body and the GET response always agree.
-- **Gateway-in-range guard**: if `gateway` is set to an IP inside `[startRange, endRange]` and is not covered by an exclusion, the request is rejected with `422 VALIDATION_ERROR`. An unexcluded gateway inside the distribution pool would be leased to a client, causing a network outage.
+- `startRange` and `endRange` are **derived as a pair when both are omitted** — the subnet's `.1` and `.253`. Exclusions then carve holes out of that range, which is what makes "everything except the excluded addresses" expressible: a Windows scope holds exactly one contiguous range, so the derivation widens the range and leaves the carving to the exclusion list.
+
+  | `startRange` / `endRange` | Result |
+  | ------------------------- | ------ |
+  | both absent (or `null` / `""`) | derived `.1`–`.253` (e.g. `10.20.30.1`–`10.20.30.253`) |
+  | both addresses | used as written |
+  | one without the other | `422 VALIDATION_ERROR` |
+
+  `.253` rather than `.254` because `.254` is the derived gateway — a range ending there would trip the gateway-in-range guard below on every body that omitted both. As with `gateway`, deriving requires a /24; any other mask must state both bounds.
+- **Gateway-in-range guard**: if `gateway` is set to an IP inside `[startRange, endRange]` and is not covered by an exclusion, the request is rejected with `422 VALIDATION_ERROR`. An unexcluded gateway inside the distribution pool would be leased to a client, causing a network outage. This is the guard that makes the derived range safe: it widens the pool over the low addresses, so a gateway at `.1` that used to sit below an explicit `startRange` now needs an exclusion.
 - DNS server order is preserved exactly (primary/secondary semantics — never sorted).
 - `description` defaults to `""` (never `null`).
 - `nextServer` / `bootFile` (DHCP options 66/67) are the PXE pair: option 66 names the boot server, option 67 the boot file. Both default to `""`, meaning the option is not set on the scope — that is the ordinary case for scopes whose hosts do not network-boot.

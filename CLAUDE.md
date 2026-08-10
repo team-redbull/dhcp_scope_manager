@@ -56,14 +56,34 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 - Per-architecture boot files (BIOS vs UEFI) need Windows DHCP *policies* matching option 93
   and are deliberately **not** modelled here
 
-**Derived defaults** (`subnetMask`, `gateway`, `scopeName`, `failover.relationshipName` — the only four)
+**Derived defaults** (`subnetMask`, `gateway`, `scopeName`, `failover.relationshipName`,
+`startRange` + `endRange` — the only six)
 
 - Omitting the key derives it: `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`,
-  `scopeName` → the hosted cluster's own name, `relationshipName` → `<scopeName>-failover`
+  `scopeName` → the hosted cluster's own name, `relationshipName` → `<scopeName>-failover`,
+  the range → the subnet's `.1`–`.253`
 - Writing `null` or `""` is honoured as written — for `gateway` that means no DHCP option 3.
-  `scopeName` and `relationshipName` are the exceptions: `""` counts as omitted and derives,
-  matching Helm's `default`, because a nameless scope is not a state anything can hold
-- Any mask other than `255.255.255.0` with no explicit gateway is a hard error, not a guess
+  `scopeName`, `relationshipName` and the range bounds are the exceptions: `""` counts as
+  omitted and derives, matching Helm's `default`, because neither a nameless scope nor one
+  distributing no addresses is a state anything can hold
+- Any mask other than `255.255.255.0` with no explicit gateway is a hard error, not a guess.
+  Same for the range: the `.1`–`.253` convention only holds for a /24
+- **The range derives as a pair.** One bound without the other is rejected (422 / CI error),
+  like the PXE pair — completing half a range from a subnet-wide default would put a
+  deliberate edge opposite an implied one
+- **`.253`, not `.254`, and that is load-bearing.** The derived gateway is `.254`; a range
+  ending there would sit on top of it, and `gateway_not_in_distribution_range` would 422
+  every values file that omitted both. Stopping one address short is what lets the minimal
+  file — a bare `network:` — resolve to a valid scope
+- **The derived bounds ignore the exclusion list.** Exclusions already carve holes inside a
+  Windows range, so `.1`–`.253` minus the exclusions *is* "every address that is not
+  excluded". Moving the bounds to fit the exclusions would couple two derivations that have
+  to stay byte-identical across three implementations, one of them in Go templates
+- Deriving the range is **fail-open by construction** — it widens the pool to the whole /24
+  rather than the narrow band a values file used to state. The guard that keeps it honest is
+  `gateway_not_in_distribution_range`: an explicit gateway at `.1` that used to sit safely
+  below `startRange` is now inside the pool and is refused until an exclusion covers it. Do
+  not soften that check to make the derivation more convenient
 - `relationshipName` only applies when a `failover` block is present; `failover: null` stays
   `null`. Windows caps the name at 64 chars, so a `scopeName` long enough to overflow that
   fails the render and CI rather than being truncated — which caps a *derived* `scopeName`,
@@ -75,7 +95,8 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
   three — and one of the three is in another repo, so it will not fail your local tests.
 - `scopeName` and `relationshipName` are the exception to "three places": the API model keeps
   both **required**, because the API only ever receives a resolved value. Only the chart and
-  the CI validator derive them.
+  the CI validator derive them. The range is *not* an exception — it derives from the scope
+  address, which the API has in the URL, so all three resolve it.
 
 **`scopeName` comes from the cluster's file name**
 
@@ -237,12 +258,13 @@ POST/PUT request body, and the GET response for a single scope — identical by 
 PUT is **diff-based convergence** in what it *writes* — only changed sections trigger
 PowerShell — but the body it diffs against is a **full replacement**, not a patch. An
 omitted optional field resolves to its default and is then applied: omitting `dnsDomain`,
-`nextServer` / `bootFile` or `exclusions` clears them on the server. That is deliberate
-and load-bearing for GitOps — if omission meant "leave alone", deleting a line from a
-values file could never remove anything, and Git would stop being authoritative. It is
-also a footgun for anyone calling the API by hand; `tests/integration/` pins it so it
-cannot change unnoticed. Required fields are `scopeName`, `startRange`, `endRange`,
-`leaseDurationDays`, `dnsServers`.
+`nextServer` / `bootFile` or `exclusions` clears them on the server, and omitting the
+range **widens the pool to the derived `.1`–`.253`** rather than leaving it alone. That is
+deliberate and load-bearing for GitOps — if omission meant "leave alone", deleting a line
+from a values file could never remove anything, and Git would stop being authoritative. It
+is also a footgun for anyone calling the API by hand; `tests/integration/` pins it so it
+cannot change unnoticed. Required fields are `scopeName`, `leaseDurationDays`,
+`dnsServers`.
 
 | Section      | Changed when                       | PowerShell cmdlet                            |
 | ------------ | ---------------------------------- | -------------------------------------------- |
@@ -384,7 +406,7 @@ Changed-file resolution:
 - `<site>/values.yaml` changed → validate all clusters under `<site>`
 - `sites/configValues.yaml` changed → full repo scan
 
-Validates: IP format, subnet consistency, range ordering, gateway in subnet, exclusions in subnet, failover mode fields.
+Validates: IP format, subnet consistency, range ordering, range given as a pair (or omitted and derived), gateway in subnet, exclusions in subnet, failover mode fields.
 
 ## 12. Testing Requirements
 

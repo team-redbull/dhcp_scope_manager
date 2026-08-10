@@ -346,12 +346,18 @@ async def test_put_rejects_subnet_mask_change_with_409():
 
 
 async def test_put_requires_the_mandatory_fields():
-    """PUT is full-replace, so the required fields cannot be omitted."""
+    """PUT is full-replace, so the required fields cannot be omitted.
+
+    startRange/endRange are deliberately absent from this set: they derive
+    (.1–.253), so a body without them is complete rather than partial.
+    """
     await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=_body())
     resp = await client.put(f"/api/v1/scopes/{TEST_SCOPE}", json={"scopeName": "partial"})
     assert resp.status_code == 422
     missing = {e["field"].removeprefix("body.") for e in resp.json()["error"]["details"]["errors"]}
-    assert {"startRange", "endRange", "leaseDurationDays"} <= missing
+    assert {"leaseDurationDays", "dnsServers"} <= missing
+    assert "startRange" not in missing
+    assert "endRange" not in missing
 
 
 async def test_put_omitting_optional_fields_resets_them():
@@ -458,6 +464,105 @@ async def test_create_scope_with_a_non_24_mask():
     assert fetched == body
 
 
+async def test_post_omitting_the_range_creates_the_derived_pool():
+    """A body with no range must create a real scope running .1–.253.
+
+    The unit suite can only prove the cmdlet string carries those bounds. Only a
+    live Add-DhcpServerv4Scope proves Windows accepts a range that starts at the
+    first host address, and that GET reads it back identically — which is what
+    Crossplane's containment check compares against.
+    """
+    body = _body(exclusions=[], gateway=None)
+    del body["startRange"]
+    del body["endRange"]
+
+    created = await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=body)
+    assert created.status_code == 200, created.text
+
+    fetched = (await client.get(f"/api/v1/scopes/{TEST_SCOPE}")).json()
+    assert fetched["startRange"] == "10.77.88.1"
+    assert fetched["endRange"] == "10.77.88.253"
+    assert created.json() == fetched
+
+
+async def test_post_omitting_both_range_and_gateway_is_a_valid_scope():
+    """The two derivations must not collide on the minimal body.
+
+    .253 exists precisely so the derived gateway (.254) lands outside the derived
+    pool. Against a real server this is the whole day-1 shape end to end: identity,
+    lease and DNS, everything else resolved.
+    """
+    body = {
+        "scopeName": "it-derived",
+        "leaseDurationDays": 8,
+        "dnsServers": ["10.0.0.53", "10.0.0.54"],
+    }
+    created = await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=body)
+    assert created.status_code == 200, created.text
+
+    fetched = (await client.get(f"/api/v1/scopes/{TEST_SCOPE}")).json()
+    assert fetched["startRange"] == "10.77.88.1"
+    assert fetched["endRange"] == "10.77.88.253"
+    assert fetched["gateway"] == "10.77.88.254"
+
+
+async def test_put_removing_an_explicit_range_widens_to_the_derived_pool():
+    """Deleting the keys is a live range change, not a no-op (§6 full replacement).
+
+    .100–.200 to .1–.253 is a widening, so _range_transition_steps collapses it to a
+    single Set-DhcpServerv4Scope — but that only holds if Windows accepts it, which
+    is what makes this a live test rather than a diff test. This is also the exact
+    edit a values file gets when someone drops the two lines.
+    """
+    await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=_body())
+
+    desired = _body(exclusions=[], gateway=None)
+    del desired["startRange"]
+    del desired["endRange"]
+    resp = await client.put(f"/api/v1/scopes/{TEST_SCOPE}", json=desired)
+    assert resp.status_code == 200, resp.text
+
+    fetched = (await client.get(f"/api/v1/scopes/{TEST_SCOPE}")).json()
+    assert fetched["startRange"] == "10.77.88.1"
+    assert fetched["endRange"] == "10.77.88.253"
+
+
+async def test_put_narrowing_from_the_derived_pool_to_an_explicit_range():
+    """And back again — adding the lines has to converge as reliably as removing them."""
+    derived = _body(exclusions=[], gateway=None)
+    del derived["startRange"]
+    del derived["endRange"]
+    await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=derived)
+
+    resp = await client.put(
+        f"/api/v1/scopes/{TEST_SCOPE}",
+        json=_body(startRange="10.77.88.100", endRange="10.77.88.200"),
+    )
+    assert resp.status_code == 200, resp.text
+
+    fetched = (await client.get(f"/api/v1/scopes/{TEST_SCOPE}")).json()
+    assert fetched["startRange"] == "10.77.88.100"
+    assert fetched["endRange"] == "10.77.88.200"
+
+
+async def test_derived_range_scope_is_idempotent_on_repost():
+    """A POST of a range-less body against the scope it already created writes nothing new.
+
+    Idempotency is a property of the diff (§2), and the diff compares the *derived*
+    bounds against what the server holds — so this only stays 200-with-no-drift if
+    the derivation is stable across calls.
+    """
+    body = _body(exclusions=[], gateway=None)
+    del body["startRange"]
+    del body["endRange"]
+
+    first = await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=body)
+    second = await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=body)
+    assert first.status_code == second.status_code == 200, second.text
+    assert first.json() == second.json()
+    assert (await client.get(f"/api/v1/scopes/{TEST_SCOPE}")).json() == second.json()
+
+
 async def test_concurrent_puts_on_one_scope_serialize():
     """ScopeLockManager against a real server.
 
@@ -499,3 +604,36 @@ async def test_half_a_pxe_pair_is_rejected():
         f"/api/v1/scopes/{TEST_SCOPE}", json=_body(nextServer="boot.lab.local", bootFile="")
     )
     assert resp.status_code == 422
+
+
+async def test_half_a_range_is_rejected():
+    """One bound alone is a 422 — the pair is never half-derived."""
+    body = _body()
+    del body["endRange"]
+    resp = await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=body)
+    assert resp.status_code == 422
+    assert "endRange is required when startRange is set" in resp.text
+
+
+async def test_non_24_mask_without_a_range_is_rejected():
+    """The .1–.253 convention holds for a /24 only; anything else must be explicit."""
+    body = _body(subnetMask="255.255.254.0", gateway="10.77.88.254")
+    del body["startRange"]
+    del body["endRange"]
+    resp = await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=body)
+    assert resp.status_code == 422
+    assert "startRange and endRange are required" in resp.text
+
+
+async def test_derived_range_with_an_unexcluded_low_gateway_is_rejected():
+    """Fail-closed: widening the pool over a router address is refused, not written.
+
+    The one genuinely new hazard the derived range introduces — a gateway at .1 that
+    was safely below an explicit startRange is inside the derived pool.
+    """
+    body = _body(gateway="10.77.88.1", exclusions=[])
+    del body["startRange"]
+    del body["endRange"]
+    resp = await client.post(f"/api/v1/scopes/{TEST_SCOPE}", json=body)
+    assert resp.status_code == 422
+    assert "not covered by any exclusion" in resp.text
