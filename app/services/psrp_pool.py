@@ -198,9 +198,20 @@ class PsrpTransport:
 
         Mirrors the semaphore handling in ``ps_executor`` — pytest and ASGI
         servers may use different event loops over the process lifetime.
+
+        Rebinding *closes* what the previous loop left parked. Dropping the queue
+        alone frees only this side: the runspace object goes out of scope, while
+        the server keeps its half — a wsmprovhost.exe holding ~120 MB — until the
+        WinRM IdleTimeout expires, which defaults to two hours. A deployed API
+        never reaches this branch, since an ASGI server keeps one loop for the
+        process lifetime; pytest-asyncio gives every test its own, so the live
+        suite stranded one shell per test and exhausted a 2 GB DHCP server
+        mid-run. Closing here is what makes that suite runnable end to end.
         """
         loop = asyncio.get_running_loop()
         if self._idle is None or self._idle_loop is not loop:
+            if self._idle is not None:
+                self._discard_idle(self._idle)
             self._idle = asyncio.LifoQueue()
             self._idle_loop = loop
         return self._idle
@@ -243,12 +254,20 @@ class PsrpTransport:
             loop.run_in_executor(None, runspace.close)
 
     def _discard_idle(self, idle: asyncio.LifoQueue) -> None:
-        """Drop every idle runspace after one has proved dead.
+        """Drain a queue, closing every runspace still parked in it.
 
-        LIFO again: everything still queued was used *earlier* than the one that
-        just failed, so if that one's session was gone, theirs is too. Without
-        this, a burst of requests arriving after an idle gap would each pay the
-        same failure and retry in turn.
+        Called from two places. After a pooled runspace has proved dead: LIFO
+        means everything still queued was used *earlier* than the one that just
+        failed, so if that one's session was gone, theirs is too — without this,
+        a burst of requests arriving after an idle gap would each pay the same
+        failure and retry in turn. And from ``_get_idle`` when the event loop
+        changes, where the queue itself is being replaced and its contents would
+        otherwise be stranded on the server.
+
+        Closes run in the background for the same reason in both cases: draining
+        a stale pool must not add its round trips to the caller's latency. The
+        runspaces are closed rather than merely dropped because a dropped one
+        keeps its server-side shell alive until WinRM's IdleTimeout.
         """
         loop = asyncio.get_running_loop()
         while True:

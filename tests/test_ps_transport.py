@@ -479,6 +479,41 @@ class TestPsrpTransportPooling:
         assert _StubRunspace.instances[0].closed
 
 
+# Outside TestPsrpTransportPooling on purpose: that class carries an asyncio
+# mark, and this one has to own the loops itself.
+def test_rebinding_to_a_new_loop_closes_what_the_old_one_parked(_stub_runspaces):
+    """A queue replaced on a loop change must not strand its runspaces.
+
+    Dropping the queue frees this side only — the server keeps a wsmprovhost.exe
+    holding ~120 MB until WinRM's IdleTimeout, two hours by default. A deployed
+    API never rebinds (one ASGI loop for the process lifetime), but
+    pytest-asyncio gives every test its own loop, so this leaked one shell per
+    test and exhausted the live test server mid-run.
+
+    Deliberately not an async test: it needs *two* event loops, so it drives
+    asyncio.run twice rather than running inside a loop of its own.
+    """
+    transport = PsrpTransport()
+
+    with patch.object(psrp_pool, "_Runspace", _StubRunspace):
+        asyncio.run(transport.execute("Get-Item", 30))
+        parked = _StubRunspace.instances[0]
+        assert not parked.closed, "still pooled — nothing should have closed it yet"
+
+        # A second loop: the pool rebinds, and the first loop's runspace has no
+        # owner left to return it.
+        asyncio.run(transport.execute("Get-Item", 30))
+
+    # run_in_executor closes in the background; give the default executor a
+    # moment to run it rather than asserting on a race.
+    for _ in range(50):
+        if parked.closed:
+            break
+        time.sleep(0.02)
+    assert parked.closed, "runspace stranded by the loop change was never closed"
+    assert transport._idle.qsize() == 1, "only the new loop's runspace stays pooled"
+
+
 # ─── Stale pooled sessions ────────────────────────────────────────────────────
 #
 # A cached runspace can die without this process noticing: the server reaps its
