@@ -65,6 +65,28 @@ class TestCreateScope:
         assert any("Add-DhcpServerv4Scope" in cmd for cmd in commands)
         assert out is result
 
+    async def test_add_scope_carries_the_derived_range(self):
+        """The cmdlet gets concrete bounds — deriving happens in the model, not here.
+
+        Add-DhcpServerv4Scope is the only cmdlet carrying the range on create, so a
+        payload that arrived without one has to reach it fully resolved.
+        """
+        payload = _make_scope(startRange=None, endRange=None, gateway=None)
+        result = _make_scope()
+
+        with patch("app.services.scope_service.run_ps") as mock_ps, \
+             patch("app.services.scope_service.assemble_scope_state", return_value=result):
+            mock_ps.side_effect = [None, None, None]
+            from app.services import scope_service
+            await scope_service.create_scope(payload)
+
+        add = next(
+            c.args[0] for c in mock_ps.call_args_list
+            if c.args and "Add-DhcpServerv4Scope" in c.args[0]
+        )
+        assert "-StartRange '10.20.30.1'" in add
+        assert "-EndRange '10.20.30.253'" in add
+
     async def test_add_scope_skipped_when_scope_exists(self):
         """If scope already exists, Add-DhcpServerv4Scope must NOT be called."""
         payload = _make_scope()

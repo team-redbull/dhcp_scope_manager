@@ -233,6 +233,11 @@ def _is_valid_k8s_label(name: str) -> bool:
 # installed — the two must be kept in step.
 _DEFAULT_SUBNET_MASK = IPv4Address("255.255.255.0")
 
+# Mirrors DERIVED_RANGE_FIRST_OCTET / DERIVED_RANGE_LAST_OCTET in app/models/scope.py.
+# .253, not .254, so the derived range cannot collide with the derived gateway.
+_DERIVED_RANGE_FIRST_OCTET = 1
+_DERIVED_RANGE_LAST_OCTET = 253
+
 
 class _CiExclusion(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -284,8 +289,8 @@ class _CiScopePayload(BaseModel):
     scopeName: str = Field(min_length=1, max_length=256)
     network: IPv4Address
     subnetMask: IPv4Address = _DEFAULT_SUBNET_MASK
-    startRange: IPv4Address
-    endRange: IPv4Address
+    startRange: Optional[IPv4Address] = None
+    endRange: Optional[IPv4Address] = None
     leaseDurationDays: int = Field(ge=1, le=3650)
     description: str = Field(default="", max_length=1024)
     gateway: Optional[IPv4Address] = None
@@ -316,6 +321,11 @@ class _CiScopePayload(BaseModel):
     @field_validator("gateway", mode="before")
     @classmethod
     def normalize_gateway(cls, v: object) -> object:
+        return None if v == "" else v
+
+    @field_validator("startRange", "endRange", mode="before")
+    @classmethod
+    def normalize_range_bound(cls, v: object) -> object:
         return None if v == "" else v
 
     @field_validator("dnsDomain", mode="before")
@@ -388,6 +398,11 @@ class _CiScopePayload(BaseModel):
 
     @model_validator(mode="after")
     def end_range_gte_start_range(self) -> "_CiScopePayload":
+        # Runs before resolve_default_range below, so an omitted range is still None
+        # here — and a derived one is ordered by construction. Mirrors the same guard
+        # in DhcpScopeBody.end_range_gte_start_range.
+        if self.startRange is None or self.endRange is None:
+            return self
         if int(self.endRange) < int(self.startRange):
             raise ValueError(
                 f"endRange {self.endRange} must be >= startRange {self.startRange}"
@@ -408,6 +423,35 @@ class _CiScopePayload(BaseModel):
                 f'Set gateway explicitly, or set it to "" for no gateway.'
             )
         self.gateway = IPv4Address((int(self.network) & ~0xFF) | 254)
+        return self
+
+    # Mirrors DhcpScopePayload.resolve_default_range in app/models/scope.py, and the
+    # chart's dhcp.distributionRange in helm-charts-hostedclusters-setup. Both bounds
+    # omitted derives .1–.253; one alone is rejected as a half-specified pair.
+    @model_validator(mode="after")
+    def resolve_default_range(self) -> "_CiScopePayload":
+        start_set = self.startRange is not None
+        end_set = self.endRange is not None
+        if start_set and end_set:
+            return self
+        if start_set or end_set:
+            missing, present = (
+                ("endRange", "startRange") if start_set else ("startRange", "endRange")
+            )
+            raise ValueError(
+                f"{missing} is required when {present} is set: the distribution range "
+                f"must be given as a pair, or left out entirely to derive "
+                f".{_DERIVED_RANGE_FIRST_OCTET}–.{_DERIVED_RANGE_LAST_OCTET}"
+            )
+        if self.subnetMask != _DEFAULT_SUBNET_MASK:
+            raise ValueError(
+                f"startRange and endRange are required when subnetMask is "
+                f"{self.subnetMask}: the default range is only derivable for "
+                f"{_DEFAULT_SUBNET_MASK}. Set both explicitly."
+            )
+        base = int(self.network) & ~0xFF
+        self.startRange = IPv4Address(base | _DERIVED_RANGE_FIRST_OCTET)
+        self.endRange = IPv4Address(base | _DERIVED_RANGE_LAST_OCTET)
         return self
 
     @model_validator(mode="after")
@@ -486,11 +530,11 @@ def _nested_present(data: dict, *keys: str) -> bool:
 #
 # scopeName is absent because it defaults to the cluster file's own stem — see
 # _validate_dhcp_content. Demanding it here would reject exactly the files this is meant
-# to allow.
+# to allow. startRange/endRange are absent for the same reason: they derive to .1–.253
+# (_CiScopePayload.resolve_default_range). They are still validated as a *pair* there —
+# one without the other is an error, it just is not a missing-required-field error.
 _REQUIRED_PATHS: list[tuple[str, ...]] = [
     ("dhcp_values", "network"),
-    ("dhcp_values", "startRange"),
-    ("dhcp_values", "endRange"),
     ("dhcp_values", "leaseDurationDays"),
     ("dhcp_values", "dns", "servers"),
 ]
@@ -547,6 +591,8 @@ def _validate_dhcp_content(cluster_path: Path, merged: dict) -> list[str]:
     kwargs = {
         "scopeName":         scope_name,
         "network":           dv.get("network"),
+        # Passed unconditionally, unlike subnetMask/gateway below: a range bound has no
+        # "unset" state, so absent and null both mean "derive" and both arrive as None.
         "startRange":        dv.get("startRange"),
         "endRange":          dv.get("endRange"),
         "leaseDurationDays": dv.get("leaseDurationDays"),

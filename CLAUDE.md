@@ -56,14 +56,34 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 - Per-architecture boot files (BIOS vs UEFI) need Windows DHCP *policies* matching option 93
   and are deliberately **not** modelled here
 
-**Derived defaults** (`subnetMask`, `gateway`, `scopeName`, `failover.relationshipName` — the only four)
+**Derived defaults** (`subnetMask`, `gateway`, `scopeName`, `failover.relationshipName`,
+`startRange` + `endRange` — the only six)
 
 - Omitting the key derives it: `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`,
-  `scopeName` → the hosted cluster's own name, `relationshipName` → `<scopeName>-failover`
+  `scopeName` → the hosted cluster's own name, `relationshipName` → `<scopeName>-failover`,
+  the range → the subnet's `.1`–`.253`
 - Writing `null` or `""` is honoured as written — for `gateway` that means no DHCP option 3.
-  `scopeName` and `relationshipName` are the exceptions: `""` counts as omitted and derives,
-  matching Helm's `default`, because a nameless scope is not a state anything can hold
-- Any mask other than `255.255.255.0` with no explicit gateway is a hard error, not a guess
+  `scopeName`, `relationshipName` and the range bounds are the exceptions: `""` counts as
+  omitted and derives, matching Helm's `default`, because neither a nameless scope nor one
+  distributing no addresses is a state anything can hold
+- Any mask other than `255.255.255.0` with no explicit gateway is a hard error, not a guess.
+  Same for the range: the `.1`–`.253` convention only holds for a /24
+- **The range derives as a pair.** One bound without the other is rejected (422 / CI error),
+  like the PXE pair — completing half a range from a subnet-wide default would put a
+  deliberate edge opposite an implied one
+- **`.253`, not `.254`, and that is load-bearing.** The derived gateway is `.254`; a range
+  ending there would sit on top of it, and `gateway_not_in_distribution_range` would 422
+  every values file that omitted both. Stopping one address short is what lets the minimal
+  file — a bare `network:` — resolve to a valid scope
+- **The derived bounds ignore the exclusion list.** Exclusions already carve holes inside a
+  Windows range, so `.1`–`.253` minus the exclusions *is* "every address that is not
+  excluded". Moving the bounds to fit the exclusions would couple two derivations that have
+  to stay byte-identical across three implementations, one of them in Go templates
+- Deriving the range is **fail-open by construction** — it widens the pool to the whole /24
+  rather than the narrow band a values file used to state. The guard that keeps it honest is
+  `gateway_not_in_distribution_range`: an explicit gateway at `.1` that used to sit safely
+  below `startRange` is now inside the pool and is refused until an exclusion covers it. Do
+  not soften that check to make the derivation more convenient
 - `relationshipName` only applies when a `failover` block is present; `failover: null` stays
   `null`. Windows caps the name at 64 chars, so a `scopeName` long enough to overflow that
   fails the render and CI rather than being truncated — which caps a *derived* `scopeName`,
@@ -75,7 +95,8 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
   three — and one of the three is in another repo, so it will not fail your local tests.
 - `scopeName` and `relationshipName` are the exception to "three places": the API model keeps
   both **required**, because the API only ever receives a resolved value. Only the chart and
-  the CI validator derive them.
+  the CI validator derive them. The range is *not* an exception — it derives from the scope
+  address, which the API has in the URL, so all three resolve it.
 
 **`scopeName` comes from the cluster's file name**
 
@@ -157,16 +178,18 @@ still matches the payload shape in §5.
 - **Crossplane object name** — based only on `dhcp_values.network`: `dhcp-scope-{network-dashed}`. Changing `scopeName` does NOT create a new CR.
 - **Request URL** — `dhcp_values.network` is baked into `payload.baseUrl` at template time (`{dhcp_api.url}/api/v1/scopes/{network}`); all four mappings then use `(.payload.baseUrl)`. The address is deliberately absent from `payload.body`. Note `network` remains a required **values file** key — only the rendered request body drops it.
 - **`payload.body` is a JSON *string*, not a mapping** — provider-http types the field as a string and the API server rejects an object outright (`must be of type string`). `dhcp.payload` therefore emits JSON text, written field by field rather than piped through `toJson`, because Go marshals a map with its keys sorted and that would destroy the canonical field order in §5. The mappings parse it back with jq (`.payload.body`).
-- **Bearer token via a header placeholder** — `Authorization: "Bearer {{ name:namespace:key }}"`, resolved by provider-http against the live Secret at reconcile time and stored only in placeholder form in `spec`, `status.requestDetails` and its logs. **Not** `secretInjectionConfigs`: that field runs the opposite direction, extracting HTTP *response* fields into a Secret. All three of `dhcp_api.tokenSecretRef.{name,namespace,key}` are required or the header is omitted entirely — a half-resolved placeholder would be sent as literal text.
-- **Required fields** — `helm template` fails hard if missing: `dhcp_values.network`, `startRange`, `endRange`, `leaseDurationDays`, `dns.servers`, `dhcp_api.url`
-- **Derived fields** — `subnetMask`, `gateway` and `scopeName` may be omitted; the chart resolves them (`dhcp.defaultGateway` and `dhcp.scopeName` in `_dhcp-helpers.tpl`) rather than passing the omission through, so the rendered body always carries concrete values. A non-/24 mask with no gateway fails the render. `scopeName` resolves from the `clusterName` parameter (§2); with neither that nor an explicit value the render fails rather than silently skipping — a skip is what the old gate did, and it hid the misconfiguration.
+- **Bearer token via a header placeholder** — `Authorization: "Bearer {{ name:namespace:key }}"`, resolved by provider-http against the live Secret at reconcile time and stored only in placeholder form in `spec`, `status.requestDetails` and its logs. **Not** `secretInjectionConfigs`: that field runs the opposite direction, extracting HTTP *response* fields into a Secret. `dhcp_api.tokenSecretRef.{name,key}` are both required or the header is omitted entirely — a half-resolved placeholder would be sent as literal text. `namespace` defaults to the **Request's own namespace**, the same variable that renders `metadata.namespace`: the Secret is meant to sit beside the CR, so naming it twice would only create two things to keep in step. An explicit value still wins, for a Secret that genuinely lives elsewhere. It is written into the placeholder rather than inherited at reconcile time, because provider-http parses it with a regex demanding exactly three literal segments and never passes the CR's namespace in. A placeholder that fails that regex is **left in the header as literal text with no error raised**, so a wrong namespace surfaces as a 401 naming nothing.
+- **The Request is the namespaced kind** — `http.m.crossplane.io/v1alpha2`, Crossplane v2's `.m.` group. provider-http ships two separate Request CRDs, not two versions of one: the legacy `http.crossplane.io/v1alpha2` is `scope: Cluster`. Consequences: `metadata.namespace` is always rendered (an object without one lands in `default`); `providerConfigRef` requires **both** `kind` and `name`, and references a `ClusterProviderConfig`/`ProviderConfig` **in the `.m.` group** — the legacy ProviderConfig of the same name cannot satisfy it; and `spec.deletionPolicy` does not exist on this kind, so writing it is silently pruned by the CRD. Deletion comes from `managementPolicies`, which the chart writes out as `["*"]` rather than leaving to the CRD's default — full management is what makes a deleted CR delete the scope, and left implicit a future default change would silently strip `Delete` and strand scopes on the Windows server.
+- **Required fields** — `helm template` fails hard if missing: `dhcp_values.network`, `leaseDurationDays`, `dns.servers`, `dhcp_api.url`
+- **Derived fields** — `subnetMask`, `gateway`, `scopeName` and the `startRange`/`endRange` pair may be omitted; the chart resolves them (`dhcp.defaultGateway`, `dhcp.scopeName` and `dhcp.distributionRange` in `_dhcp-helpers.tpl`) rather than passing the omission through, so the rendered body always carries concrete values. A non-/24 mask with no gateway, or with no range, fails the render; so does half a range. `scopeName` resolves from the `clusterName` parameter (§2); with neither that nor an explicit value the render fails rather than silently skipping — a skip is what the old gate did, and it hid the misconfiguration.
 - **The chart's `values.yaml` is the base of every merge** — a key set there cannot be unset by a site or cluster file. That is why it ships no `dhcp_values` at all: a worked example there would give every hosted cluster the same `scopeName` and `network`, colliding on one Request object name.
 - **The whole template is gated on `dhcp_values.network`**, so a cluster with no DHCP block renders nothing. Three things make that the right key and not a workaround:
   - It is the scope's identity (§5) and the only `dhcp_values` key a cluster's *own* file ever sets. `sites/configValues.yaml` gives every cluster a `dhcp_values` block (lease, DNS, failover defaults), so inheriting one is not opting in — having a subnet is.
   - It was gated on `scopeName` until that gained a default. Now that `scopeName` resolves for every cluster, leaving the gate there would be the same as deleting it.
   - Deleting it is not an option: the air-gapped copy of this chart also carries the `HostedCluster` / `NodePool`, so an ungated Request would make the `required` on `network` fail the **whole** render for a cluster that never asked for a scope.
   - Gated on `hasKey`, not truthiness, so an absent `network` (no scope wanted) and `network: ""` (a malformed scope) stay different: the first renders nothing, the second reaches the `required` guard instead of disappearing silently.
-- **ProviderConfig** — configurable via `crossplane.providerConfigName` (default: `dhcp-http`)
+- **ProviderConfig** — configurable via `crossplane.providerConfigName` (default: `dhcp-http`) and `crossplane.providerConfigKind` (default: `ClusterProviderConfig`). Both must name an object in the `.m.` group.
+- **CR namespace** — `crossplane.namespace`, defaulting to `hcp-<clusterName>` (`dhcp.crNamespace`). It is **also** the token Secret's namespace, so one value decides both and they cannot drift. Unresolvable is a hard render failure, not a rendered `hcp-`: `clusterName` defaults to `""`, so the derived form would otherwise produce a garbage namespace for any render that skipped the appset's `--set`. The connected chart copy pins it to `dhcp-scope-manager` in its own `values.yaml` — where the shared token Secret already lives, so the CR and the Secret agree without a second key. The air-gapped copy drops the key and gets `hcp-<clusterName>` for both, each hosted cluster holding its own token beside its own Request. It is a property of the chart copy, not of the ApplicationSet, which passes no namespace parameter.
 
 ## 5. API Contract
 
@@ -235,12 +258,13 @@ POST/PUT request body, and the GET response for a single scope — identical by 
 PUT is **diff-based convergence** in what it *writes* — only changed sections trigger
 PowerShell — but the body it diffs against is a **full replacement**, not a patch. An
 omitted optional field resolves to its default and is then applied: omitting `dnsDomain`,
-`nextServer` / `bootFile` or `exclusions` clears them on the server. That is deliberate
-and load-bearing for GitOps — if omission meant "leave alone", deleting a line from a
-values file could never remove anything, and Git would stop being authoritative. It is
-also a footgun for anyone calling the API by hand; `tests/integration/` pins it so it
-cannot change unnoticed. Required fields are `scopeName`, `startRange`, `endRange`,
-`leaseDurationDays`, `dnsServers`.
+`nextServer` / `bootFile` or `exclusions` clears them on the server, and omitting the
+range **widens the pool to the derived `.1`–`.253`** rather than leaving it alone. That is
+deliberate and load-bearing for GitOps — if omission meant "leave alone", deleting a line
+from a values file could never remove anything, and Git would stop being authoritative. It
+is also a footgun for anyone calling the API by hand; `tests/integration/` pins it so it
+cannot change unnoticed. Required fields are `scopeName`, `leaseDurationDays`,
+`dnsServers`.
 
 | Section      | Changed when                       | PowerShell cmdlet                            |
 | ------------ | ---------------------------------- | -------------------------------------------- |
@@ -382,7 +406,7 @@ Changed-file resolution:
 - `<site>/values.yaml` changed → validate all clusters under `<site>`
 - `sites/configValues.yaml` changed → full repo scan
 
-Validates: IP format, subnet consistency, range ordering, gateway in subnet, exclusions in subnet, failover mode fields.
+Validates: IP format, subnet consistency, range ordering, range given as a pair (or omitted and derived), gateway in subnet, exclusions in subnet, failover mode fields.
 
 ## 12. Testing Requirements
 

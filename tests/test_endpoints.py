@@ -573,6 +573,69 @@ async def test_non_24_mask_without_gateway_returns_422():
     assert "gateway is required when subnetMask is 255.255.0.0" in str(err["details"])
 
 
+async def test_post_omitting_the_range_resolves_the_derived_bounds():
+    """A body carrying no range reaches the service layer with .1–.253 resolved.
+
+    The service only ever sees resolved values, which is what keeps the cmdlet
+    builder free of defaulting logic of its own.
+    """
+    body = _make_scope_dict()
+    del body["startRange"]
+    del body["endRange"]
+    del body["gateway"]
+    with patch("app.services.scope_service.create_scope",
+               return_value=_make_scope()) as mock_create:
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 200
+    payload = mock_create.call_args[0][0]
+    assert str(payload.startRange) == "10.20.30.1"
+    assert str(payload.endRange) == "10.20.30.253"
+
+
+async def test_put_omitting_the_range_resolves_the_derived_bounds():
+    """PUT is a full replacement (§6), so dropping the keys re-derives rather than keeps.
+
+    Deleting the lines from a values file is a live range change, not a no-op — the
+    same rule that makes an omitted dnsDomain clear the option.
+    """
+    body = _make_scope_dict()
+    del body["startRange"]
+    del body["endRange"]
+    del body["gateway"]
+    with patch("app.services.scope_service.update_scope",
+               return_value=_make_scope()) as mock_update:
+        r = await client.put("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 200
+    # update_scope(scope, desired) — the payload is the second positional arg
+    payload = mock_update.call_args[0][1]
+    assert str(payload.startRange) == "10.20.30.1"
+    assert str(payload.endRange) == "10.20.30.253"
+
+
+async def test_half_specified_range_returns_422():
+    """One bound without the other is a 422, not a silently completed range."""
+    body = _make_scope_dict()
+    del body["endRange"]
+    r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 422
+    err = _error(r.json())
+    assert err["code"] == "VALIDATION_ERROR"
+    assert "endRange is required when startRange is set" in str(err["details"])
+
+
+async def test_non_24_mask_without_range_returns_422():
+    body = _make_scope_dict(subnetMask="255.255.0.0", gateway="10.20.0.1")
+    del body["startRange"]
+    del body["endRange"]
+    r = await client.post("/api/v1/scopes/10.20.0.0", json=body)
+    assert r.status_code == 422
+    err = _error(r.json())
+    assert err["code"] == "VALIDATION_ERROR"
+    assert "startRange and endRange are required when subnetMask is 255.255.0.0" in str(
+        err["details"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # GET /scopes — list all scopes
 # ---------------------------------------------------------------------------

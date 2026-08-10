@@ -507,3 +507,46 @@ class TestDerivedDefaultParity:
         )
         assert str(payload.subnetMask) == "255.255.255.0"
         assert str(payload.gateway) == "10.20.30.254"
+
+    def test_api_derives_dot_1_to_dot_253_when_the_range_is_omitted(self):
+        payload = DhcpScopePayload(
+            scope="10.20.30.0",
+            scopeName="Cluster-A",
+            leaseDurationDays=8,
+            dnsServers=["10.50.1.5"],
+        )
+        assert str(payload.startRange) == "10.20.30.1"
+        assert str(payload.endRange) == "10.20.30.253"
+
+    def test_derived_range_matches_what_get_reports_back(self):
+        """The loop-proof: a body that omits the range equals the GET of the scope it creates.
+
+        A derived value only stays stable if the DHCP server ends up holding exactly
+        what the derivation produced. Assembling the GET response from a server whose
+        scope runs .1–.253 and comparing it to the resolved body is that check —
+        anything else here would be a permanent diff and a PUT every 60 seconds.
+        """
+        resolved = DhcpScopePayload(
+            scope="10.20.30.0",
+            scopeName="Cluster-A",
+            leaseDurationDays=8,
+            description="",
+            dnsServers=["10.50.1.5", "10.50.1.6"],
+            dnsDomain="lab.local",
+        ).body().model_dump(mode="json")
+
+        got = _assemble(
+            _ps_scope(StartRange="10.20.30.1", EndRange="10.20.30.253"),
+            # Option 3 carries the derived .254 the same way it carries any other gateway.
+            _ps_options(options=[
+                {"OptionId": 3, "Value": ["10.20.30.254"]},
+                {"OptionId": 6, "Value": ["10.50.1.5", "10.50.1.6"]},
+                {"OptionId": 15, "Value": ["lab.local"]},
+            ]),
+            None,
+        )
+        assert got == resolved, (
+            f"derived range does not survive the round trip!\n"
+            f"resolved body: {json.dumps(resolved, indent=2)}\n"
+            f"GET response:  {json.dumps(got, indent=2)}"
+        )

@@ -36,6 +36,7 @@ dhcp_values:
   # Set it only to override that.
   network: "10.20.30.0"
   subnetMask: "255.255.255.0" # optional; this is the default, so it can be omitted
+  # optional as a pair; omit both to derive 10.20.30.1 – 10.20.30.253
   startRange: "10.20.30.11"
   endRange: "10.20.30.240"
   leaseDurationDays: 8
@@ -76,8 +77,6 @@ dhcp_values:
 | Field               | Type         | Constraints                                     | Description                                                          |
 | ------------------- | ------------ | ----------------------------------------------- | -------------------------------------------------------------------- |
 | `network`           | IPv4         | must be exact network address                   | Scope ID — used in all PowerShell cmdlets and the Crossplane CR name |
-| `startRange`        | IPv4         | in subnet, not network/broadcast                | First IP in the DHCP distribution range                              |
-| `endRange`          | IPv4         | in subnet, not network/broadcast, >= startRange | Last IP in the DHCP distribution range                               |
 | `leaseDurationDays` | integer      | 1–3650                                          | Lease duration sent to clients                                       |
 | `dns.servers`       | list of IPv4 | at least one required                           | DNS servers sent to clients (DHCP option 6)                          |
 
@@ -86,6 +85,8 @@ dhcp_values:
 | Field         | Type           | Default             | Description                                                                |
 | ------------- | -------------- | ------------------- | -------------------------------------------------------------------------- |
 | `scopeName`   | string         | the cluster's file name, without `.yaml` | Display name for the scope on the DHCP server. 1–256 chars, not blank. Set it only to override the file name — see below. |
+| `startRange`  | IPv4           | the subnet's `.1`   | First IP in the DHCP distribution range. In subnet, not the network/broadcast address. Omit it **together with `endRange`** to derive; requires a /24. |
+| `endRange`    | IPv4           | the subnet's `.253` | Last IP in the DHCP distribution range. In subnet, not the network/broadcast address, `>= startRange`. Omit it **together with `startRange`** to derive; requires a /24. |
 | `description` | string         | `""`                | Free-text scope description. `null` and omitting are both treated as `""`. |
 | `subnetMask`  | IPv4           | `255.255.255.0`     | Contiguous mask; combined with `network` must form a valid subnet. `null` and `""` also mean the default — there is no "no subnet mask". |
 | `gateway`     | IPv4 or `""`   | the subnet's `.254` | Default gateway/router option. **Omit it** to derive `.254`; write `""` or `null` for no option 3. When set, must be in the subnet. If inside `[startRange, endRange]`, must be covered by an exclusion. |
@@ -136,25 +137,28 @@ Mappings need none of this. A cluster file's `failover` block deep-merges onto t
 
 ---
 
-## Derived defaults: `subnetMask`, `gateway` and `failover.relationshipName`
+## Derived defaults
 
-These three are the only fields the stack fills in for you. **Omitting the key is what
-triggers the default** — anything you actually write is honoured as written.
+`subnetMask`, `gateway`, `startRange` + `endRange`, `scopeName` and
+`failover.relationshipName` are the only fields the stack fills in for you. **Omitting the
+key is what triggers the default** — anything you actually write is honoured as written.
 
 ```yaml
-# The common case: a /24 whose router is at .254. Write neither key.
+# The common case: a /24 whose router is at .254. Write none of them.
 dhcp_values:
   network: "10.20.30.0"
   # subnetMask -> 255.255.255.0
   # gateway    -> 10.20.30.254
+  # startRange -> 10.20.30.1
+  # endRange   -> 10.20.30.253
 ```
 
-| What you write        | What the scope gets      |
-| --------------------- | ------------------------ |
-| neither key           | `255.255.255.0`, `.254`  |
-| `gateway: ""`         | no DHCP option 3         |
-| `gateway: null`       | no DHCP option 3         |
-| `gateway: "10.20.30.1"` | that address           |
+| What you write          | What the scope gets     |
+| ----------------------- | ----------------------- |
+| neither key             | `255.255.255.0`, `.254` |
+| `gateway: ""`           | no DHCP option 3        |
+| `gateway: null`         | no DHCP option 3        |
+| `gateway: "10.20.30.1"` | that address            |
 
 A `subnetMask` other than `255.255.255.0` **requires** an explicit `gateway`. The `.254`
 convention only holds for a /24, so rather than guessing, `helm template` fails and the
@@ -178,6 +182,60 @@ trigger a PUT every 60 seconds forever.
 
 Note that the chart's `values.yaml` is the base of every Helm merge, so a key set there cannot be
 unset by a site or cluster file. Both keys ship absent from it for that reason.
+
+### `startRange` and `endRange` derive to `.1`–`.253`
+
+Omit both and the scope distributes the whole /24 except the addresses the derivation
+holds back. Exclusions then carve holes out of it, exactly as they do for a range you
+write by hand:
+
+```yaml
+dhcp_values:
+  network: "10.20.30.0"
+  # startRange -> 10.20.30.1
+  # endRange   -> 10.20.30.253
+  exclusions:
+    - startAddress: "10.20.30.1"
+      endAddress: "10.20.30.10" # .11 upwards is what actually gets leased
+```
+
+Four rules govern it:
+
+- **Both keys or neither.** One bound alone is rejected by CI and by the API with `422`,
+  the same way half a `pxe` pair is. Completing the missing edge from a subnet-wide
+  default would put an implied bound opposite a deliberate one.
+- **`null` and `""` derive too.** Unlike `gateway`, there is no "no range" state to
+  express — every scope distributes something — so all three forms mean the same thing.
+- **`.253`, not `.254`.** `.254` is the derived gateway. A range ending there would put
+  the router inside the leasable pool, which the gateway-in-range rule below rejects — so
+  the minimal file would be invalid, and the default would be useless.
+- **A /24 only.** As with `gateway`, any other mask needs both bounds written out.
+
+**The exclusion list does not move the bounds.** `.1`–`.253` is fixed; the exclusions are
+what remove addresses from it. That keeps the derivation reproducible in all three places
+(chart, API, CI) without any of them reimplementing exclusion arithmetic.
+
+**This widens the pool, so check your gateway.** A file that used to say
+`startRange: "10.20.30.11"` with `gateway: "10.20.30.1"` was safe because `.1` sat below
+the range. Delete the range lines and `.1` is inside the pool — CI and the API both refuse
+it until an exclusion covers the gateway:
+
+```yaml
+# Rejected — the derived range covers the gateway
+network: "10.20.30.0"
+gateway: "10.20.30.1"
+
+# Fine — the exclusion keeps it from being leased
+network: "10.20.30.0"
+gateway: "10.20.30.1"
+exclusions:
+  - startAddress: "10.20.30.1"
+    endAddress: "10.20.30.10"
+```
+
+Removing an explicit range from a file that already has a live scope is a **real change**,
+not a cleanup: PUT is full-replacement, so the scope's range widens on the next
+reconciliation. The effective pool only grows by whatever your exclusions do not cover.
 
 ### `scopeName` comes from the file name
 
@@ -256,9 +314,13 @@ dns:
 For `description` and `dns.domain`, `null`, a bare empty YAML value, and omitting the key are also accepted. Use `""` as the canonical form because it is explicit and unambiguous in all YAML parsers.
 
 `gateway` is the exception: omitting it does **not** mean "unset", it means "derive the
-subnet's `.254`" (see [Derived defaults](#derived-defaults-subnetmask-and-gateway)). Write
+subnet's `.254`" (see [Derived defaults](#derived-defaults)). Write
 `gateway: ""` when you genuinely want no router option — that is the only form that says so
 without ambiguity.
+
+The range bounds have no "unset" form at all: `startRange: ""` derives `.1` rather than
+clearing anything, because a scope that distributes no addresses is not a state Windows
+can hold.
 
 For optional non-scalar fields, use the field's natural empty value:
 

@@ -8,9 +8,22 @@ from app.utils.ip_utils import ip_to_int
 from app.models.exclusion import DhcpExclusion
 from app.models.failover import DhcpFailover
 
-# The only mask for which a gateway can be derived. Any other mask requires an
-# explicit gateway — see DhcpScopePayload.resolve_default_gateway.
+# The only mask for which a gateway or a distribution range can be derived. Any other
+# mask requires both explicitly — see DhcpScopePayload.resolve_default_gateway and
+# resolve_default_range.
 DEFAULT_SUBNET_MASK = IPv4Address("255.255.255.0")
+
+# Host octets of the derived distribution range: the whole /24 except the network
+# address, the broadcast address, and .254.
+#
+# .254 is held back because it is the derived gateway (.255 is the broadcast address and
+# validate_subnet_consistency refuses it outright). Ending at .254 would make the two
+# derivations collide on every values file that omits both — the gateway would sit inside
+# the distribution range uncovered by any exclusion, which
+# gateway_not_in_distribution_range rejects. Stopping one short means the minimal file
+# (a bare `network:`) resolves to a valid scope instead of a 422.
+DERIVED_RANGE_FIRST_OCTET = 1
+DERIVED_RANGE_LAST_OCTET = 253
 
 
 class DhcpScopeBody(BaseModel):
@@ -57,14 +70,37 @@ class DhcpScopeBody(BaseModel):
         if v is None or v == "":
             return DEFAULT_SUBNET_MASK
         return v
-    startRange: IPv4Address = Field(
-        description="First IP address in the DHCP distribution range",
+    startRange: Optional[IPv4Address] = Field(
+        default=None,
+        description=(
+            "First IP address in the DHCP distribution range. Omit it — together with "
+            "endRange — to derive the subnet's .1 address; requires a /24."
+        ),
         examples=["10.20.30.100"],
     )
-    endRange: IPv4Address = Field(
-        description="Last IP address in the DHCP distribution range",
+    endRange: Optional[IPv4Address] = Field(
+        default=None,
+        description=(
+            "Last IP address in the DHCP distribution range. Omit it — together with "
+            "startRange — to derive the subnet's .253 address; requires a /24."
+        ),
         examples=["10.20.30.200"],
     )
+
+    @field_validator("startRange", "endRange", mode="before")
+    @classmethod
+    def normalize_range_bound(cls, v: object) -> object:
+        """Normalize null/empty to None, the 'derive it' state.
+
+        Unlike gateway, a range bound has no 'unset' meaning — every DHCP scope
+        distributes some range — so omitted, null and "" all collapse to the same
+        derivation rather than needing to stay distinguishable. That is subnetMask's
+        treatment, not gateway's, and it is why this needs no model_fields_set dance
+        in validate_scope_request.
+        """
+        if v == "":
+            return None
+        return v
     leaseDurationDays: int = Field(
         ge=1,
         le=3650,
@@ -222,6 +258,14 @@ class DhcpScopeBody(BaseModel):
 
     @model_validator(mode="after")
     def end_range_gte_start_range(self) -> "DhcpScopeBody":
+        # Unresolved bounds are not comparable. Base-class validators run before the
+        # ones on DhcpScopePayload, so this sees the range before it is derived —
+        # unguarded, an omitted range would be a TypeError on None and so a 500
+        # rather than the 422 a bad body deserves. Both-or-neither is enforced in
+        # DhcpScopePayload.resolve_default_range, and a derived range is ordered by
+        # construction, so nothing escapes by returning early here.
+        if self.startRange is None or self.endRange is None:
+            return self
         if int(self.endRange) < int(self.startRange):
             raise ValueError(
                 f"endRange {self.endRange} must be >= startRange {self.startRange}"
@@ -298,6 +342,57 @@ class DhcpScopePayload(DhcpScopeBody, _ScopeIdentity):
         # not a proper network address still yields the right .254, and the malformed
         # address itself is reported by validate_subnet_consistency below.
         self.gateway = IPv4Address((int(self.scope) & ~0xFF) | 254)
+        return self
+
+    # After resolve_default_gateway so a file omitting both reports the gateway problem
+    # first (it is the more specific one), and before the subnet/range guards below so
+    # they see resolved bounds rather than None.
+    @model_validator(mode="after")
+    def resolve_default_range(self) -> "DhcpScopePayload":
+        """Derive the distribution range from the scope address when both bounds are absent.
+
+        Two states, unlike gateway's three:
+          both omitted (or null/"")  -> derive <network>.1 – <network>.253
+          both addresses             -> used as written
+
+        Deliberately fixed rather than fitted around the exclusions: exclusions already
+        carve holes inside a Windows range, so `.1–.253` minus the exclusions *is* "every
+        address that is not excluded". Making the bounds themselves move with the
+        exclusion list would couple two derivations that have to stay identical here, in
+        the CI validator and in the chart.
+
+        .253 rather than .254 keeps the derived range clear of the derived gateway — see
+        DERIVED_RANGE_LAST_OCTET.
+
+        Both-or-neither, like the PXE pair: a half-specified range would leave the other
+        edge silently at a subnet-wide default, which is the fail-open case this rule is
+        shaped to avoid.
+        """
+        start_set = self.startRange is not None
+        end_set = self.endRange is not None
+        if start_set and end_set:
+            return self
+        if start_set or end_set:
+            missing, present = (
+                ("endRange", "startRange") if start_set else ("startRange", "endRange")
+            )
+            raise ValueError(
+                f"{missing} is required when {present} is set: the distribution range "
+                f"must be given as a pair, or left out entirely to derive "
+                f".{DERIVED_RANGE_FIRST_OCTET}–.{DERIVED_RANGE_LAST_OCTET}"
+            )
+        if self.subnetMask != DEFAULT_SUBNET_MASK:
+            raise ValueError(
+                f"startRange and endRange are required when subnetMask is "
+                f"{self.subnetMask}: the default range is only derivable for "
+                f"{DEFAULT_SUBNET_MASK}. Set both explicitly."
+            )
+        # Mask the host octet rather than adding to the scope address, for the same
+        # reason as the gateway: a malformed scope address still yields the right
+        # octets, and the address itself is reported by validate_subnet_consistency.
+        base = int(self.scope) & ~0xFF
+        self.startRange = IPv4Address(base | DERIVED_RANGE_FIRST_OCTET)
+        self.endRange = IPv4Address(base | DERIVED_RANGE_LAST_OCTET)
         return self
 
     @model_validator(mode="after")
