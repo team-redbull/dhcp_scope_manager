@@ -908,13 +908,14 @@ class TestDnsExtraServers:
 # ─── scopeName default ────────────────────────────────────────────────────────
 
 class TestScopeNameDefault:
-    """Omitting scopeName derives it from the cluster file's own name.
+    """Omitting scopeName derives it from the cluster file's own name, uppercased.
 
     One values file is one hosted cluster is one DHCP scope, so the file name already
     carries the name. Mirrors the chart's dhcp.scopeName, which derives the same value
     from the clusterName parameter hcAppset.yaml passes it — Helm never sees file names,
     so the appset has to inject it. Resolved in both places because each has to work
-    without the other.
+    without the other, and the two must agree character for character: the case is part
+    of the value Crossplane compares the GET response against.
     """
 
     def _errors(self, tmp_path, cluster_yaml: str, stem: str = "cluster") -> list[str]:
@@ -948,15 +949,31 @@ class TestScopeNameDefault:
     def test_omitted_scope_name_is_accepted(self, tmp_path):
         assert self._errors(tmp_path, self._NO_SCOPE_NAME) == []
 
-    def test_omitted_scope_name_derives_the_file_stem(self, tmp_path):
+    def test_omitted_scope_name_derives_the_uppercased_file_stem(self, tmp_path):
         captured = self._payload(tmp_path, self._NO_SCOPE_NAME, stem="prep-tlv-gpu")
-        assert captured["scopeName"] == "prep-tlv-gpu"
+        assert captured["scopeName"] == "PREP-TLV-GPU"
+
+    def test_a_mixed_case_file_name_derives_fully_uppercased(self, tmp_path):
+        """The whole stem is upper-cased, not just its first letter — a half-cased
+        name would still differ from the chart's `upper` and re-PUT forever."""
+        captured = self._payload(tmp_path, self._NO_SCOPE_NAME, stem="Prep-TLV-gpu")
+        assert captured["scopeName"] == "PREP-TLV-GPU"
 
     def test_explicit_scope_name_beats_the_file_name(self, tmp_path):
         captured = self._payload(
             tmp_path, _minimal_cluster_yaml(), stem="prep-tlv-gpu"
         )
         assert captured["scopeName"] == "Test Scope"
+
+    def test_explicit_scope_name_is_not_uppercased(self, tmp_path):
+        """Only the derivation upper-cases. A name someone wrote by hand is passed
+        through as written — rewriting it would silently rename their scope, and the
+        chart does not rewrite it either."""
+        values = _minimal_cluster_yaml().replace(
+            "  scopeName: Test Scope\n", "  scopeName: quiet-name\n"
+        )
+        captured = self._payload(tmp_path, values, stem="prep-tlv-gpu")
+        assert captured["scopeName"] == "quiet-name"
 
     def test_blank_scope_name_still_derives(self, tmp_path):
         """An empty string is an omission, not a name — same as the chart's
@@ -965,7 +982,7 @@ class TestScopeNameDefault:
             "  scopeName: Test Scope\n", '  scopeName: ""\n'
         )
         captured = self._payload(tmp_path, values, stem="prep-tlv-gpu")
-        assert captured["scopeName"] == "prep-tlv-gpu"
+        assert captured["scopeName"] == "PREP-TLV-GPU"
 
     def test_scope_name_is_no_longer_a_required_field(self, tmp_path):
         """It has a default now, so demanding it would reject the very files this
@@ -985,7 +1002,9 @@ class TestScopeNameDefault:
             "    maxClientLeadTimeMinutes: 60\n",
         )
         captured = self._payload(tmp_path, values, stem="prep-tlv-gpu")
-        assert captured["failover"]["relationshipName"] == "prep-tlv-gpu-failover"
+        # The scope name half is uppercased, the "-failover" suffix is the literal both
+        # implementations append. Mixed case on purpose: the chart does exactly this.
+        assert captured["failover"]["relationshipName"] == "PREP-TLV-GPU-failover"
 
     def test_derived_relationship_name_over_64_chars_names_the_file(self, tmp_path):
         """Windows caps the relationship name at 64, so a derived one caps the file

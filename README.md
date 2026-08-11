@@ -654,15 +654,18 @@ produces them lives elsewhere:
   through `toJson` would sort the keys and break it.
 - **Derived defaults are resolved at render time**, not passed through as omissions.
   `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`, `scopeName` → the
-  hosted cluster's own name. GET reports the concrete value the DHCP server holds, so a
-  body that said `null` would diff forever. A non-/24 mask with no explicit gateway
-  fails the render.
-- **`scopeName` comes from the cluster's values-file name.** One values file is one
-  hosted cluster is one DHCP scope, so `<cluster>.yaml` already carries the name; writing
-  it in the file is only an override. Helm has no notion of which file a value came from,
-  so the ApplicationSet injects it as a `clusterName` Helm parameter — deliberately a
-  chart-owned key rather than `--set dhcp_values.scopeName`, since parameters outrank
-  `valueFiles` and would make an explicit value impossible to honour.
+  hosted cluster's own name in capitals. GET reports the concrete value the DHCP server
+  holds, so a body that said `null` would diff forever. A non-/24 mask with no explicit
+  gateway fails the render.
+- **`scopeName` comes from the cluster's values-file name, upper-cased.** One values file
+  is one hosted cluster is one DHCP scope, so `<cluster>.yaml` already carries the name;
+  writing it in the file is only an override, and an explicit name is used exactly as
+  written. Helm has no notion of which file a value came from, so the ApplicationSet
+  injects it as a `clusterName` Helm parameter — deliberately a chart-owned key rather
+  than `--set dhcp_values.scopeName`, since parameters outrank `valueFiles` and would
+  make an explicit value impossible to honour. `clusterName` itself is not upper-cased:
+  it also names the Argo Application and the CR's `hcp-<cluster>` namespace, which
+  Kubernetes requires to be lowercase, so the capitals live in `dhcp.scopeName` alone.
 - **The template is gated on `dhcp_values.network`**, the one key only a cluster's own
   file sets, so a cluster with no DHCP block renders nothing instead of failing. It
   cannot be gated on `scopeName` any more — that now resolves for every cluster.

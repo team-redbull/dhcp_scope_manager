@@ -60,7 +60,8 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 `startRange` + `endRange` — the only six)
 
 - Omitting the key derives it: `subnetMask` → `255.255.255.0`, `gateway` → the subnet's `.254`,
-  `scopeName` → the hosted cluster's own name, `relationshipName` → `<scopeName>-failover`,
+  `scopeName` → the hosted cluster's own name **upper-cased**, `relationshipName` →
+  `<scopeName>-failover`,
   the range → the subnet's `.1`–`.253`
 - Writing `null` or `""` is honoured as written — for `gateway` that means no DHCP option 3.
   `scopeName`, `relationshipName` and the range bounds are the exceptions: `""` counts as
@@ -98,17 +99,29 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
   the CI validator derive them. The range is *not* an exception — it derives from the scope
   address, which the API has in the URL, so all three resolve it.
 
-**`scopeName` comes from the cluster's file name**
+**`scopeName` comes from the cluster's file name, upper-cased**
 
 - One values file *is* one hosted cluster *is* one DHCP scope, so `<cluster>.yaml` already
   carries the name. Repeating it inside the file could only ever be redundant or wrong
-- An explicit `scopeName` anywhere in the merge chain still wins, so nothing already written
-  had to change when this landed
+- An explicit `scopeName` anywhere in the merge chain still wins, and is used **exactly as
+  written** — only the derivation upper-cases, because only the derivation is inventing a
+  name. Upper-casing explicit names too would rename live scopes nobody touched
+- The corollary, and the one thing that is not free: deleting a `scopeName` line is a no-op
+  only when the name already *was* the upper-cased file name. Dropping `scopeName: cluster-a`
+  from `cluster-a.yaml` derives `CLUSTER-A`, a different string, so the scope takes a rename
+  PUT — and if `relationshipName` also derives, a failover *recreate* (§6). Pinned by
+  `test_deleting_a_differently_cased_scope_name_renames_the_scope` in the chart repo
+- **The upper-casing lives in `dhcp.scopeName` and `_validate_dhcp_content` only.**
+  `clusterName` itself must stay as written: it also names the Argo Application and derives
+  the CR's `hcp-<cluster>` namespace, and Kubernetes requires that lowercase
 - **Helm has no notion of which file a value came from** — it merges the four `valueFiles`
   into one flat `.Values`. So the name cannot be derived inside the chart from the values
   alone: `hcAppset.yaml` injects it as a `clusterName` Helm *parameter*, from the same
   `.path.filename | trimSuffix` expression that names the Application. The CI validator has
   the path in hand and uses `cluster_path.stem` instead
+- The chart applies `upper` **after** its `.yaml`-suffix guard, not before: `".yaml"`
+  upper-cased is `".YAML"`, which `hasSuffix ".yaml"` no longer matches, so reordering the
+  two silently disarms the guard. `test_cluster_name_with_a_file_suffix_fails` pins the order
 - It must be a chart-owned key, **not** `--set dhcp_values.scopeName`: helm parameters
   outrank `valueFiles`, so injected there an explicit `scopeName` in a values file could
   never win

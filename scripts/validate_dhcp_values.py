@@ -569,13 +569,19 @@ def _validate_dhcp_content(cluster_path: Path, merged: dict) -> list[str]:
     dns = dv.get("dns") or {}
     pxe = dv.get("pxe") or {}
 
-    # scopeName defaults to the cluster file's own name, the same derivation the chart's
-    # dhcp.scopeName makes from the clusterName parameter hcAppset.yaml passes it. One
-    # values file is one hosted cluster is one DHCP scope, so the file name already *is*
-    # the name. An explicit scopeName anywhere in the merge chain still wins; falsy
-    # (including "") counts as omitted, matching Helm's `default`.
+    # scopeName defaults to the cluster file's own name, uppercased — the same derivation
+    # the chart's dhcp.scopeName makes from the clusterName parameter hcAppset.yaml passes
+    # it. One values file is one hosted cluster is one DHCP scope, so the file name already
+    # *is* the name. An explicit scopeName anywhere in the merge chain still wins, and is
+    # passed through exactly as written: only the derivation upper-cases, because only the
+    # derivation is inventing a name. Falsy (including "") counts as omitted, matching
+    # Helm's `default`.
+    #
+    # The upper-casing is on the scope name alone. clusterName itself must stay as written
+    # — it also names the Argo Application and derives the CR's hcp-<cluster> namespace,
+    # which Kubernetes requires to be lowercase.
     scope_name_was_derived = not dv.get("scopeName")
-    scope_name = dv.get("scopeName") or cluster_path.stem
+    scope_name = dv.get("scopeName") or cluster_path.stem.upper()
 
     # relationshipName defaults to <scopeName>-failover, the same derivation the
     # chart's dhcp.payload makes. Resolve it here too or a values file that omits
@@ -625,8 +631,9 @@ def _validate_dhcp_content(cluster_path: Path, merged: dict) -> list[str]:
             # where the value actually came from and how to override it.
             if scope_name_was_derived and loc in ("scopeName", "failover.relationshipName"):
                 msg += (
-                    f" (scopeName was derived from the file name {cluster_path.name}; "
-                    "set dhcp_values.scopeName explicitly to override)"
+                    f" (scopeName was derived from the file name {cluster_path.name}, "
+                    f"uppercased to {scope_name!r}; set dhcp_values.scopeName explicitly "
+                    "to override)"
                 )
             errors.append(f"{path}: {msg}")
 

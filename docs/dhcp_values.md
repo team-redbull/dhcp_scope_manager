@@ -32,8 +32,8 @@ somewhere in the chain.
 ```yaml
 # sites/site1/mces/prep-mce-tlv-a/hostedClusters/cluster-a-workers.yaml
 dhcp_values:
-  # scopeName is omitted: it derives from this file's name, "cluster-a-workers".
-  # Set it only to override that.
+  # scopeName is omitted: it derives from this file's name, upper-cased —
+  # "CLUSTER-A-WORKERS". Set it only to override that.
   network: "10.20.30.0"
   subnetMask: "255.255.255.0" # optional; this is the default, so it can be omitted
   # optional as a pair; omit both to derive 10.20.30.1 – 10.20.30.253
@@ -84,7 +84,7 @@ dhcp_values:
 
 | Field         | Type           | Default             | Description                                                                |
 | ------------- | -------------- | ------------------- | -------------------------------------------------------------------------- |
-| `scopeName`   | string         | the cluster's file name, without `.yaml` | Display name for the scope on the DHCP server. 1–256 chars, not blank. Set it only to override the file name — see below. |
+| `scopeName`   | string         | the cluster's file name, without `.yaml`, upper-cased | Display name for the scope on the DHCP server. 1–256 chars, not blank. Set it only to override the file name — an explicit value is used as written, never upper-cased. See below. |
 | `startRange`  | IPv4           | the subnet's `.1`   | First IP in the DHCP distribution range. In subnet, not the network/broadcast address. Omit it **together with `endRange`** to derive; requires a /24. |
 | `endRange`    | IPv4           | the subnet's `.253` | Last IP in the DHCP distribution range. In subnet, not the network/broadcast address, `>= startRange`. Omit it **together with `startRange`** to derive; requires a /24. |
 | `description` | string         | `""`                | Free-text scope description. `null` and omitting are both treated as `""`. |
@@ -237,16 +237,16 @@ Removing an explicit range from a file that already has a live scope is a **real
 not a cleanup: PUT is full-replacement, so the scope's range widens on the next
 reconciliation. The effective pool only grows by whatever your exclusions do not cover.
 
-### `scopeName` comes from the file name
+### `scopeName` comes from the file name, upper-cased
 
 One values file is one hosted cluster is one DHCP scope, so `<cluster>.yaml` already carries
-the scope's name. Omit the key and it derives:
+the scope's name. Omit the key and it derives, in capitals:
 
 ```yaml
 # sites/site1/mces/prep-mce-tlv-a/hostedClusters/cluster-a-workers.yaml
 dhcp_values:
   network: "10.20.30.0"
-  # scopeName -> cluster-a-workers
+  # scopeName -> CLUSTER-A-WORKERS
 ```
 
 Write it only to override:
@@ -257,10 +257,22 @@ dhcp_values:
   network: "10.20.30.0"
 ```
 
+**Only the derivation upper-cases.** A name you write by hand is used exactly as written —
+`legacy-name-kept-for-continuity` above stays lowercase. Upper-casing explicit names too
+would rename live scopes that nobody touched.
+
+The corollary: deleting a `scopeName` line is a no-op **only** when the name was already the
+upper-cased file name. Delete `scopeName: "cluster-a"` from `cluster-a.yaml` and the derived
+`CLUSTER-A` is a different string, so the scope takes a one-time rename PUT on the next
+reconciliation. Cheap — `Set-DhcpServerv4Scope`, no lease impact — but not nothing, and if
+the file also derives `relationshipName` that is a failover *recreate* (see below).
+
 An explicit value anywhere in the merge chain wins, and `""` counts as omitted (there is no
 "nameless scope" state to express). Helm never sees the names of the files it is handed, so
 the ApplicationSet injects the cluster's name as a `clusterName` parameter; the CI validator
-takes it from the file path directly.
+takes it from the file path directly. The parameter itself is *not* upper-cased — it also
+names the Argo Application and the CR's `hcp-<cluster>` namespace, both of which Kubernetes
+requires to be lowercase. The capitals exist only in the scope name the DHCP server holds.
 
 > **Renaming a cluster file renames the scope — but that is the least of it.** The Argo
 > Application is named after the file too, so a `git mv` deletes and recreates the
@@ -272,11 +284,11 @@ for the scope itself — Windows keys scopes by ScopeId, not name — but their 
 *relationship* names would collide on the shared server pair, so set `relationshipName`
 explicitly if both use failover.
 
-> **How to stop managing a scope changed with this.** Deleting `scopeName` no longer does
-> anything — it just derives again. Remove the whole `dhcp_values` block, or at minimum
-> `network`, which is what the template is gated on. With `prune: false` the existing
-> `Request` is left orphaned rather than deleted, so this stops managing the scope without
-> removing it from the DHCP server.
+> **How to stop managing a scope changed with this.** Deleting `scopeName` does not stop
+> anything — the name just derives again, and may rename the scope on the way (above).
+> Remove the whole `dhcp_values` block, or at minimum `network`, which is what the template
+> is gated on. With `prune: false` the existing `Request` is left orphaned rather than
+> deleted, so this stops managing the scope without removing it from the DHCP server.
 
 ### `failover.relationshipName`
 
@@ -292,6 +304,13 @@ dhcp_values:
     maxClientLeadTimeMinutes: 60
     # relationshipName -> cluster-a-workers-failover
 ```
+
+The suffix is appended to `scopeName` verbatim, so a *derived* name gives the mixed-case
+`CLUSTER-A-WORKERS-failover`. Deliberate: both the chart and CI append the same lowercase
+literal, and that agreement is what matters — the two must produce the same string character
+for character or Crossplane re-PUTs forever. Note a `relationshipName` change is a failover
+**recreate**, not a rename, so a file that derives both fields pays more for the switch to
+capitals than one that names its relationship explicitly.
 
 Windows caps the name at 64 characters, so a `scopeName` long enough to overflow that is
 a hard error in both the render and CI rather than a silent truncation. When the `scopeName`
