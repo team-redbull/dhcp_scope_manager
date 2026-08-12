@@ -1,16 +1,22 @@
 # Single-source DHCP API token — changes to apply in the air-gapped repos
 
-Everything done in this change set, per repo, in apply order. Most of it is a
-straight port: the GitHub-side commits are the reference, and only the items marked
-**AIR-GAPPED ONLY** have no counterpart to copy from.
+Everything done in this change set, per repo, in apply order. The GitHub-side commits
+are the reference for anything you port; items marked **AIR-GAPPED ONLY** have no
+counterpart to copy from.
 
-**What this fixes.** The DHCP API bearer token existed in three places and was
-authored in two repos:
+**Two things are out of scope here:**
+
+- **`dhcp_scope_manager` source.** You transfer the image, not the code — repo 1 is a
+  behaviour note plus an `image.tag` bump, nothing to port.
+- **`segment-lifecycle-worker` / `workflows`.** Not deployed air-gapped. Those repos
+  changed on the GitHub side too; port them whenever that service lands here.
+
+**What this fixes.** The DHCP API bearer token existed in two places air-gapped and
+was authored in two repos:
 
 | Where (before) | Namespace | Authored in | After |
 | --- | --- | --- | --- |
 | mgmt cluster | `dhcp-scope-manager` | `oc create secret` out of band | **kept**, now rendered from one committed value |
-| mgmt cluster | `redbull-workflows` | out of band, "must stay in sync" | **deleted** — its only consumer was a GET, and GETs are anonymous now |
 | every MCE | `hcp-<cluster>` × N | `hostedclusters-setup`, once per hosted cluster | **one per MCE**, in `dhcp-scope-manager` |
 
 After this, rotation is one commit in one file plus one `oc rollout restart`.
@@ -19,20 +25,15 @@ After this, rotation is one commit in one file plus one `oc rollout restart`.
 
 ## ⚠️ Apply order
 
-The order matters in three places. Everything else can land in any sequence.
+Only one ordering constraint really bites. Everything else can land in any sequence.
 
-1. **`dhcp_scope_manager` (the API image) first.** It makes the scope `GET`s
-   anonymous. Nothing else may land before the new image is actually running.
-2. **`helm-charts/dhcp-scope-manager` + `gitops-day2-prod` next** — this is what puts
-   one token Secret on the mgmt cluster and on every MCE.
-3. **`helm-charts/hostedclusters-setup` after that.** It repoints every Request at the
-   shared Secret. Landing it before step 2 means every scope *write* 401s until the
-   Secret arrives. (Reads keep working — they need no token.)
-4. **`workflows` + `helm-charts/segment-lifecycle-worker` only after step 1 is live.**
-   They delete the worker's token; before anonymous GET is deployed, its convergence
-   poll would 401 on every attempt.
-
-Steps 2 and 4 are safe to do in either order relative to each other.
+1. **Transfer the new API image and bump `image.tag`** — it makes the scope `GET`s
+   anonymous and removes the test-runner endpoint. Independent of the token work.
+2. **`helm-charts/dhcp-scope-manager` + `gitops-day2-prod`** — this is what puts one
+   token Secret on the mgmt cluster and on every MCE.
+3. **`helm-charts/hostedclusters-setup` after step 2.** ← the constraint. It repoints
+   every Request at the shared Secret, so landing it first means every scope *write*
+   401s until that Secret arrives. (Reads keep working — they need no token.)
 
 ### Before you start
 
@@ -50,70 +51,41 @@ design. Never sync that line in either direction.
 
 ---
 
-## Repo 1: `dhcp_scope_manager` — anonymous scope GETs, test runner removed
+## Repo 1: `dhcp_scope_manager` — **nothing to port, transfer the image**
 
-Port the commits as-is. Two independent changes ship together here.
+The air-gapped side runs this as a prebuilt image, so none of the source changes
+need porting. **Move the new image tag across and bump `image.tag`** — everything
+below is what that image behaves like, not work for you to do.
 
-### a. Scope `GET`s become unauthenticated
+### a. Scope `GET`s are now unauthenticated
 
-`app/routers/scopes.py` splits its one router in two. Writes keep `verify_token`;
-reads drop it. Two routers rather than per-route dependencies, because FastAPI
-cannot subtract a router-level dependency from a single route — and this way the
-safe case is the default: a route added to `router` inherits auth, and anonymity has
-to be chosen deliberately.
+`GET /api/v1/scopes/{scope}` and `GET /api/v1/scopes` no longer check the bearer
+token. `POST`, `PUT` and `DELETE` still do, and `/healthz` was already exempt.
 
-```diff
-+router = APIRouter(
-+    prefix="/api/v1", tags=["scopes"],
-+    dependencies=[Depends(verify_token), Depends(require_dhcp_service)],
-+)
-+
-+read_router = APIRouter(
-+    prefix="/api/v1", tags=["scopes"],
-+    dependencies=[Depends(require_dhcp_service)],
-+)
-```
-
-Both `GET` handlers move to `read_router`; `app/routers/__init__.py` includes both.
-`require_dhcp_service` stays on reads — a `GET` still talks to the DHCP server.
-
-**Why:** `segment-lifecycle-worker`'s `allocate_segment` polls
-`GET /api/v1/scopes/{network}` to confirm Crossplane converged. Behind auth, that
-poll needed the token in its own namespace (Secrets are namespace-scoped and
-`envFrom` resolves per-pod), so a second copy lived in `redbull-workflows` and had to
-rotate in step with the first. Opening reads deleted that copy.
-
-**What it costs, and it is real:** a `GET` returns the full scope state — mask,
+**What it costs, and it is real here:** a `GET` returns the full scope state — mask,
 ranges, gateway, DNS servers, DNS domain, PXE boot server, exclusions, failover
-partner hostname — and `GET /api/v1/scopes` returns every scope at once. Crossplane
-reaches the API through the OpenShift Route in this environment, so the Route cannot
-be turned off as a mitigation: **the whole addressing plan is readable by anything
-that can reach that Route.** Writes stay authenticated, so integrity is unchanged.
+partner hostname — and the list route returns every scope at once. Crossplane
+reaches the API through the OpenShift Route in this environment, so **turning that
+Route off is not available as a mitigation**: the whole addressing plan is readable
+by anything that can reach it. Writes stay authenticated, so integrity is unchanged.
 
-Pinned by `test_route_auth_matrix`, which asserts the exact set of anonymous routes
-so a new route cannot join them by accident.
+The change was driven by `segment-lifecycle-worker`, which polls a `GET` to confirm
+Crossplane converged and needed its own copy of the token to do it. That worker is
+not deployed here — the API behaviour ships regardless.
 
-### b. `POST /api/v1/test-runs` and everything behind it, deleted
+### b. `POST /api/v1/test-runs` is gone — **this changes how you test**
 
-**This is the one that changes how you test air-gapped.** The deployed API can no
-longer run its own pytest suite. Deleted: `app/routers/testrunner.py`,
-`app/services/test_runner.py`, `app/models/test_run.py`, three `ErrorCode` members
-and their error classes, `TEST_RUNNER_*` settings, `tests/test_testrunner.py`.
+The deployed API can no longer run its own pytest suite. The endpoint, its service
+and models are removed, the image no longer ships `tests/` or `scripts/`, and
+`pytest` is no longer installed in it. There is no in-cluster way to run the suite
+any more.
 
-Three supporting changes went with it, and **all three have to be reverted together**
-if the endpoint is ever wanted back:
-
-- `requirements.txt` no longer carries `pytest` / `pytest-asyncio` / `httpx`; they
-  moved to a new `requirements-dev.txt`.
-- The `Dockerfile` no longer does `COPY tests/` or `COPY scripts/`.
-- `.github/workflows/test.yml` installs `requirements-dev.txt` as well. **If the
-  air-gapped side builds the image or runs the suite through its own pipeline,
-  that pipeline needs the same `-r requirements-dev.txt`**, or collection fails.
-
-Run the suite from a checkout instead. `tests/integration/` still self-skips unless
+Run it from a checkout instead — `pip install -r requirements.txt -r
+requirements-dev.txt`, then `pytest`. `tests/integration/` still self-skips unless
 `DHCP_IT=1`.
 
----
+The second `dhcp-scope-manager-tests` release existed only to host that endpoint and
+is deleted too (repo 5).
 
 ## Repo 2: `helm-charts/dhcp-scope-manager` — the token subchart
 
@@ -170,7 +142,7 @@ kept its startup value.** Nothing replaces it.
 
 The chart creates the Secret now, so "existing" actively misleads. Change in
 `values.yaml`, `templates/deployment.yaml`, and every values file that sets it — see
-repo 6. **Leave `winrm.existingSecret` alone**: that one genuinely is created out of
+repo 5. **Leave `winrm.existingSecret` alone**: that one genuinely is created out of
 band, and after this rename the two names finally mean different things.
 
 `templates/deployment.yaml` loses its conditional:
@@ -317,34 +289,11 @@ helm template hc . --set clusterName=<cluster> -f <cluster values> | grep -E "^ 
 
 ---
 
-## Repo 5: `workflows` + `helm-charts/segment-lifecycle-worker` — drop the token
-
-**Only after the new API image is live.** Not deployed air-gapped today, so this is
-low risk here — port it for consistency.
-
-- `activities/segment_lifecycle/activities.py` — `_dhcp_api_client()` drops the
-  `Authorization` header; keeps `base_url` and timeout.
-- `shared/settings.py` — remove `dhcp_api_token`. Keep `dhcp_api_url`.
-- `.env.example` — remove `DHCP_API_TOKEN`.
-- worker chart `templates/config.yaml` — delete the `dhcp-api-token` Secret template.
-- worker chart `templates/activity-worker.yaml` — delete the `envFrom.secretRef`
-  entry for it. **This one matters operationally:** an `envFrom` naming a Secret that
-  no longer exists blocks pod start, so the template and the Secret must go together.
-- worker chart `values.yaml` — remove `secrets.existingDhcpSecret` and
-  `secrets.dhcpApiToken`.
-
-`allocate_segment`'s `awaiting-dhcp-scope` phase is unchanged — it still polls and
-still has its convergence deadline. Only the header goes.
-
----
-
-## Repo 6: `redbull-platform` (or its air-gapped equivalent)
+## Repo 5: `redbull-platform` (or its air-gapped equivalent)
 
 - `gitops/services/prod/dhcp-scope-manager/values.yaml` — `apiAuth.existingSecret` →
   `apiAuth.secretName` (same value, `dhcp-scope-manager-token`). Drop the
   `oc create secret` instructions and the "rotate the two together" note.
-- `gitops/services/prod/segment-lifecycle-worker/values.yaml` — remove
-  `existingDhcpSecret`.
 - **DELETE `gitops/services/prod/dhcp-scope-manager-tests/`** — the second release
   existed to host the test-runner endpoint, which is gone.
 - `gitops/SECRETS.md` — new row for the DHCP token.
@@ -361,9 +310,6 @@ grep -rn "apiAuth" .
 ## Live cleanup, after everything is synced
 
 ```sh
-# The worker's copy — no longer referenced by anything
-oc delete secret dhcp-api-token -n redbull-workflows
-
 # Should be exactly ONE per MCE, in dhcp-scope-manager
 oc --context <mce> get secret -A -l app.kubernetes.io/name=dhcp-api-token
 
