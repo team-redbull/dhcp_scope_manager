@@ -109,9 +109,6 @@ class ErrorCode:
     POWERSHELL_COMMAND_FAILED = "POWERSHELL_COMMAND_FAILED"
     POWERSHELL_TIMEOUT = "POWERSHELL_TIMEOUT"
     DHCP_ENVIRONMENT_UNAVAILABLE = "DHCP_ENVIRONMENT_UNAVAILABLE"
-    TEST_TARGET_REFUSED = "TEST_TARGET_REFUSED"
-    TEST_RUN_IN_PROGRESS = "TEST_RUN_IN_PROGRESS"
-    TEST_RUN_NOT_FOUND = "TEST_RUN_NOT_FOUND"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     BAD_REQUEST = "BAD_REQUEST"
     NOT_FOUND = "NOT_FOUND"
@@ -203,63 +200,4 @@ class ImmutableScopeFieldError(AppError):
             f"holds {current}, the request asks for {desired}. Windows cannot "
             f"change it in place — the scope must be deleted and recreated.",
             details={"field": field, "current": current, "desired": desired},
-        )
-
-
-class TestTargetRefusedError(AppError):
-    """The requested test target is a host this deployment must not test against.
-
-    The live suite creates and deletes a real scope, so pointing it at a DHCP
-    server that something depends on is destructive. Refused before any subprocess
-    starts, rather than trusting whoever composed the request — a typo in a
-    hostname is not a reason to write to production.
-    """
-
-    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
-    code = ErrorCode.TEST_TARGET_REFUSED
-    # Not a pytest test class — the name only starts with Test because it is
-    # about test *runs*. Without this pytest tries to collect it.
-    __test__ = False
-
-    def __init__(self, host: str) -> None:
-        self.host = host
-        super().__init__(
-            f"Refusing to run tests against '{host}': it is a protected DHCP "
-            f"server for this deployment. The live suite creates and deletes "
-            f"scopes, so it may only target a dedicated test server.",
-            details={"host": host},
-        )
-
-
-class TestRunInProgressError(AppError):
-    """One run at a time — concurrent suites would fight over the same test scope."""
-
-    status_code = status.HTTP_409_CONFLICT
-    code = ErrorCode.TEST_RUN_IN_PROGRESS
-    # Not a pytest test class — the name only starts with Test because it is
-    # about test *runs*. Without this pytest tries to collect it.
-    __test__ = False
-
-    def __init__(self, run_id: str) -> None:
-        super().__init__(
-            f"Test run {run_id} is still in progress. Only one run may execute at "
-            f"a time: the suite owns a single scope and concurrent runs would "
-            f"delete each other's state mid-test.",
-            details={"runId": run_id},
-        )
-
-
-class TestRunNotFoundError(AppError):
-    status_code = status.HTTP_404_NOT_FOUND
-    code = ErrorCode.TEST_RUN_NOT_FOUND
-    # Not a pytest test class — the name only starts with Test because it is
-    # about test *runs*. Without this pytest tries to collect it.
-    __test__ = False
-
-    def __init__(self, run_id: str) -> None:
-        super().__init__(
-            f"No test run {run_id} on this instance. Runs are held in memory by "
-            f"the pod that started them, so polling a different replica than the "
-            f"one that accepted the POST will not find it.",
-            details={"runId": run_id},
         )

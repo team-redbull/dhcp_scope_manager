@@ -30,15 +30,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 
-# The test suite ships in the image on purpose. requirements.txt already installs
-# pytest, pytest-asyncio and httpx, so this adds sources only — and it is what lets
-# POST /api/v1/test-runs execute the suite in an air-gapped environment, where there
-# is no CI and no package index to fetch anything from.
+# tests/ and scripts/ are deliberately NOT copied. They used to be, because the
+# deployed API could run its own pytest suite via POST /api/v1/test-runs — that
+# endpoint is gone, and with it the only thing in the image that read them. The
+# runtime deps shrank the same way: pytest, pytest-asyncio and httpx moved out of
+# requirements.txt into requirements-dev.txt.
 #
-# scripts/ comes too: tests/test_validate_*.py load the values-repo validators by
-# path, so without it 96 tests fail to collect and the whole run errors out.
-COPY tests/ ./tests/
-COPY scripts/ ./scripts/
+# If an in-image suite is ever wanted again (the air-gapped side has no CI and no
+# package index), all three have to come back together — sources, deps, endpoint.
 
 # OpenShift's restricted-v2 SCC runs the container as an arbitrary UID from the
 # namespace's range, NOT as the USER declared below, and always with GID 0. Files

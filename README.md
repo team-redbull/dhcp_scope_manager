@@ -62,18 +62,15 @@ app/
     failover.py              DhcpFailover — failover relationship configuration
     exclusion.py             DhcpExclusion — exclusion range
     list_response.py         DhcpScopeListResponse / DhcpScopeListError — GET /scopes response
-    test_run.py              TestRunRequest / TestTarget / TestRun — the test-runner contract
   routers/
     __init__.py              Aggregates all sub-routers into a single router — main.py imports only this
-    scopes.py                DHCP scope endpoints (POST/GET/PUT/DELETE /api/v1/scopes/{scope})
+    scopes.py                DHCP scope endpoints — two routers: authenticated writes, anonymous reads
     health.py                /healthz runtime capability check
-    testrunner.py            On-demand test execution (POST/GET /api/v1/test-runs)
   services/
     dhcp_service.py          Runtime guard (OS / PowerShell / DHCP cmdlets check)
     ps_executor.py           Async PowerShell command runner with timeout/error handling
     ps_parsers.py            Single-process GET script builder and PowerShell JSON normalization
     scope_service.py         Core scope lifecycle logic (create / get / update / delete)
-    test_runner.py           Runs the pytest suite in a subprocess with a scrubbed environment
   utils/
     decorators.py            Async-aware lightweight logging decorator for service calls
     ip_utils.py              IP integer conversion and TimeSpan parsing helpers
@@ -109,7 +106,6 @@ tests/
   test_edge_cases.py             Edge cases and boundary conditions
   test_security.py               PowerShell escaping and response sanitization
   test_service_unit.py           Focused scope_service create/get/delete/list behavior
-  test_testrunner.py             Test-runner guards: env scrubbing, host refusal, redaction
   test_validate_dhcp_values.py        CI validator — structure, YAML checks, filtering, deep merge
   test_validate_changed_clusters.py   Changed-file detection, inheritance resolution, git integration
   integration/                   Live suite — real app, real PSRP, real DHCP server. Skipped
@@ -169,7 +165,7 @@ pip install -r requirements.txt
 
 | Variable                               | Default   | Description                                                   |
 | -------------------------------------- | --------- | ------------------------------------------------------------- |
-| `DHCP_API_TOKEN`                       | _(empty)_ | Bearer token for auth. When unset, auth is disabled entirely. |
+| `DHCP_API_TOKEN`                       | _(empty)_ | Bearer token for auth on writes. When unset, auth is disabled entirely. Scope `GET`s and `/healthz` never check it. |
 | `HOST`                                 | `0.0.0.0` | Bind address                                                  |
 | `PORT`                                 | `8080`    | Bind port                                                     |
 | `LOG_LEVEL`                            | `INFO`    | Log level                                                     |
@@ -273,21 +269,13 @@ own, so each carries a leading `scope` field to identify itself.
 
 All `/api/v1/scopes*` endpoints share two implicit checks that run before the handler:
 
-- **Auth** — rejects requests when `DHCP_API_TOKEN` is set and the token is missing or wrong. Returns `401`. `/healthz` is deliberately outside this check, because it backs the readiness probe and a kubelet cannot send a token.
+- **Auth** — rejects **writes** when `DHCP_API_TOKEN` is set and the token is missing or wrong. Returns `401`. Three routes are deliberately outside this check: `/healthz`, because it backs the readiness probe and a kubelet cannot send a token, and both scope `GET`s (CLAUDE.md §10). `test_route_auth_matrix` pins that list.
 - **Environment guard** — rejects requests when DHCP automation cannot run. Under `local` that means the wrong OS, missing PowerShell, or no DHCP cmdlets; under `psrp` it means `pypsrp` missing, WinRM unreachable or unauthenticated, or no DHCP cmdlets on the target host. Returns `503`.
 
-There is one more group of routes, used only for on-demand test execution — see
-[Air-gapped environments](#air-gapped-environments):
-
-| Verb   | Path                       | Description                                                        |
-| ------ | -------------------------- | ------------------------------------------------------------------ |
-| `POST` | `/api/v1/test-runs`        | Run the whole suite against the DHCP server named in the body → `202` + `runId` |
-| `GET`  | `/api/v1/test-runs/{id}`   | Status, exit code and redacted output of one run                    |
-| `GET`  | `/api/v1/test-runs`        | Recent runs, summaries only                                         |
-
-These take **auth but not the environment guard**: they drive a DHCP server named
-in the request rather than this deployment's own, so a release that manages no
-scopes (and returns `503` from every scope route) can still run tests.
+Those routes plus `/healthz` are the whole API. A `/api/v1/test-runs` group used to
+sit alongside them, running this service's own pytest suite inside the pod; it is
+removed — see [Air-gapped environments](#air-gapped-environments) for what that
+means and what has to come back together if it is ever wanted again.
 
 Scope APIs use a real async execution path:
 
@@ -671,13 +659,15 @@ produces them lives elsewhere:
   cannot be gated on `scopeName` any more — that now resolves for every cluster.
 - **Bearer token** renders as `Authorization: "Bearer {{ name:namespace:key }}"`, which
   provider-http resolves against the live Secret at reconcile time, keeping the token out
-  of git. `name` and `key` are both required or the header is omitted entirely; `namespace`
-  defaults to the Request's own, the same variable that renders `metadata.namespace` — the
-  Secret sits beside the CR, so naming it twice would only create two things to keep in
-  step. An explicit value still wins. It is written into the placeholder rather than
-  inherited: provider-http's parser demands three literal segments and never sees the CR's
-  namespace, and a placeholder it cannot parse is passed through as literal text with no
-  error, so the symptom is a 401 naming nothing.
+  of git. `name` and `key` are both required or the header is omitted entirely. `namespace`
+  still defaults to the Request's own, but both chart copies set it explicitly to
+  `dhcp-scope-manager` and the default never runs: the token is one credential per
+  cluster, and letting it follow the CR would put a copy in every `hcp-<cluster>`
+  namespace. Reading it from another namespace needs no extra RBAC — provider-http's
+  ClusterRole grants `secrets/*` cluster-wide. It is written into the placeholder rather
+  than inherited: provider-http's parser demands three literal segments and never sees the
+  CR's namespace, and a placeholder it cannot parse is passed through as literal text with
+  no error, so the symptom is a 401 naming nothing.
 - **The Request is namespaced** — `http.m.crossplane.io/v1alpha2`, Crossplane v2's `.m.`
   group, which provider-http ships alongside a separate cluster-scoped `Request` in the
   legacy `http.crossplane.io` group. So `metadata.namespace` is always rendered,
@@ -848,8 +838,12 @@ Dependencies are installed with `pip install -r scripts/requirements.txt` (pydan
 
 ## Security and Safety
 
-- Bearer token auth via `DHCP_API_TOKEN` — optional; disabled when unset. `/healthz` is
-  the one exemption: it is the readiness probe, and a kubelet probe cannot send a token
+- Bearer token auth via `DHCP_API_TOKEN` — optional; disabled when unset. Three routes are
+  exempt: `/healthz`, because it is the readiness probe and a kubelet cannot send a token,
+  and both scope **GET**s, so `segment-lifecycle-worker`'s convergence poll needs no
+  credential of its own. Writes are always authenticated. An anonymous caller can read the
+  full scope inventory — that cost was accepted to remove a second copy of the token that
+  had to be rotated in step; see CLAUDE.md §10
 - Runtime environment guard rejects all scope operations on non-Windows / non-DHCP hosts
 - `-ErrorAction Stop` on every PowerShell command
 - PowerShell stderr is sanitized before returning to clients and before logging previews
@@ -965,85 +959,24 @@ under test. `DHCP_IT` is never set in the workflow.
 
 ### Air-gapped environments
 
-There is no CI on the air-gapped side, and no package index to install a test
-runner from. Instead **the deployed API runs its own suite on request**: the image
-already installs `pytest` from `requirements.txt` and carries `tests/`, so nothing
-extra has to cross the air gap.
+There is no CI on the air-gapped side and no package index, so the suite runs
+wherever a developer can reach a checkout — not inside the cluster.
 
-Deploy a second release of the chart whose only job is running tests:
+**The API used to run its own tests.** `POST /api/v1/test-runs` forked pytest in the
+pod, and a second `dhcp-scope-manager-tests` release existed to host it away from the
+pod Crossplane reconciles through. Both are removed. So are the things that made them
+work: `pytest`/`pytest-asyncio`/`httpx` moved from `requirements.txt` to
+`requirements-dev.txt`, and the image no longer copies `tests/` or `scripts/`.
 
-```bash
-helm install dhcp-scope-manager-tests . -f values-test.yaml -n dhcp-scope-manager
-oc port-forward svc/dhcp-scope-manager-tests 8080:8080 -n dhcp-scope-manager &
-
-# One token for both releases — the test release reads the production release's
-# Secret rather than minting a second credential, which is why it installs into
-# the same namespace.
-TOKEN=$(oc get secret dhcp-scope-manager-api-token -n dhcp-scope-manager \
-          -o jsonpath='{.data.api-token}' | base64 -d)
-```
-
-The release name differs from production's, so every resource resolves to
-`dhcp-scope-manager-tests` and nothing collides. Install the production release
-first: the test pod mounts its Secret and will not start without it.
-
-Start a run. **The DHCP server under test is named in the request, never stored in
-the chart** — so no values file can aim the destructive live suite anywhere:
-
-```bash
-curl -sX POST localhost:8080/api/v1/test-runs \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{
-        "target": {
-          "dhcpServerHost": "dhcp-test.lab.local",
-          "winrmUsername": "svc-dhcp-test",
-          "winrmPassword": "...",
-          "winrmAuth": "ntlm",
-          "winrmCertValidation": false
-        }
-      }'
-# → 202 {"runId":"a1b2c3d4e5f6","status":"running", ...}
-
-curl -s localhost:8080/api/v1/test-runs/a1b2c3d4e5f6 -H "Authorization: Bearer $TOKEN"
-# → {"status":"passed","exitCode":0,"output":"721 passed, 30 passed in 41.2s", ...}
-```
-
-`202` and polling rather than one blocking call: a live run takes minutes, far
-longer than an HTTP request should be held open.
-
-**Every run is the whole suite** — the mocked tests and `tests/integration`
-together. There is no suite selector: with one, a green run meant two different
-things depending on a field nobody looked at afterwards, and the cheap option
-verified nothing about the server the release was pointed at. `target` is
-therefore **required**, and a request without one is `422` rather than a run that
-quietly skips the live half (`tests/integration` self-skips unless `DHCP_IT` is
-set, which only a target sets). A body still carrying `suite` is rejected by
-`extra="forbid"`, not ignored.
-
-#### What stops this being dangerous
-
-| Guard | Effect |
-| --- | --- |
-| Environment is rebuilt, not inherited | The subprocess gets no `DHCP_*`/`WINRM_*` from the pod, so a mistyped target cannot silently fall back to the server this release manages |
-| Protected hosts refused | A target matching `dhcp.serverHost`, or any `testRunner.denyHosts` entry, returns `422 TEST_TARGET_REFUSED` before anything starts |
-| Token required | Generated into a Secret by the chart; the app treats an empty token as auth disabled, so the chart never leaves one empty |
-| Credentials not persisted | `winrmPassword` is a `SecretStr` held only for the subprocess — never in the run registry, a response, or a log |
-| Output redacted | Captured pytest output has the run's secrets stripped before it is returned |
-| One run at a time | The suite owns a single scope; concurrent runs would delete each other's state |
-
-The live suite creates and deletes exactly one scope, `10.77.88.0`, and touches
-nothing else.
-
-#### Why a separate release
-
-The route exists on every deployment of this image, including production. Running
-it there would put a full pytest run — and its memory spike — inside the pod
-Crossplane reconciles every hosted cluster's scope through. `values-test.yaml`
-gives it its own pod, its own limits, and no DHCP credentials at rest.
-
-That release sets `dhcp.transport: local`, so its own `/api/v1/scopes/*` routes
-return `503`. That is correct: it exists to run tests, not to manage DHCP. Its
-readiness probe is TCP rather than `/healthz` for the same reason.
+Bringing it back means bringing back all three together — endpoint, test sources, and
+runtime dependencies. Before doing that, re-derive the constraints the removed version
+was built around: a run had to be the whole suite (a selector made a green run
+ambiguous), the target server had to come from the request body with the pod's own
+`DHCP_*`/`WINRM_*` stripped from the subprocess (otherwise a mistyped target falls back
+to the server the release manages, and the live suite creates and deletes real scopes),
+protected hosts had to be refused before anything started, and captured output had to be
+redacted because a traceback echoes locals and a WinRM connection repr carries the
+credential.
 
 **Failover still cannot be tested on a single DHCP server.** Windows failover is a
 relationship between two *distinct* servers — `Add-DhcpServerv4Failover` refuses a

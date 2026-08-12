@@ -39,14 +39,19 @@ jobs:
           cache: pip
           cache-dependency-path: |
             requirements.txt
+            requirements-dev.txt
             scripts/requirements.txt
 
       - name: Install dependencies
+        # requirements-dev.txt carries pytest/pytest-asyncio/httpx. They used to be
+        # in requirements.txt because the deployed API ran its own suite; that
+        # endpoint is gone, so they are test-only now and stay out of the image.
+        #
         # scripts/requirements.txt is not redundant: tests/test_validate_*.py import
         # the validator scripts, which need PyYAML. It reaches the environment today
         # only as a transitive dependency of uvicorn[standard] — installing it
         # explicitly means a change to uvicorn's extras cannot quietly break CI.
-        run: pip install -r requirements.txt -r scripts/requirements.txt
+        run: pip install -r requirements.txt -r requirements-dev.txt -r scripts/requirements.txt
 
       - name: Run tests
         run: pytest -q

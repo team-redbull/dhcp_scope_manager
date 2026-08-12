@@ -147,10 +147,12 @@ DHCP scope lifecycle (create, read, update, delete) for OpenShift hosted cluster
 **Reconciliation safety**
 
 - No hidden defaults inside the API beyond the two derived above; everything else comes from Helm / Git values
-- API is stateless **for every scope route**. The one exception is the test runner
-  (`/api/v1/test-runs`), which keeps a bounded in-memory registry so a run started by
-  `POST` can be polled by `GET`. That is why a release people actually post runs to must
-  be single-replica — a second pod has never heard of the run id.
+- API is stateless, with no exceptions. It held one until the in-cluster test runner
+  (`/api/v1/test-runs`) was removed: that route kept a bounded in-memory registry so a
+  run started by `POST` could be polled by `GET`, which forced any release people posted
+  runs to to be single-replica — a second pod had never heard of the run id. Nothing
+  constrains replica count now. **Do not reintroduce per-pod state on any route**
+  without re-deriving that consequence.
 
 ## 3. GitOps Values Hierarchy
 
@@ -191,7 +193,7 @@ still matches the payload shape in §5.
 - **Crossplane object name** — based only on `dhcp_values.network`: `dhcp-scope-{network-dashed}`. Changing `scopeName` does NOT create a new CR.
 - **Request URL** — `dhcp_values.network` is baked into `payload.baseUrl` at template time (`{dhcp_api.url}/api/v1/scopes/{network}`); all four mappings then use `(.payload.baseUrl)`. The address is deliberately absent from `payload.body`. Note `network` remains a required **values file** key — only the rendered request body drops it.
 - **`payload.body` is a JSON *string*, not a mapping** — provider-http types the field as a string and the API server rejects an object outright (`must be of type string`). `dhcp.payload` therefore emits JSON text, written field by field rather than piped through `toJson`, because Go marshals a map with its keys sorted and that would destroy the canonical field order in §5. The mappings parse it back with jq (`.payload.body`).
-- **Bearer token via a header placeholder** — `Authorization: "Bearer {{ name:namespace:key }}"`, resolved by provider-http against the live Secret at reconcile time and stored only in placeholder form in `spec`, `status.requestDetails` and its logs. **Not** `secretInjectionConfigs`: that field runs the opposite direction, extracting HTTP *response* fields into a Secret. `dhcp_api.tokenSecretRef.{name,key}` are both required or the header is omitted entirely — a half-resolved placeholder would be sent as literal text. `namespace` defaults to the **Request's own namespace**, the same variable that renders `metadata.namespace`: the Secret is meant to sit beside the CR, so naming it twice would only create two things to keep in step. An explicit value still wins, for a Secret that genuinely lives elsewhere. It is written into the placeholder rather than inherited at reconcile time, because provider-http parses it with a regex demanding exactly three literal segments and never passes the CR's namespace in. A placeholder that fails that regex is **left in the header as literal text with no error raised**, so a wrong namespace surfaces as a 401 naming nothing.
+- **Bearer token via a header placeholder** — `Authorization: "Bearer {{ name:namespace:key }}"`, resolved by provider-http against the live Secret at reconcile time and stored only in placeholder form in `spec`, `status.requestDetails` and its logs. **Not** `secretInjectionConfigs`: that field runs the opposite direction, extracting HTTP *response* fields into a Secret. `dhcp_api.tokenSecretRef.{name,key}` are both required or the header is omitted entirely — a half-resolved placeholder would be sent as literal text. `namespace` still *defaults* to the Request's own namespace, but **both chart copies set it explicitly, to the same literal `dhcp-scope-manager`**, and the default is never what runs. The token is one credential per cluster, deployed there once by the `dhcp-api-token` subchart (§10); leaving it to default would put it back to one Secret per `hcp-<cluster>` namespace, which is N copies of one credential per MCE. Only a write needs it now — the GETs are anonymous (§10) — but a Request does write. It is written into the placeholder rather than inherited at reconcile time, because provider-http parses it with a regex demanding exactly three literal segments and never passes the CR's namespace in. A placeholder that fails that regex is **left in the header as literal text with no error raised**, so a wrong namespace surfaces as a 401 naming nothing — and that clause carries more weight now that the two namespaces are separate values and therefore *can* drift.
 - **The Request is the namespaced kind** — `http.m.crossplane.io/v1alpha2`, Crossplane v2's `.m.` group. provider-http ships two separate Request CRDs, not two versions of one: the legacy `http.crossplane.io/v1alpha2` is `scope: Cluster`. Consequences: `metadata.namespace` is always rendered (an object without one lands in `default`); `providerConfigRef` requires **both** `kind` and `name`, and references a `ClusterProviderConfig`/`ProviderConfig` **in the `.m.` group** — the legacy ProviderConfig of the same name cannot satisfy it; and `spec.deletionPolicy` does not exist on this kind, so writing it is silently pruned by the CRD. Deletion comes from `managementPolicies`, which the chart writes out as `["*"]` rather than leaving to the CRD's default — full management is what makes a deleted CR delete the scope, and left implicit a future default change would silently strip `Delete` and strand scopes on the Windows server.
 - **TLS to this API** — `forProvider.insecureSkipTLSVerify`, from `dhcp_api.insecureSkipTLSVerify`, default **true**. provider-http verifies the API's certificate, so an `https` `dhcp_api.url` served by an OpenShift Route fails every reconcile with `x509: certificate signed by unknown authority` — the ingress certificate is signed by the cluster's own CA, which the provider pod does not trust — and the request never leaves the provider. Costs nothing where the url is plain `http` to an in-cluster Service. The bearer token then rides an unverified connection, so it is turned off (an explicit `false`, honoured via `ternary` — sprig's `default` would read `false` as unset) once the provider trusts that CA, either through its trust bundle or a `forProvider.tlsConfig`, which the CRD's CEL rule refuses to combine with a `true` here.
 - **Required fields** — `helm template` fails hard if missing: `dhcp_values.network`, `leaseDurationDays`, `dns.servers`, `dhcp_api.url`
@@ -203,25 +205,25 @@ still matches the payload shape in §5.
   - Deleting it is not an option: the air-gapped copy of this chart also carries the `HostedCluster` / `NodePool`, so an ungated Request would make the `required` on `network` fail the **whole** render for a cluster that never asked for a scope.
   - Gated on `hasKey`, not truthiness, so an absent `network` (no scope wanted) and `network: ""` (a malformed scope) stay different: the first renders nothing, the second reaches the `required` guard instead of disappearing silently.
 - **ProviderConfig** — configurable via `crossplane.providerConfigName` (default: `dhcp-http`) and `crossplane.providerConfigKind` (default: `ClusterProviderConfig`). Both must name an object in the `.m.` group.
-- **CR namespace** — `crossplane.namespace`, defaulting to `hcp-<clusterName>` (`dhcp.crNamespace`). It is **also** the token Secret's namespace, so one value decides both and they cannot drift. Unresolvable is a hard render failure, not a rendered `hcp-`: `clusterName` defaults to `""`, so the derived form would otherwise produce a garbage namespace for any render that skipped the appset's `--set`. The connected chart copy pins it to `dhcp-scope-manager` in its own `values.yaml` — where the shared token Secret already lives, so the CR and the Secret agree without a second key. The air-gapped copy drops the key and gets `hcp-<clusterName>` for both, each hosted cluster holding its own token beside its own Request. It is a property of the chart copy, not of the ApplicationSet, which passes no namespace parameter.
+- **CR namespace** — `crossplane.namespace`, defaulting to `hcp-<clusterName>` (`dhcp.crNamespace`). It decides **only** where the Request lands; the token Secret's namespace is `dhcp_api.tokenSecretRef.namespace`, set explicitly and separately. They used to be one value, which is what forced a copy of the Secret into every hosted cluster's namespace. Unresolvable is a hard render failure, not a rendered `hcp-`: `clusterName` defaults to `""`, so the derived form would otherwise produce a garbage namespace for any render that skipped the appset's `--set`. The connected chart copy pins it to `dhcp-scope-manager`; the air-gapped copy drops the key and gets `hcp-<clusterName>`, one Request beside each hosted control plane. It is a property of the chart copy, not of the ApplicationSet, which passes no namespace parameter.
+- **Token namespace** — `dhcp_api.tokenSecretRef.namespace`, `dhcp-scope-manager` in **both** copies, which is the one namespace name used on every cluster. On the mgmt cluster it holds the API and its token; on an MCE it holds only the token, since the API runs elsewhere. Same name on purpose: it makes this key one literal everywhere, so the two chart copies cannot disagree about it. Reading it from another namespace needs no extra RBAC — provider-http's ClusterRole already grants `secrets/*` cluster-wide, which is exactly why one Secret per cluster is enough for every hosted cluster's Request.
 
 ## 5. API Contract
 
-| Verb     | Path                     | Description                                            |
-| -------- | ------------------------ | ------------------------------------------------------ |
-| `POST`   | `/api/v1/scopes/{scope}` | Create or ensure scope (idempotent)                    |
-| `GET`    | `/api/v1/scopes/{scope}` | Current canonical state (404 → Crossplane issues POST) |
-| `PUT`    | `/api/v1/scopes/{scope}` | Diff-based update                                      |
-| `DELETE` | `/api/v1/scopes/{scope}` | Delete scope (idempotent — 204 even if not found)      |
-| `GET`    | `/api/v1/scopes`         | List all scopes, sorted by scope address               |
-| `GET`    | `/healthz`               | Runtime capability check                               |
-| `POST`   | `/api/v1/test-runs`      | Run this service's whole suite (§12) — 202 + `runId`   |
-| `GET`    | `/api/v1/test-runs/{id}` | Run status, exit code, redacted output                 |
-| `GET`    | `/api/v1/test-runs`      | Recent runs, summaries only                            |
+| Verb     | Path                     | Auth | Description                                            |
+| -------- | ------------------------ | ---- | ------------------------------------------------------ |
+| `POST`   | `/api/v1/scopes/{scope}` | yes  | Create or ensure scope (idempotent)                    |
+| `GET`    | `/api/v1/scopes/{scope}` | **no** | Current canonical state (404 → Crossplane issues POST) |
+| `PUT`    | `/api/v1/scopes/{scope}` | yes  | Diff-based update                                      |
+| `DELETE` | `/api/v1/scopes/{scope}` | yes  | Delete scope (idempotent — 204 even if not found)      |
+| `GET`    | `/api/v1/scopes`         | **no** | List all scopes, sorted by scope address               |
+| `GET`    | `/healthz`               | **no** | Runtime capability check                               |
+**These six routes are the whole API.** `/api/v1/test-runs` used to be here too —
+`POST` forked pytest in the pod and `GET` polled the result — and is gone; §12 records
+what replaced it.
 
-The `test-runs` routes take auth but **not** the DHCP environment guard: they drive a
-server named in the request, not this deployment's own, so a release returning 503 from
-every scope route can still run tests.
+**Scope reads are anonymous, scope writes are not** — §10 records why, and
+`test_route_auth_matrix` pins the exact set.
 
 `{scope}` = IPv4 network address — **the sole identifier of the resource**.
 
@@ -365,15 +367,50 @@ construction, and equality is far easier to test than containment.
 - Bearer token auth via `DHCP_API_TOKEN` — optional; disabled when unset
 - Secrets never logged; PowerShell stderr sanitized before returning to clients
 
-**`/healthz` is the one route with no `verify_token`.** It is the Deployment's
-readiness probe, and a kubelet probe cannot send an Authorization header — it has no
-way to read a Secret. Behind auth it returned 401 to every probe, so the pod never
-became ready and never joined its Service; that is not theoretical, it is what the
-first token-generating release did. The response is a bare `{"status": "ok"}` or an
-error, so an anonymous caller learns only whether the DHCP server is reachable.
-Do not "fix" this by moving readiness to `tcpSocket`: that asks whether the process
-is up rather than whether this pod can reach the DHCP server, and would keep a pod
-that can serve nothing in the Service endpoints. Pinned by
+**The token is GitOps-managed and required — never generated, never created out of
+band.** The deploy chart used to `lookup`-then-`randAlphaNum` a Secret when none was
+supplied. Argo CD renders with `helm template`, where `lookup` returns nothing, so
+**every sync minted a new token while the running pod kept its startup value** —
+observed live, pod env and Secret disagreeing. Out-of-band `oc create secret` fixed
+that but left the live token invisible to git. Both paths are gone: one vendored
+subchart (`charts/dhcp-api-token`) renders the Secret from one committed value, and an
+absent value fails the render rather than producing something that authenticates
+nothing. That subchart is also what puts the token on each MCE — deployed standalone
+there, so the Crossplane Requests in every `hcp-<cluster>` namespace read one Secret
+per cluster instead of one apiece.
+
+**Three routes have no `verify_token`: `/healthz` and both scope GETs.** They are
+exempt for different reasons, and only one of them is a trade-off.
+
+`/healthz` is the Deployment's readiness probe, and a kubelet probe cannot send an
+Authorization header — it has no way to read a Secret. Behind auth it returned 401 to
+every probe, so the pod never became ready and never joined its Service; that is not
+theoretical, it is what the first token-generating release did. The response is a bare
+`{"status": "ok"}` or an error, so an anonymous caller learns only whether the DHCP
+server is reachable. Do not "fix" this by moving readiness to `tcpSocket`: that asks
+whether the process is up rather than whether this pod can reach the DHCP server, and
+would keep a pod that can serve nothing in the Service endpoints.
+
+The scope GETs are a deliberate confidentiality trade, taken to delete a credential.
+`segment-lifecycle-worker`'s `allocate_segment` polls `GET /api/v1/scopes/{scope}` to
+confirm Crossplane converged. Behind auth, that poll needed the token in its own
+namespace — Secrets are namespace-scoped and `envFrom` is resolved per-pod — so a
+second copy existed in `redbull-workflows` that had to be rotated in step with the
+first. Opening reads removed that copy and the whole class of drift with it.
+
+What it costs, stated plainly: a GET returns the full canonical state — mask, ranges,
+gateway, DNS servers, DNS domain, PXE boot server, exclusions, failover partner
+hostname — and the list route returns every scope at once, so an anonymous caller can
+read the entire addressing plan. In the air-gapped environment the API is reached
+through an OpenShift Route (which is why `insecureSkipTLSVerify` defaults true), so
+that is not confined to the cluster. **Writes stay authenticated**, so nothing about
+integrity changed. Do not widen this to `POST`/`PUT`/`DELETE` for a caller's
+convenience, and do not narrow it back without first giving the worker another way to
+observe convergence.
+
+The split is structural, not per-route: `app/routers/scopes.py` declares two routers,
+and `read_router` is the only one missing `verify_token`. A new route added to `router`
+inherits auth, so anonymity has to be chosen. Pinned by `test_route_auth_matrix` and
 `test_healthz_needs_no_token_even_when_auth_is_on`.
 
 **WinRM auth and the failover double hop.** `WINRM_AUTH` is `kerberos | ntlm | credssp`.
@@ -454,29 +491,32 @@ Its async fixtures must use `@pytest_asyncio.fixture`: the repo sets no `asyncio
 so pytest-asyncio runs strict, where a plain `@pytest.fixture` on an async generator is
 never awaited and its body silently does not run.
 
-**Air-gapped runs.** There is no CI and no package index on that side, so the deployed
-API runs its own suite: `POST /api/v1/test-runs` forks pytest in a subprocess. This works
-only because `requirements.txt` carries pytest / pytest-asyncio / httpx and the Dockerfile
-does `COPY tests/` — keep both, or the endpoint has nothing to run.
+**The API does not run its own tests.** It used to: `POST /api/v1/test-runs` forked
+pytest in a subprocess, so the air-gapped side — which has no CI and no package index —
+could exercise the suite against a named server. The endpoint, its service, models,
+errors and settings are all removed, along with the second `dhcp-scope-manager-tests`
+release that hosted it.
 
-Four rules that are load-bearing, all covered by `tests/test_testrunner.py`:
+What went with it, so a reintroduction is a deliberate act rather than an accident:
+`requirements.txt` no longer carries pytest / pytest-asyncio / httpx (they moved to
+`requirements-dev.txt`, which CI installs), and the Dockerfile no longer does
+`COPY tests/` or `COPY scripts/`. **All three have to come back together** — endpoint,
+sources, dependencies — or the endpoint has nothing to run.
 
-- **A run is always the whole suite.** There is no `suite` selector on the request — the
-  subprocess gets no `--ignore` and no path argument, so pytest collects the mocked tests
-  and `tests/integration` together. Selecting a subset meant a passing run could mean two
-  different things, and the cheap subset verified nothing about the server the release was
-  aimed at. `target` is consequently **required**: `tests/integration` self-skips unless
-  `DHCP_IT` is set, and only a target sets it, so a run without one would be "everything"
-  in name only. A body still carrying `suite` is rejected by `extra="forbid"`.
-- **The DHCP server under test comes from the request body, never from settings.** The
-  subprocess environment is built by *stripping* every `DHCP_*`/`WINRM_*` key and setting
-  only what the request supplied. A target that could fall back to this deployment's own
-  server would make the live tests — which create and delete real scopes — a loaded gun.
-- **A target matching `settings.DHCP_SERVER_HOST` or `TEST_RUNNER_DENY_HOSTS` is refused
-  with 422** before anything starts.
-- **Captured pytest output is redacted** before it is returned or logged. `--tb=line`
-  because a full traceback can echo locals, and a WinRM connection repr carries the
-  credential.
+If in-cluster runs are wanted again, re-derive these first; they are why the removed
+version looked the way it did:
+
+- **A run was always the whole suite** — no `suite` selector, so a passing run could not
+  mean two different things, and `target` was required because `tests/integration`
+  self-skips unless `DHCP_IT` is set.
+- **The server under test came from the request body, never from settings** — the
+  subprocess environment stripped every `DHCP_*`/`WINRM_*` key. A target that could fall
+  back to the deployment's own server makes a suite that creates and deletes real scopes
+  a loaded gun.
+- **A target matching the deployment's own server, or a deny list, was refused with 422**
+  before anything started.
+- **Captured output was redacted** before being returned or logged — `--tb=line`, because
+  a full traceback echoes locals and a WinRM connection repr carries the credential.
 
 Live failover is still not testable: Windows refuses a failover relationship whose partner
 is the local server, so a single test server cannot exercise it at all.

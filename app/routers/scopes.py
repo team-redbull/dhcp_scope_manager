@@ -10,14 +10,35 @@ from app.services import scope_service
 from app.utils.decorators import log_call
 
 
+# Writes are authenticated, reads are not — CLAUDE.md section 10 records the
+# trade-off and why it was taken.
+#
+# TWO routers rather than per-route dependencies, because FastAPI cannot subtract
+# a router-level dependency from one route. This way the SAFE case is the default:
+# a new route added to `router` inherits verify_token, and anonymity has to be
+# chosen deliberately by putting the route on `read_router`. Getting that backwards
+# — one router with per-route auth — makes a forgotten Depends an open write path.
+#
+# require_dhcp_service stays on BOTH: a read still talks to the DHCP server, so a
+# deployment with no server configured must 503 rather than error out mid-cmdlet.
+#
+# test_route_auth_matrix pins the exact set of anonymous routes.
 router = APIRouter(
     prefix="/api/v1",
     tags=["scopes"],
     dependencies=[Depends(verify_token), Depends(require_dhcp_service)],
 )
 
+read_router = APIRouter(
+    prefix="/api/v1",
+    tags=["scopes"],
+    dependencies=[Depends(require_dhcp_service)],
+)
 
-@router.get("/scopes", response_model=DhcpScopeListResponse, status_code=status.HTTP_200_OK)
+
+@read_router.get(
+    "/scopes", response_model=DhcpScopeListResponse, status_code=status.HTTP_200_OK
+)
 @log_call
 async def list_scopes() -> DhcpScopeListResponse:
     return await scope_service.list_scopes()
@@ -32,7 +53,9 @@ async def create_scope(
     return created.body()
 
 
-@router.get("/scopes/{scope}", response_model=DhcpScopeBody, status_code=status.HTTP_200_OK)
+@read_router.get(
+    "/scopes/{scope}", response_model=DhcpScopeBody, status_code=status.HTTP_200_OK
+)
 @log_call
 async def get_scope(
     scope: str = Depends(validate_scope),

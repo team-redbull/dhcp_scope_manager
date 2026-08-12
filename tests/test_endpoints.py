@@ -1,10 +1,12 @@
 """API endpoint tests using FastAPI TestClient with mocked service layer."""
 import json
+from contextlib import contextmanager
 from unittest.mock import patch
 import pytest
+from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
 from app.main import app
-from app.models import DhcpExclusion, DhcpScopePayload
+from app.models import DhcpExclusion, DhcpScopeListResponse, DhcpScopePayload
 from app.errors import PowerShellError
 
 pytestmark = pytest.mark.asyncio
@@ -390,62 +392,112 @@ async def test_method_not_allowed_uses_standard_error_shape():
 # Auth
 # ---------------------------------------------------------------------------
 
-async def test_auth_required_when_token_set():
+@contextmanager
+def _auth_token(value: str):
+    """Set DHCP_API_TOKEN for the duration of a test.
+
+    Patches the module the dependency reads through, not app.config, because
+    verify_token holds its own `settings` reference.
+    """
     import app.dependencies.auth as auth_mod
     original = auth_mod.settings.DHCP_API_TOKEN
-    auth_mod.settings.DHCP_API_TOKEN = "secret-token"
+    auth_mod.settings.DHCP_API_TOKEN = value
     try:
-        r = await client.get("/api/v1/scopes/10.20.30.0")
-        assert r.status_code == 401
-        err = _error(r.json())
-        assert err["code"] == "UNAUTHORIZED"
-        assert r.headers["www-authenticate"] == "Bearer"
+        yield
     finally:
         auth_mod.settings.DHCP_API_TOKEN = original
+
+
+async def test_auth_required_on_writes_when_token_set():
+    """DELETE, not GET: reads are anonymous now (see test_route_auth_matrix)."""
+    with _auth_token("secret-token"):
+        r = await client.delete("/api/v1/scopes/10.20.30.0")
+    assert r.status_code == 401
+    assert _error(r.json())["code"] == "UNAUTHORIZED"
+    assert r.headers["www-authenticate"] == "Bearer"
 
 
 async def test_auth_rejects_wrong_bearer_token():
-    import app.dependencies.auth as auth_mod
-    original = auth_mod.settings.DHCP_API_TOKEN
-    auth_mod.settings.DHCP_API_TOKEN = "secret-token"
-    try:
-        r = await client.get(
+    with _auth_token("secret-token"):
+        r = await client.delete(
             "/api/v1/scopes/10.20.30.0",
             headers={"Authorization": "Bearer wrong-token"},
         )
-        assert r.status_code == 401
-        assert _error(r.json())["code"] == "UNAUTHORIZED"
-    finally:
-        auth_mod.settings.DHCP_API_TOKEN = original
+    assert r.status_code == 401
+    assert _error(r.json())["code"] == "UNAUTHORIZED"
 
 
 async def test_auth_disabled_when_token_empty():
-    import app.dependencies.auth as auth_mod
-    scope = _make_scope()
-    original = auth_mod.settings.DHCP_API_TOKEN
-    auth_mod.settings.DHCP_API_TOKEN = ""
-    try:
-        with patch("app.services.scope_service.assemble_scope_state", return_value=scope):
-            r = await client.get("/api/v1/scopes/10.20.30.0")
-        assert r.status_code == 200
-    finally:
-        auth_mod.settings.DHCP_API_TOKEN = original
+    with _auth_token(""):
+        with patch("app.services.scope_service.delete_scope", return_value=None):
+            r = await client.delete("/api/v1/scopes/10.20.30.0")
+    assert r.status_code == 204
 
 
 async def test_auth_passes_with_correct_token():
-    import app.dependencies.auth as auth_mod
-    scope = _make_scope()
-    original = auth_mod.settings.DHCP_API_TOKEN
-    auth_mod.settings.DHCP_API_TOKEN = "secret-token"
-    try:
-        with patch("app.services.scope_service.assemble_scope_state", return_value=scope):
-            r = await client.get(
+    with _auth_token("secret-token"):
+        with patch("app.services.scope_service.delete_scope", return_value=None):
+            r = await client.delete(
                 "/api/v1/scopes/10.20.30.0",
                 headers={"Authorization": "Bearer secret-token"},
             )
-        assert r.status_code == 200
-    finally:
-        auth_mod.settings.DHCP_API_TOKEN = original
+    assert r.status_code == 204
+
+
+@pytest.mark.parametrize("path", ["/api/v1/scopes", "/api/v1/scopes/10.20.30.0"])
+async def test_reads_need_no_token_even_when_auth_is_on(path):
+    """Both scope GETs are anonymous, deliberately.
+
+    segment-lifecycle-worker's allocate-segment polls GET to confirm Crossplane
+    converged. Behind auth that poll needed its own copy of the token in the
+    redbull-workflows namespace — a second credential to rotate in step, which is
+    exactly the drift this service kept paying for. Opening reads deleted that
+    copy. Writes stay authenticated, so this is a confidentiality trade only.
+    """
+    scope = _make_scope()
+    with _auth_token("secret-token"):
+        with patch("app.services.scope_service.assemble_scope_state", return_value=scope), \
+             patch("app.services.scope_service.list_scopes",
+                   return_value=DhcpScopeListResponse(scopes=[], errors=[])):
+            r = await client.get(path)
+    assert r.status_code == 200
+
+
+async def test_writes_still_reject_anonymous_callers():
+    """The other half of the trade: opening reads must not open writes."""
+    body = _make_scope_dict()
+    with _auth_token("secret-token"):
+        assert (await client.post("/api/v1/scopes/10.20.30.0", json=body)).status_code == 401
+        assert (await client.put("/api/v1/scopes/10.20.30.0", json=body)).status_code == 401
+        assert (await client.delete("/api/v1/scopes/10.20.30.0")).status_code == 401
+
+
+async def test_route_auth_matrix():
+    """Exactly these route+method pairs skip verify_token — nothing else.
+
+    A new route must not join them by accident: writes inherit verify_token from
+    `router` in app/routers/scopes.py, and anonymity is a deliberate choice of
+    `read_router`. This assertion is what makes that choice reviewable, since a
+    missing dependency is invisible at the call site.
+
+    APIRoute only: /docs, /redoc and /openapi.json are Starlette routes FastAPI
+    mounts itself. They are anonymous too, and always have been — that predates
+    this split and is not what this test is guarding.
+    """
+    anonymous = set()
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        names = {d.dependency.__name__ for d in route.dependencies}
+        if "verify_token" not in names:
+            anonymous |= {
+                (route.path, m) for m in route.methods if m not in ("HEAD", "OPTIONS")
+            }
+    assert anonymous == {
+        ("/healthz", "GET"),
+        ("/api/v1/scopes", "GET"),
+        ("/api/v1/scopes/{scope}", "GET"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -462,22 +514,18 @@ async def test_healthz_endpoint():
 async def test_healthz_needs_no_token_even_when_auth_is_on():
     """/healthz is the readiness probe, and the kubelet cannot send a token.
 
-    Every other route requires one. This is the single exemption, and it is not
-    cosmetic: when /healthz was behind verify_token, a release that generated a
-    token failed every probe with 401, so the pod never became ready and never
-    joined its Service. The endpoint returns a bare {"status": "ok"}, so there
-    is nothing to protect.
+    It is no longer the *only* anonymous route — the scope GETs are too — but its
+    exemption is the one that is not a trade-off: when /healthz was behind
+    verify_token, a release that generated a token failed every probe with 401,
+    so the pod never became ready and never joined its Service. The response is a
+    bare {"status": "ok"}, so there is nothing to protect. Unlike the GETs, this
+    route would be unusable behind auth at all.
     """
-    import app.dependencies.auth as auth_mod
-    original = auth_mod.settings.DHCP_API_TOKEN
-    auth_mod.settings.DHCP_API_TOKEN = "secret-token"
-    try:
+    with _auth_token("secret-token"):
         with patch("app.services.dhcp_service.validate_dhcp_environment"):
             r = await client.get("/healthz")
-        assert r.status_code == 200
-        assert r.json() == {"status": "ok"}
-    finally:
-        auth_mod.settings.DHCP_API_TOKEN = original
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
