@@ -110,6 +110,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: dhcp-scope-manager-token
+  namespace: dhcp-scope-manager
   labels:
     app.kubernetes.io/name: dhcp-api-token
     app.kubernetes.io/managed-by: {{ .Release.Service }}
@@ -118,17 +119,37 @@ stringData:
   api-token: {{ required "dhcp-api-token: values.yaml has no token. ..." .Values.token | quote }}
 ```
 
-Three things about this that are load-bearing:
+Three things about this that are load-bearing — the middle one most of all:
 
-- **The Secret name and key are constants, not values.** Two other places already
-  spell them out (`apiAuth.secretName`/`tokenKey` here, `dhcp_api.tokenSecretRef` in
-  `hostedclusters-setup`). A third configurable copy would be a third thing to keep
-  in step, and a mismatch is not a render error — it is a placeholder provider-http
-  passes through as literal text, i.e. a 401 naming nothing.
-- **No namespace is stamped.** Rendered standalone on an MCE the Secret lands in the
-  Application's destination namespace; rendered as a subchart on the mgmt cluster it
-  lands in the release namespace. Both are `dhcp-scope-manager`. Stamping one would
-  break the standalone case — and it is also why nothing here is cluster-scoped.
+- **The Secret name, key and namespace are constants, not values.** All three are
+  already spelled out in `dhcp_api.tokenSecretRef` in `hostedclusters-setup`, and
+  the name and key again in `apiAuth.secretName`/`tokenKey` here. A configurable
+  copy would be another thing to keep in step, and a mismatch is not a render error
+  — it is a placeholder provider-http passes through as literal text, i.e. a 401
+  naming nothing.
+- **The namespace is stamped, not inherited from the release.** This is the key
+  point of the whole change and it is worth being blunt about: **one Secret per
+  cluster, not one per hosted cluster.** Both placements already target
+  `dhcp-scope-manager` — standalone on an MCE it is the Application's
+  `projectNamespace` (repo 3), nested on the mgmt cluster it is the release
+  namespace — so the literal renders identically either way today. What it buys is
+  that neither can quietly move the Secret out from under the placeholder, which
+  resolves against this fixed namespace and fails silently when it is wrong.
+  Verified by rendering both placements with a deliberately wrong `-n`.
+  - Consequence in repo 3: if `projectNamespace` were ever changed, the outcome is
+    either a failed sync (the AppProject restricting destinations, or
+    `dhcp-scope-manager` not existing on that cluster) or the stamp simply winning
+    over the Application's destination. Which one depends on the `redbull`
+    AppProject, which is not defined in `gitops-day2-prod` — **either way the Secret
+    cannot quietly land somewhere no Request looks**, which is the property that
+    matters.
+  - The cost, stated: the API pod's `secretKeyRef` resolves in the pod's own
+    namespace, so this pins the `dhcp-scope-manager` release to the namespace of
+    the same name. That was already the platform constant; it is enforced now
+    rather than assumed.
+  - Still nothing cluster-scoped and no extra RBAC anywhere — provider-http's
+    ClusterRole already reads Secrets cluster-wide, which is what lets one Secret
+    serve every hosted cluster's Request.
 - **`required` is the whole guard.** An absent token fails the render rather than
   producing a Secret nobody can authenticate with.
 
@@ -207,8 +228,12 @@ syncPolicy:
 - **No `values.yaml` in this folder.** The token comes from the subchart's own
   values, which is the base of the merge in both render paths. That is what makes
   rotation one file for both the mgmt cluster and every MCE.
-- `projectNamespace` matches the mgmt cluster's namespace on purpose, so
-  `tokenSecretRef.namespace` is one literal everywhere. Here it holds only the token.
+- **`projectNamespace` must be `dhcp-scope-manager`** — the same literal the Secret
+  stamps (repo 2a) and `tokenSecretRef.namespace` names (repo 4a). One namespace name
+  on every cluster; here it holds only the token. `deployApp.yaml` feeds this straight
+  to `destination.namespace`, i.e. the Helm release namespace — which the Secret no
+  longer depends on, since repo 2a stamps the namespace. Keep them equal anyway so
+  `CreateNamespace=true` creates the namespace the Secret actually declares.
 - `prune: true` is deliberate — deleting the folder must remove the Secret rather
   than strand a live credential. The flip side: an accidental deletion 401s every
   scope write on that MCE.

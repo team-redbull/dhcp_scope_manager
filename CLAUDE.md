@@ -377,7 +377,12 @@ subchart (`charts/dhcp-api-token`) renders the Secret from one committed value, 
 absent value fails the render rather than producing something that authenticates
 nothing. That subchart is also what puts the token on each MCE — deployed standalone
 there, so the Crossplane Requests in every `hcp-<cluster>` namespace read one Secret
-per cluster instead of one apiece.
+per cluster instead of one apiece. **It stamps `metadata.namespace: dhcp-scope-manager`
+as a literal rather than taking the release namespace**, so the Secret lands where the
+placeholder in §4 looks no matter how the chart is rendered — nested beside the API on
+the mgmt cluster, or standalone on an MCE. Inheriting it is what put one Secret in each
+hosted cluster's namespace. The price is that the API release itself is pinned to the
+namespace of the same name, since the pod's `secretKeyRef` resolves in its own.
 
 **Three routes have no `verify_token`: `/healthz` and both scope GETs.** They are
 exempt for different reasons, and only one of them is a trade-off.
