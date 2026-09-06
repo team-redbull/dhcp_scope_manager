@@ -23,10 +23,10 @@ jobs:
     uses: team-redbull/.github/.github/workflows/ghcr-build-push.yml@main
     with:
       image-name: dhcp-scope-manager
-      # Argo CD service: the chart lives in its own repo, so the image bump and
-      # the vX.Y.Z tag land there rather than here.
-      chart-repo: team-redbull/helm-charts-dhcp-scope-manager
-      helm-values-path: values.yaml
+      # Argo CD service: the chart lives in the redbull-platform repo, so the image
+      # bump and the `dhcp-scope-manager/vX.Y.Z` tag land there rather than here.
+      chart-repo: team-redbull/redbull-platform
+      helm-values-path: gitops/charts/dhcp-scope-manager/values.yaml
     secrets: inherit
 
   cleanup-on-delete:
