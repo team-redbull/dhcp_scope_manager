@@ -1,0 +1,1008 @@
+"""API endpoint tests using FastAPI TestClient with mocked service layer."""
+import json
+from contextlib import contextmanager
+from unittest.mock import patch
+import pytest
+from fastapi.routing import APIRoute
+from httpx import ASGITransport, AsyncClient
+from app.main import app
+from app.models import DhcpExclusion, DhcpScopeListResponse, DhcpScopePayload
+from app.errors import PowerShellError
+
+pytestmark = pytest.mark.asyncio
+
+
+class AsyncTestClient:
+    async def request(self, method: str, path: str, **kwargs):
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            return await client.request(method, path, **kwargs)
+
+    async def get(self, path: str, **kwargs):
+        return await self.request("GET", path, **kwargs)
+
+    async def post(self, path: str, **kwargs):
+        return await self.request("POST", path, **kwargs)
+
+    async def put(self, path: str, **kwargs):
+        return await self.request("PUT", path, **kwargs)
+
+    async def delete(self, path: str, **kwargs):
+        return await self.request("DELETE", path, **kwargs)
+
+
+client = AsyncTestClient()
+
+
+def _error(body):
+    return body["error"]
+
+
+def _make_scope_dict(**overrides):
+    """The request body — state only, no identity (that lives in the URL)."""
+    base = {
+        "scopeName": "Cluster-A Management",
+        "subnetMask": "255.255.255.0",
+        "startRange": "10.20.30.100",
+        "endRange": "10.20.30.200",
+        "leaseDurationDays": 8,
+        "description": "Cluster A management network",
+        "gateway": "10.20.30.1",
+        "dnsServers": ["10.0.0.53", "10.0.0.54"],
+        "dnsDomain": "lab.local",
+        "exclusions": [{"startAddress": "10.20.30.1", "endAddress": "10.20.30.99"}],
+        "failover": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_scope(scope="10.20.30.0", **overrides):
+    """The domain model — what the service layer returns."""
+    return DhcpScopePayload(scope=scope, **_make_scope_dict(**overrides))
+
+
+# ---------------------------------------------------------------------------
+# GET
+# ---------------------------------------------------------------------------
+
+async def test_get_existing_scope():
+    scope = _make_scope()
+    with patch("app.services.scope_service.assemble_scope_state", return_value=scope):
+        r = await client.get("/api/v1/scopes/10.20.30.0")
+    assert r.status_code == 200
+    data = r.json()
+    assert "scope" not in data, "identity lives in the URL, not the response body"
+    assert data["scopeName"] == "Cluster-A Management"
+    assert data["leaseDurationDays"] == 8
+
+
+async def test_get_missing_scope():
+    with patch(
+        "app.services.scope_service.assemble_scope_state",
+        side_effect=PowerShellError("Get-DhcpServerv4Scope", "No DHCP scope found", 1),
+    ):
+        r = await client.get("/api/v1/scopes/10.20.30.0")
+    assert r.status_code == 404
+    err = _error(r.json())
+    assert err["code"] == "SCOPE_NOT_FOUND"
+    assert "10.20.30.0" in err["message"]
+
+
+# ---------------------------------------------------------------------------
+# POST
+# ---------------------------------------------------------------------------
+
+async def test_post_create_new_scope():
+    created = _make_scope()
+    with patch("app.services.scope_service.create_scope", return_value=created):
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 200
+    assert r.json()["scopeName"] == "Cluster-A Management"
+
+
+async def test_post_bare_scopes_route_not_found():
+    """POST /scopes (without scope) must not exist — all writes go through Git/Crossplane."""
+    r = await client.post("/api/v1/scopes", json=_make_scope_dict())
+    assert r.status_code == 405  # Method Not Allowed — path exists (GET /scopes) but not POST
+
+
+async def test_post_idempotent_existing():
+    """POST on existing scope must return 200, never 409."""
+    existing = _make_scope()
+    with patch("app.services.scope_service.create_scope", return_value=existing):
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# POST /scopes/{scope}  — Crossplane provider-http target
+# ---------------------------------------------------------------------------
+
+async def test_post_by_scope_creates_scope():
+    """POST /scopes/{scope} is the actual URL Crossplane uses for create.
+    The path address is the sole source of the scope identity."""
+    created = _make_scope()
+    with patch("app.services.scope_service.create_scope", return_value=created) as mock_create:
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 200
+    assert str(mock_create.call_args[0][0].scope) == "10.20.30.0"
+
+
+@pytest.mark.parametrize("identity_field", ["scope", "network"])
+async def test_post_rejects_identity_field_in_body(identity_field):
+    """The body must not carry the scope address under any name.
+
+    The address is the resource identifier and comes from the path alone. A body
+    that also carried it could disagree with the path, which is exactly the
+    ambiguity this API shape removes — so extra="forbid" rejects it outright
+    rather than silently preferring one source over the other.
+    """
+    body = _make_scope_dict()
+    body[identity_field] = "10.20.40.0"
+    r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 422
+
+
+async def test_post_invalid_scope_returns_400():
+    """POST /scopes/{scope} with a malformed address must return 400."""
+    r = await client.post("/api/v1/scopes/10.20.999.0", json=_make_scope_dict())
+    assert r.status_code == 400
+    err = _error(r.json())
+    assert err["code"] == "INVALID_SCOPE"
+    assert "10.20.999.0" in err["message"]
+
+
+async def test_post_body_must_match_path_subnet():
+    """Subnet validation still spans path and body even though they are separate.
+
+    A body describing 10.20.40.x sent to /scopes/10.20.30.0 has ranges outside the
+    path subnet — the composed domain model must reject it.
+    """
+    body = _make_scope_dict(
+        startRange="10.20.40.100", endRange="10.20.40.200", gateway="10.20.40.1",
+        exclusions=[],
+    )
+    r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 422
+
+
+async def test_post_by_scope_id_with_hotstandby_failover():
+    """POST /scopes/{scope} with HotStandby failover delegates to same service function."""
+    failover_dict = {
+        "partnerServer": "dhcp02.lab.local",
+        "relationshipName": "rel1",
+        "mode": "HotStandby",
+        "serverRole": "Active",
+        "reservePercent": 5,
+        "loadBalancePercent": 0,
+        "maxClientLeadTimeMinutes": 60,
+    }
+    body = _make_scope_dict(failover=failover_dict)
+    created = _make_scope(failover=DhcpScopePayload(scope="10.20.30.0", **body).failover)
+    with patch("app.services.scope_service.create_scope", return_value=created) as mock_create:
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 200
+    mock_create.assert_called_once()
+    called_payload = mock_create.call_args[0][0]
+    assert called_payload.failover is not None
+    assert called_payload.failover.mode == "HotStandby"
+    assert called_payload.failover.serverRole == "Active"
+
+
+async def test_post_rejects_unknown_failover_fields():
+    failover_dict = {
+        "partnerServer": "dhcp02.lab.local",
+        "relationshipName": "rel1",
+        "mode": "HotStandby",
+        "serverRole": "Active",
+        "reservePercent": 5,
+        "maxClientLeadTimeMinutes": 60,
+        "unexpectedField": "unexpected-value",
+    }
+    body = _make_scope_dict(failover=failover_dict)
+    r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+
+    assert r.status_code == 422
+
+
+async def test_post_by_scope_id_with_loadbalance_failover():
+    """POST /scopes/{scope} with LoadBalance failover — serverRole must be normalised to Active."""
+    failover_dict = {
+        "partnerServer": "dhcp02.lab.local",
+        "relationshipName": "rel1",
+        "mode": "LoadBalance",
+        "loadBalancePercent": 50,
+        "maxClientLeadTimeMinutes": 60,
+    }
+    body = _make_scope_dict(failover=failover_dict)
+    from app.models import DhcpFailover
+    f = DhcpFailover(**failover_dict)
+    created = _make_scope(failover=f)
+    with patch("app.services.scope_service.create_scope", return_value=created) as mock_create:
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 200
+    mock_create.assert_called_once()
+    called_payload = mock_create.call_args[0][0]
+    assert called_payload.failover is not None
+    assert called_payload.failover.mode == "LoadBalance"
+    assert called_payload.failover.serverRole == "Active"   # normalised
+    assert called_payload.failover.reservePercent == 0      # normalised
+    assert called_payload.failover.loadBalancePercent == 50
+
+
+# ---------------------------------------------------------------------------
+# PUT
+# ---------------------------------------------------------------------------
+
+async def test_put_update_scope():
+    updated = _make_scope(scopeName="Updated Name")
+    with patch("app.services.scope_service.update_scope", return_value=updated):
+        r = await client.put("/api/v1/scopes/10.20.30.0", json=_make_scope_dict(scopeName="Updated Name"))
+    assert r.status_code == 200
+    assert r.json()["scopeName"] == "Updated Name"
+
+
+async def test_put_scope_not_found():
+    from app.errors import ScopeNotFoundError
+    with patch(
+        "app.services.scope_service.update_scope",
+        side_effect=ScopeNotFoundError("10.20.30.0"),
+    ):
+        r = await client.put("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 404
+    assert _error(r.json())["code"] == "SCOPE_NOT_FOUND"
+
+
+async def test_put_rejects_identity_field_in_body():
+    """PUT body must not carry the scope address — same rule as POST."""
+    body = _make_scope_dict()
+    body["scope"] = "10.20.40.0"
+    r = await client.put("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 422
+
+
+async def test_put_takes_scope_from_path():
+    """PUT applies to the path address, which is passed through to the service."""
+    updated = _make_scope()
+    with patch("app.services.scope_service.update_scope", return_value=updated) as mock_update:
+        r = await client.put("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 200
+    assert mock_update.call_args[0][0] == "10.20.30.0"
+    assert str(mock_update.call_args[0][1].scope) == "10.20.30.0"
+
+
+# ---------------------------------------------------------------------------
+# DELETE
+# ---------------------------------------------------------------------------
+
+async def test_delete_scope():
+    with patch("app.services.scope_service.delete_scope", return_value=None):
+        r = await client.delete("/api/v1/scopes/10.20.30.0")
+    assert r.status_code == 204
+    assert r.content == b""
+
+
+async def test_delete_idempotent():
+    """DELETE on non-existent scope must return 204."""
+    with patch("app.services.scope_service.delete_scope", return_value=None):
+        r = await client.delete("/api/v1/scopes/10.99.99.99")
+    assert r.status_code == 204
+
+
+async def test_delete_ps_error_during_assembly_returns_500():
+    """Unexpected PowerShell failure during delete scope assembly must return 500, not 204.
+
+    If _try_assemble_scope raises for a non-not-found reason (e.g. permission denied),
+    delete_scope must propagate the error so Crossplane retries on the next cycle,
+    rather than receiving a false 204 that causes it to remove the CR while the scope
+    remains on the DHCP server.
+    """
+    with patch("app.services.scope_service.scope_exists", return_value=True), \
+         patch("app.services.scope_service.assemble_scope_state",
+               side_effect=PowerShellError("Get-DhcpServerv4Scope", "Access denied", 5)):
+        r = await client.delete("/api/v1/scopes/10.20.30.0")
+    assert r.status_code == 500
+    err = _error(r.json())
+    assert err["code"] == "POWERSHELL_COMMAND_FAILED"
+    assert "ps_error" not in err
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+async def test_powershell_error_500():
+    with patch(
+        "app.services.scope_service.create_scope",
+        side_effect=PowerShellError("Add-DhcpServerv4Scope", "Access denied", 1),
+    ):
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 500
+    body = r.json()
+    err = _error(body)
+    assert err["code"] == "POWERSHELL_COMMAND_FAILED"
+    assert err["message"] == "Failed to apply DHCP scope configuration"
+
+
+async def test_powershell_timeout_returns_504():
+    with patch(
+        "app.services.scope_service.create_scope",
+        side_effect=PowerShellError("Set-DhcpServerv4Scope", "PowerShell command timed out after 60 seconds", -1),
+    ):
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 504
+    assert _error(r.json())["code"] == "POWERSHELL_TIMEOUT"
+
+
+async def test_powershell_already_exists_unhandled_returns_409():
+    with patch(
+        "app.services.scope_service.update_scope",
+        side_effect=PowerShellError("Add-DhcpServerv4Failover", "relationship already exists", 1),
+    ):
+        r = await client.put("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 409
+    assert _error(r.json())["code"] == "DHCP_CONFLICT"
+
+
+async def test_failover_replication_failure_returns_500():
+    from app.models import DhcpFailover
+
+    failover = DhcpFailover(
+        partnerServer="dhcp02.lab.local",
+        relationshipName="rel1",
+        mode="HotStandby",
+        serverRole="Active",
+        reservePercent=5,
+        maxClientLeadTimeMinutes=60,
+    )
+    current = _make_scope(dnsServers=["10.0.0.53"], failover=failover)
+    desired = _make_scope(dnsServers=["10.0.0.53", "10.0.0.54"], failover=failover)
+    body = desired.body().model_dump(mode="json")
+
+    with patch("app.services.scope_service.assemble_scope_state") as mock_assemble, \
+         patch("app.services.scope_service.run_ps") as mock_ps:
+        mock_assemble.side_effect = [current, desired]
+        mock_ps.side_effect = [
+            None,
+            PowerShellError("Invoke-DhcpServerv4FailoverReplication", "replication failed", 1),
+        ]
+        r = await client.put("/api/v1/scopes/10.20.30.0", json=body)
+
+    assert r.status_code == 500
+    assert _error(r.json())["code"] == "POWERSHELL_COMMAND_FAILED"
+
+
+async def test_unexpected_exception_returns_standard_500():
+    with patch("app.services.scope_service.list_scopes", side_effect=TypeError("boom")):
+        r = await client.get("/api/v1/scopes")
+    assert r.status_code == 500
+    err = _error(r.json())
+    assert err["code"] == "INTERNAL_ERROR"
+    assert err["message"] == "Internal server error"
+
+
+async def test_method_not_allowed_uses_standard_error_shape():
+    r = await client.post("/api/v1/scopes", json=_make_scope_dict())
+    assert r.status_code == 405
+    assert _error(r.json())["code"] == "METHOD_NOT_ALLOWED"
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _auth_token(value: str):
+    """Set DHCP_API_TOKEN for the duration of a test.
+
+    Patches the module the dependency reads through, not app.config, because
+    verify_token holds its own `settings` reference.
+    """
+    import app.dependencies.auth as auth_mod
+    original = auth_mod.settings.DHCP_API_TOKEN
+    auth_mod.settings.DHCP_API_TOKEN = value
+    try:
+        yield
+    finally:
+        auth_mod.settings.DHCP_API_TOKEN = original
+
+
+async def test_auth_required_on_writes_when_token_set():
+    """DELETE, not GET: reads are anonymous now (see test_route_auth_matrix)."""
+    with _auth_token("secret-token"):
+        r = await client.delete("/api/v1/scopes/10.20.30.0")
+    assert r.status_code == 401
+    assert _error(r.json())["code"] == "UNAUTHORIZED"
+    assert r.headers["www-authenticate"] == "Bearer"
+
+
+async def test_auth_rejects_wrong_bearer_token():
+    with _auth_token("secret-token"):
+        r = await client.delete(
+            "/api/v1/scopes/10.20.30.0",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+    assert r.status_code == 401
+    assert _error(r.json())["code"] == "UNAUTHORIZED"
+
+
+async def test_auth_disabled_when_token_empty():
+    with _auth_token(""):
+        with patch("app.services.scope_service.delete_scope", return_value=None):
+            r = await client.delete("/api/v1/scopes/10.20.30.0")
+    assert r.status_code == 204
+
+
+async def test_auth_passes_with_correct_token():
+    with _auth_token("secret-token"):
+        with patch("app.services.scope_service.delete_scope", return_value=None):
+            r = await client.delete(
+                "/api/v1/scopes/10.20.30.0",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+    assert r.status_code == 204
+
+
+@pytest.mark.parametrize("path", ["/api/v1/scopes", "/api/v1/scopes/10.20.30.0"])
+async def test_reads_need_no_token_even_when_auth_is_on(path):
+    """Both scope GETs are anonymous, deliberately.
+
+    segment-lifecycle-worker's allocate-segment polls GET to confirm Crossplane
+    converged. Behind auth that poll needed its own copy of the token in the
+    redbull-workflows namespace — a second credential to rotate in step, which is
+    exactly the drift this service kept paying for. Opening reads deleted that
+    copy. Writes stay authenticated, so this is a confidentiality trade only.
+    """
+    scope = _make_scope()
+    with _auth_token("secret-token"):
+        with patch("app.services.scope_service.assemble_scope_state", return_value=scope), \
+             patch("app.services.scope_service.list_scopes",
+                   return_value=DhcpScopeListResponse(scopes=[], errors=[])):
+            r = await client.get(path)
+    assert r.status_code == 200
+
+
+async def test_writes_still_reject_anonymous_callers():
+    """The other half of the trade: opening reads must not open writes."""
+    body = _make_scope_dict()
+    with _auth_token("secret-token"):
+        assert (await client.post("/api/v1/scopes/10.20.30.0", json=body)).status_code == 401
+        assert (await client.put("/api/v1/scopes/10.20.30.0", json=body)).status_code == 401
+        assert (await client.delete("/api/v1/scopes/10.20.30.0")).status_code == 401
+
+
+async def test_route_auth_matrix():
+    """Exactly these route+method pairs skip verify_token — nothing else.
+
+    A new route must not join them by accident: writes inherit verify_token from
+    `router` in app/routers/scopes.py, and anonymity is a deliberate choice of
+    `read_router`. This assertion is what makes that choice reviewable, since a
+    missing dependency is invisible at the call site.
+
+    APIRoute only: /docs, /redoc and /openapi.json are Starlette routes FastAPI
+    mounts itself. They are anonymous too, and always have been — that predates
+    this split and is not what this test is guarding.
+    """
+    anonymous = set()
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        names = {d.dependency.__name__ for d in route.dependencies}
+        if "verify_token" not in names:
+            anonymous |= {
+                (route.path, m) for m in route.methods if m not in ("HEAD", "OPTIONS")
+            }
+    assert anonymous == {
+        ("/healthz", "GET"),
+        ("/api/v1/scopes", "GET"),
+        ("/api/v1/scopes/{scope}", "GET"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+async def test_healthz_endpoint():
+    with patch("app.services.dhcp_service.validate_dhcp_environment"):
+        r = await client.get("/healthz")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+async def test_healthz_needs_no_token_even_when_auth_is_on():
+    """/healthz is the readiness probe, and the kubelet cannot send a token.
+
+    It is no longer the *only* anonymous route — the scope GETs are too — but its
+    exemption is the one that is not a trade-off: when /healthz was behind
+    verify_token, a release that generated a token failed every probe with 401,
+    so the pod never became ready and never joined its Service. The response is a
+    bare {"status": "ok"}, so there is nothing to protect. Unlike the GETs, this
+    route would be unusable behind auth at all.
+    """
+    with _auth_token("secret-token"):
+        with patch("app.services.dhcp_service.validate_dhcp_environment"):
+            r = await client.get("/healthz")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Critical: GET/PUT roundtrip test
+# ---------------------------------------------------------------------------
+
+async def test_invalid_scope_returns_400():
+    r = await client.get("/api/v1/scopes/10.20.999.0")
+    assert r.status_code == 400
+    assert _error(r.json())["code"] == "INVALID_SCOPE"
+
+
+async def test_invalid_scope_not_ip_returns_422():
+    # Pattern validation on the path param catches non-IP strings before our validator
+    r = await client.get("/api/v1/scopes/not-an-ip")
+    assert r.status_code == 400
+    assert _error(r.json())["code"] == "INVALID_SCOPE"
+
+
+async def test_invalid_request_body_returns_standard_validation_error():
+    body = _make_scope_dict(startRange="not-an-ip")
+    r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 422
+    err = _error(r.json())
+    assert err["code"] == "VALIDATION_ERROR"
+    assert err["message"] == "Request validation failed"
+    assert any(e["field"] == "body.startRange" for e in err["details"]["errors"])
+
+
+async def test_post_empty_dns_servers_returns_422():
+    body = _make_scope_dict(dnsServers=[])
+    r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 422
+    err = _error(r.json())
+    assert err["code"] == "VALIDATION_ERROR"
+    assert any(e["field"] == "body.dnsServers" for e in err["details"]["errors"])
+
+
+async def test_put_empty_dns_servers_returns_422():
+    body = _make_scope_dict(dnsServers=[])
+    r = await client.put("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 422
+    err = _error(r.json())
+    assert err["code"] == "VALIDATION_ERROR"
+    assert any(e["field"] == "body.dnsServers" for e in err["details"]["errors"])
+
+
+async def test_invalid_subnet_relationship_returns_validation_error():
+    body = _make_scope_dict(startRange="10.20.31.100", endRange="10.20.31.200")
+    r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 422
+    err = _error(r.json())
+    assert err["code"] == "VALIDATION_ERROR"
+    assert err["details"]["errors"]
+
+
+async def test_post_omitting_mask_and_gateway_resolves_defaults():
+    """A body with neither key is accepted and converges on the derived values."""
+    body = _make_scope_dict()
+    del body["subnetMask"]
+    del body["gateway"]
+    with patch("app.services.scope_service.create_scope",
+               return_value=_make_scope()) as mock_create:
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 200
+    payload = mock_create.call_args[0][0]
+    assert str(payload.subnetMask) == "255.255.255.0"
+    assert str(payload.gateway) == "10.20.30.254"
+
+
+async def test_post_explicit_null_gateway_is_not_defaulted():
+    """null means no DHCP option 3 and must survive the trip to the service layer."""
+    body = _make_scope_dict(gateway=None)
+    with patch("app.services.scope_service.create_scope",
+               return_value=_make_scope()) as mock_create:
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 200
+    assert mock_create.call_args[0][0].gateway is None
+
+
+async def test_non_24_mask_without_gateway_returns_422():
+    """The mismatch surfaces as a 422, not an unhandled 500.
+
+    It is only detectable once the path address and body are composed, so it is
+    raised inside validate_scope_request and re-wrapped as RequestValidationError.
+    """
+    body = _make_scope_dict(subnetMask="255.255.0.0")
+    del body["gateway"]
+    r = await client.post("/api/v1/scopes/10.20.0.0", json=body)
+    assert r.status_code == 422
+    err = _error(r.json())
+    assert err["code"] == "VALIDATION_ERROR"
+    assert "gateway is required when subnetMask is 255.255.0.0" in str(err["details"])
+
+
+async def test_post_omitting_the_range_resolves_the_derived_bounds():
+    """A body carrying no range reaches the service layer with .1–.253 resolved.
+
+    The service only ever sees resolved values, which is what keeps the cmdlet
+    builder free of defaulting logic of its own.
+    """
+    body = _make_scope_dict()
+    del body["startRange"]
+    del body["endRange"]
+    del body["gateway"]
+    with patch("app.services.scope_service.create_scope",
+               return_value=_make_scope()) as mock_create:
+        r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 200
+    payload = mock_create.call_args[0][0]
+    assert str(payload.startRange) == "10.20.30.1"
+    assert str(payload.endRange) == "10.20.30.253"
+
+
+async def test_put_omitting_the_range_resolves_the_derived_bounds():
+    """PUT is a full replacement (§6), so dropping the keys re-derives rather than keeps.
+
+    Deleting the lines from a values file is a live range change, not a no-op — the
+    same rule that makes an omitted dnsDomain clear the option.
+    """
+    body = _make_scope_dict()
+    del body["startRange"]
+    del body["endRange"]
+    del body["gateway"]
+    with patch("app.services.scope_service.update_scope",
+               return_value=_make_scope()) as mock_update:
+        r = await client.put("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 200
+    # update_scope(scope, desired) — the payload is the second positional arg
+    payload = mock_update.call_args[0][1]
+    assert str(payload.startRange) == "10.20.30.1"
+    assert str(payload.endRange) == "10.20.30.253"
+
+
+async def test_half_specified_range_returns_422():
+    """One bound without the other is a 422, not a silently completed range."""
+    body = _make_scope_dict()
+    del body["endRange"]
+    r = await client.post("/api/v1/scopes/10.20.30.0", json=body)
+    assert r.status_code == 422
+    err = _error(r.json())
+    assert err["code"] == "VALIDATION_ERROR"
+    assert "endRange is required when startRange is set" in str(err["details"])
+
+
+async def test_non_24_mask_without_range_returns_422():
+    body = _make_scope_dict(subnetMask="255.255.0.0", gateway="10.20.0.1")
+    del body["startRange"]
+    del body["endRange"]
+    r = await client.post("/api/v1/scopes/10.20.0.0", json=body)
+    assert r.status_code == 422
+    err = _error(r.json())
+    assert err["code"] == "VALIDATION_ERROR"
+    assert "startRange and endRange are required when subnetMask is 255.255.0.0" in str(
+        err["details"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /scopes — list all scopes
+# ---------------------------------------------------------------------------
+
+async def test_list_scopes_empty():
+    """Empty DHCP server must return 200 with empty scopes and errors lists."""
+    from app.models import DhcpScopeListResponse
+    with patch("app.services.scope_service.list_scopes",
+               return_value=DhcpScopeListResponse(scopes=[], errors=[])):
+        r = await client.get("/api/v1/scopes")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"scopes": [], "errors": []}
+
+
+async def test_list_scopes_single():
+    """Single scope is returned in scopes list with the canonical shape."""
+    from app.models import DhcpScopeListResponse
+    scope = _make_scope()
+    with patch("app.services.scope_service.list_scopes",
+               return_value=DhcpScopeListResponse(scopes=[scope], errors=[])):
+        r = await client.get("/api/v1/scopes")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["scopes"]) == 1
+    assert body["errors"] == []
+    # Verify all canonical top-level fields are present
+    for field in ("scope", "scopeName", "subnetMask", "startRange", "endRange",
+                  "leaseDurationDays", "description", "gateway", "dnsServers",
+                  "dnsDomain", "exclusions", "failover"):
+        assert field in body["scopes"][0], f"canonical field '{field}' missing from list item"
+
+
+async def test_list_scopes_multiple():
+    """Multiple scopes are returned in scopes list."""
+    from app.models import DhcpScopeListResponse
+    scope_a = DhcpScopePayload(
+        scopeName="Scope-A", scope="10.20.30.0", subnetMask="255.255.255.0",
+        startRange="10.20.30.100", endRange="10.20.30.200", leaseDurationDays=8,
+        description="", gateway="10.20.30.1", dnsServers=["10.0.0.53"], dnsDomain="",
+        exclusions=[], failover=None,
+    )
+    scope_b = DhcpScopePayload(
+        scopeName="Scope-B", scope="10.20.31.0", subnetMask="255.255.255.0",
+        startRange="10.20.31.100", endRange="10.20.31.200", leaseDurationDays=8,
+        description="", gateway="10.20.31.1", dnsServers=["10.0.0.53"], dnsDomain="",
+        exclusions=[], failover=None,
+    )
+    with patch("app.services.scope_service.list_scopes",
+               return_value=DhcpScopeListResponse(scopes=[scope_a, scope_b], errors=[])):
+        r = await client.get("/api/v1/scopes")
+    assert r.status_code == 200
+    assert len(r.json()["scopes"]) == 2
+
+
+async def test_list_scopes_partial_errors_returned():
+    """Scopes with assembly errors appear in errors[], valid scopes still returned."""
+    from app.models import DhcpScopeListError, DhcpScopeListResponse
+    scope = _make_scope()
+    err = DhcpScopeListError(scope="10.20.31.0", error="No DNS servers configured")
+    with patch("app.services.scope_service.list_scopes",
+               return_value=DhcpScopeListResponse(scopes=[scope], errors=[err])):
+        r = await client.get("/api/v1/scopes")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["scopes"]) == 1
+    assert len(body["errors"]) == 1
+    assert body["errors"][0]["scope"] == "10.20.31.0"
+    assert "DNS" in body["errors"][0]["error"]
+
+
+async def test_list_scopes_ps_error_returns_500():
+    """PowerShell failure during list must return the standard safe 500 shape."""
+    with patch(
+        "app.services.scope_service.list_scopes",
+        side_effect=PowerShellError("Get-DhcpServerv4Scope", "Access denied", 1),
+    ):
+        r = await client.get("/api/v1/scopes")
+    assert r.status_code == 500
+    body = r.json()
+    assert _error(body)["code"] == "POWERSHELL_COMMAND_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_list_scopes_sorted_numerically():
+    """Scopes must be sorted numerically by network address regardless of PS return order."""
+    from app.services.scope_service import list_scopes as svc_list_scopes
+
+    scope_30 = DhcpScopePayload(
+        scopeName="Scope-30", scope="10.20.30.0", subnetMask="255.255.255.0",
+        startRange="10.20.30.100", endRange="10.20.30.200", leaseDurationDays=8,
+        description="", gateway="10.20.30.1", dnsServers=["10.0.0.53"], dnsDomain="",
+        exclusions=[], failover=None,
+    )
+    scope_9 = DhcpScopePayload(
+        scopeName="Scope-9", scope="10.20.9.0", subnetMask="255.255.255.0",
+        startRange="10.20.9.100", endRange="10.20.9.200", leaseDurationDays=8,
+        description="", gateway="10.20.9.1", dnsServers=["10.0.0.53"], dnsDomain="",
+        exclusions=[], failover=None,
+    )
+    # "10.20.9.0" < "10.20.30.0" numerically but "10.20.30.0" < "10.20.9.0" lexicographically.
+    # Correct numeric sort must put 10.20.9.0 first.
+    # The all-scopes script emits one {scope, options, exclusions, failover} object per scope.
+    raw_entries = [
+        {"scope": {"ScopeId": "10.20.30.0"}, "options": [], "exclusions": [], "failover": None},
+        {"scope": {"ScopeId": "10.20.9.0"},  "options": [], "exclusions": [], "failover": None},
+    ]
+
+    def fake_build(scope, state):
+        return scope_30 if scope == "10.20.30.0" else scope_9
+
+    with patch("app.services.scope_service.run_ps", return_value=raw_entries), \
+         patch("app.services.scope_service.build_payload_from_scope_state", side_effect=fake_build):
+        result = await svc_list_scopes()
+
+    assert len(result.scopes) == 2
+    assert str(result.scopes[0].scope) == "10.20.9.0",  "10.20.9.0 must sort before 10.20.30.0 numerically"
+    assert str(result.scopes[1].scope) == "10.20.30.0"
+
+
+async def test_list_scopes_item_shape_matches_single_scope_get(
+    mock_ps_scope_raw, mock_ps_options_raw, mock_ps_exclusions_raw
+):
+    """Each item from GET /scopes must be byte-for-byte identical to GET /scopes/{scope}."""
+
+    state = {
+        "scope": mock_ps_scope_raw,
+        "options": mock_ps_options_raw,
+        "exclusions": mock_ps_exclusions_raw,
+        "failover": None,
+    }
+
+    def fake_run_ps(cmd, parse_json=True, **_kwargs):
+        if "ConvertTo-Json -Depth 10 -Compress" in cmd:
+            return state
+        # List call — no -ScopeId flag
+        if "Get-DhcpServerv4Scope" in cmd and "-ScopeId" not in cmd:
+            return [mock_ps_scope_raw]
+        return None
+
+    with patch("app.services.scope_service.run_ps", side_effect=fake_run_ps), \
+         patch("app.services.ps_parsers.run_ps", side_effect=fake_run_ps):
+        list_r = await client.get("/api/v1/scopes")
+        single_r = await client.get("/api/v1/scopes/10.20.30.0")
+
+    assert list_r.status_code == 200
+    assert single_r.status_code == 200
+    list_body = list_r.json()
+    single_item = single_r.json()
+    assert len(list_body["scopes"]) == 1
+    list_item = list_body["scopes"][0]
+
+    # The list item is the single-scope body plus the identity, which the list
+    # needs because it has no URL per item to carry it.
+    assert set(list_item) - set(single_item) == {"scope"}, (
+        f"list item may only add 'scope'!\n"
+        f"list[0]: {json.dumps(list_item)}\n"
+        f"single:  {json.dumps(single_item)}"
+    )
+    assert list_item["scope"] == "10.20.30.0"
+    assert {k: v for k, v in list_item.items() if k != "scope"} == single_item, (
+        f"GET /scopes item body differs from GET /scopes/{{scope}}!\n"
+        f"list[0]: {json.dumps(list_item)}\n"
+        f"single:  {json.dumps(single_item)}"
+    )
+
+
+async def test_list_scopes_failover_null_consistent(
+    mock_ps_scope_raw, mock_ps_options_raw, mock_ps_exclusions_raw
+):
+    """failover: null in list items must match failover: null in single-scope GET."""
+
+    state = {
+        "scope": mock_ps_scope_raw,
+        "options": mock_ps_options_raw,
+        "exclusions": mock_ps_exclusions_raw,
+        "failover": None,
+    }
+
+    def fake_run_ps(cmd, parse_json=True, **_kwargs):
+        if "ConvertTo-Json -Depth 10 -Compress" in cmd:
+            return state
+        if "Get-DhcpServerv4Scope" in cmd and "-ScopeId" not in cmd:
+            return [mock_ps_scope_raw]
+        return None
+
+    with patch("app.services.scope_service.run_ps", side_effect=fake_run_ps), \
+         patch("app.services.ps_parsers.run_ps", side_effect=fake_run_ps):
+        list_r = await client.get("/api/v1/scopes")
+
+    assert list_r.status_code == 200
+    item = list_r.json()["scopes"][0]
+    assert "failover" in item
+    assert item["failover"] is None
+
+
+# ---------------------------------------------------------------------------
+# Critical: GET/PUT roundtrip test
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_put_roundtrip(
+    mock_ps_scope_raw, mock_ps_options_raw, mock_ps_exclusions_raw
+):
+    """
+    CRITICAL: The JSON that Crossplane sends as the PUT body must be byte-for-byte
+    identical to the JSON returned by the GET endpoint.
+
+    This test catches type mismatches (int vs str), key ordering differences,
+    null handling, and array ordering issues.
+    """
+    from app.services.ps_parsers import assemble_scope_state as real_assemble
+
+    # Build the "desired" payload — this is what Crossplane would send as PUT body
+    put_payload = DhcpScopePayload(
+        scopeName="Cluster-A Management",
+        scope="10.20.30.0",
+        subnetMask="255.255.255.0",
+        startRange="10.20.30.100",
+        endRange="10.20.30.200",
+        leaseDurationDays=8,
+        description="Cluster A management network",
+        gateway="10.20.30.1",
+        dnsServers=["10.0.0.53", "10.0.0.54"],
+        dnsDomain="lab.local",
+        exclusions=[DhcpExclusion(startAddress="10.20.30.1", endAddress="10.20.30.99")],
+        failover=None,
+    )
+    put_json = put_payload.model_dump(mode="json")
+
+    # Simulate GET response assembled from the single PowerShell JSON object.
+    state = {
+        "scope": mock_ps_scope_raw,
+        "options": mock_ps_options_raw,
+        "exclusions": mock_ps_exclusions_raw,
+        "failover": None,
+    }
+
+    with patch("app.services.ps_parsers.run_ps", return_value=state):
+        get_payload = await real_assemble("10.20.30.0")
+    get_json = get_payload.model_dump(mode="json")
+
+    # Must be byte-for-byte identical — no sort_keys so field order matters too
+    put_str = json.dumps(put_json, ensure_ascii=False)
+    get_str = json.dumps(get_json, ensure_ascii=False)
+
+    assert put_str == get_str, (
+        f"GET/PUT mismatch!\nPUT: {put_str}\nGET: {get_str}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_put_roundtrip_with_pxe_options(
+    mock_ps_scope_raw, mock_ps_exclusions_raw
+):
+    """GET/PUT parity must hold with DHCP options 66/67 populated, not just absent.
+
+    The no-PXE case proves "" round-trips; this proves a real pair does, including
+    its position in the key order.
+    """
+    from app.services.ps_parsers import assemble_scope_state as real_assemble
+
+    put_payload = DhcpScopePayload(
+        scopeName="Cluster-A Management",
+        scope="10.20.30.0",
+        subnetMask="255.255.255.0",
+        startRange="10.20.30.100",
+        endRange="10.20.30.200",
+        leaseDurationDays=8,
+        description="Cluster A management network",
+        gateway="10.20.30.1",
+        dnsServers=["10.0.0.53", "10.0.0.54"],
+        dnsDomain="lab.local",
+        nextServer="boot.lab.local",
+        bootFile="snponly.efi",
+        exclusions=[DhcpExclusion(startAddress="10.20.30.1", endAddress="10.20.30.99")],
+        failover=None,
+    )
+
+    state = {
+        "scope": mock_ps_scope_raw,
+        "options": [
+            {"OptionId": 3, "Value": ["10.20.30.1"]},
+            {"OptionId": 6, "Value": ["10.0.0.53", "10.0.0.54"]},
+            {"OptionId": 15, "Value": ["lab.local"]},
+            {"OptionId": 66, "Value": ["boot.lab.local"]},
+            {"OptionId": 67, "Value": ["snponly.efi"]},
+        ],
+        "exclusions": mock_ps_exclusions_raw,
+        "failover": None,
+    }
+
+    with patch("app.services.ps_parsers.run_ps", return_value=state):
+        get_payload = await real_assemble("10.20.30.0")
+
+    put_str = json.dumps(put_payload.model_dump(mode="json"), ensure_ascii=False)
+    get_str = json.dumps(get_payload.model_dump(mode="json"), ensure_ascii=False)
+    assert put_str == get_str, (
+        f"GET/PUT mismatch with PXE options!\nPUT: {put_str}\nGET: {get_str}"
+    )
+
+
+async def test_put_subnet_mask_change_returns_409():
+    """An in-place mask change is impossible on Windows, so it must be refused.
+
+    Returning 200 without applying it hides the drift and makes Crossplane
+    re-send the same PUT on every reconcile loop.
+    """
+    from app.errors import ImmutableScopeFieldError
+    with patch(
+        "app.services.scope_service.update_scope",
+        side_effect=ImmutableScopeFieldError(
+            "subnetMask", "255.255.255.0", "255.255.255.128"
+        ),
+    ):
+        r = await client.put("/api/v1/scopes/10.20.30.0", json=_make_scope_dict())
+    assert r.status_code == 409
+    err = _error(r.json())
+    assert err["code"] == "IMMUTABLE_FIELD"
+    assert err["details"]["field"] == "subnetMask"
+    assert err["details"]["current"] == "255.255.255.0"
+    assert err["details"]["desired"] == "255.255.255.128"

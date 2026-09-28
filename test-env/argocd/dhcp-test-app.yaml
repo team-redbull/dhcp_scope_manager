@@ -1,0 +1,68 @@
+# Test leaf for the DHCP Crossplane integration.
+#
+# This is what tier 3 of the gitops-day1 cascade
+# (argocd-platform/hostedClusters/templates/hcAppset.yaml) generates for one
+# hosted-cluster file, with `site` and `mce` spelled out instead of templated.
+# Promoting it back into the cascade is putting the {{ }} placeholders back.
+#
+# One deviation from tier 3, forced by this sandbox rather than by design: the
+# repoURLs point at GitHub rather than the air-gapped GitLab, and therefore at
+# helm-charts-hostedclusters-setup (the GitHub-side spelling) rather than
+# helm-charts/hostedclusters-setup. Same chart, same four valueFiles.
+#
+# Apply once, by hand — nothing watches a git repo until an Application names it:
+#   oc apply -f test-env/argocd/dhcp-test-app.yaml
+#
+# It goes in openshift-gitops, the cluster-scoped Argo instance. user1-argocd is
+# namespaced and crossplane-system carries no argocd.argoproj.io/managed-by label,
+# so that instance could not write the Request CR there.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  # Tier 3 names the app after the cluster file: {{ .path.filename | trimSuffix ".yaml" }}
+  name: ocp4-prep-herzi-site1-a-dhcp
+  namespace: openshift-gitops
+  finalizers:
+    # Without this, deleting the Application orphans the Request CR instead of
+    # cascading — and an orphaned Request keeps reconciling the live DHCP scope.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  sources:
+    # The chart tier 3 renders. Its DHCP templates are synced from
+    # dhcp_scope_manager/helm/templates via scripts/sync_chart.py — that repo is
+    # their source of truth and holds the tests; this one is what Argo deploys.
+    - repoURL: https://github.com/team-redbull/helm-charts-hostedclusters-setup.git
+      targetRevision: main
+      path: .
+      helm:
+        releaseName: ocp4-prep-herzi-site1-a-dhcp
+        ignoreMissingValueFiles: true
+        # The full inheritance chain, in merge order — identical to tier 3's list.
+        # Site and MCE values.yaml are empty today; ignoreMissingValueFiles keeps
+        # that from failing the render.
+        valueFiles:
+          - $values/sites/configValues.yaml
+          - $values/sites/site1/values.yaml
+          - $values/sites/site1/mces/ocp4-prep-mce-site1-a/values.yaml
+          - $values/sites/site1/mces/ocp4-prep-mce-site1-a/hostedClusters/ocp4-prep-herzi-site1-a.yaml
+
+    # The values repo, referenced only as $values above. This is day1 — the GitHub
+    # twin of gitops-day1/platform-config.
+    - repoURL: https://github.com/team-redbull/day1.git
+      targetRevision: main
+      ref: values
+
+  destination:
+    name: in-cluster
+    # Where the Request CR lands. The chart also stamps this namespace on the CR
+    # itself (crossplane.namespace), so the two must agree.
+    namespace: crossplane-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 5
+      backoff: { duration: 15s, factor: 2, maxDuration: 3m }

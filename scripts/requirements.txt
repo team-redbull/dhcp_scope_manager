@@ -1,0 +1,6 @@
+# Minimal dependencies for scripts/validate_dhcp_values.py
+# Used in CI — does NOT include the full FastAPI/uvicorn stack.
+# Pin pydantic to the same version as the application so validation
+# behaviour is identical in CI and at runtime.
+pydantic==2.8.0
+PyYAML>=6.0,<7.0

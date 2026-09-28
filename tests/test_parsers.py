@@ -1,0 +1,729 @@
+from unittest.mock import AsyncMock, patch
+import pytest
+from app.errors import DhcpConflictError, InvalidScopeError
+from app.errors import PowerShellError
+from app.services.ps_parsers import (
+    build_get_all_scopes_script,
+    build_get_scope_state_script,
+    build_payload_from_scope_state,
+    normalize_list,
+    normalize_get_scope_state,
+    extract_option,
+    extract_option_list,
+    parse_failover,
+    ps_single_quote,
+    assemble_scope_state,
+)
+from app.utils.ip_utils import ip_to_int, parse_timespan_days, parse_timespan_minutes
+
+
+def test_parse_timespan_days_full():
+    assert parse_timespan_days("8.00:00:00") == 8
+
+
+def test_parse_timespan_days_one_day():
+    assert parse_timespan_days("1.00:00:00") == 1
+
+
+def test_parse_timespan_days_no_dot():
+    # No days component → 0
+    assert parse_timespan_days("8:00:00") == 0
+
+
+def test_parse_timespan_minutes_one_hour():
+    assert parse_timespan_minutes("1:00:00") == 60
+
+
+def test_parse_timespan_minutes_half_hour():
+    assert parse_timespan_minutes("0:30:00") == 30
+
+
+def test_parse_timespan_minutes_ninety():
+    assert parse_timespan_minutes("1:30:00") == 90
+
+
+def test_parse_timespan_minutes_day_format_one_day():
+    """PowerShell emits d.HH:MM:SS for maxClientLeadTime >= 24h.
+    1.00:00:00 = 1 day = 1440 minutes — previously crashed with ValueError."""
+    assert parse_timespan_minutes("1.00:00:00") == 1440
+
+
+def test_parse_timespan_minutes_day_format_half_day():
+    """0 days 12 hours — verifies day + time combination."""
+    assert parse_timespan_minutes("0.12:00:00") == 720
+
+
+def test_parse_timespan_minutes_day_format_one_day_thirty():
+    """1 day 0 hours 30 minutes = 1470 minutes."""
+    assert parse_timespan_minutes("1.00:30:00") == 1470
+
+
+def test_parse_timespan_minutes_seconds_are_ignored():
+    """Seconds component is correctly discarded — 1:30:45 → 90 minutes, not 91."""
+    assert parse_timespan_minutes("1:30:45") == 90
+
+
+def test_parse_timespan_minutes_invalid_format_raises():
+    """Unrecognized format must raise ValueError, not silently return 0."""
+    with pytest.raises(ValueError, match="Unrecognized PowerShell TimeSpan format"):
+        parse_timespan_minutes("00:01:00:00")
+
+
+def test_ip_to_int_ordering():
+    assert ip_to_int("10.20.30.0") < ip_to_int("10.20.40.0")
+    assert ip_to_int("10.20.30.1") < ip_to_int("10.20.30.2")
+    assert ip_to_int("10.0.0.0") < ip_to_int("11.0.0.0")
+
+
+def test_normalize_list_dict():
+    d = {"key": "val"}
+    assert normalize_list(d) == [d]
+
+
+def test_normalize_list_none():
+    assert normalize_list(None) == []
+
+
+def test_normalize_list_list():
+    lst = [{"a": 1}, {"b": 2}]
+    assert normalize_list(lst) == lst
+
+
+def test_normalize_list_scalar_string():
+    assert normalize_list("10.0.0.53") == ["10.0.0.53"]
+
+
+def test_extract_option_router(mock_ps_options_raw):
+    result = extract_option(mock_ps_options_raw, 3)
+    assert result == "10.20.30.1"
+
+
+def test_extract_option_dns_list(mock_ps_options_raw):
+    result = extract_option_list(mock_ps_options_raw, 6)
+    assert result == ["10.0.0.53", "10.0.0.54"]
+
+
+def test_extract_option_domain(mock_ps_options_raw):
+    result = extract_option(mock_ps_options_raw, 15)
+    assert result == "lab.local"
+
+
+def test_extract_option_missing(mock_ps_options_raw):
+    assert extract_option(mock_ps_options_raw, 999) == ""
+    assert extract_option_list(mock_ps_options_raw, 999) == []
+
+
+def test_extract_option_scalar_string_value_not_split():
+    options = [{"OptionId": 3, "Value": "10.20.30.1"}]
+    assert extract_option(options, 3) == "10.20.30.1"
+
+
+def test_extract_option_list_scalar_string_value_not_split():
+    options = [{"OptionId": 6, "Value": "10.0.0.53"}]
+    assert extract_option_list(options, 6) == ["10.0.0.53"]
+
+
+def test_extract_option_list_none_value_returns_empty():
+    options = [{"OptionId": 6, "Value": None}]
+    assert extract_option_list(options, 6) == []
+
+
+def _scope_state(scope, options, exclusions=None, failover=None):
+    return {
+        "scope": scope,
+        "options": options,
+        "exclusions": [] if exclusions is None else exclusions,
+        "failover": failover,
+    }
+
+
+@pytest.mark.asyncio
+async def test_assemble_scope_state(
+    mock_ps_scope_raw, mock_ps_options_raw, mock_ps_exclusions_raw, mock_ps_failover_raw
+):
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(
+            return_value=_scope_state(
+                mock_ps_scope_raw,
+                mock_ps_options_raw,
+                mock_ps_exclusions_raw,
+                mock_ps_failover_raw,
+            )
+        ),
+    ) as mock_ps:
+        result = await assemble_scope_state("10.20.30.0")
+
+    mock_ps.assert_awaited_once()
+    _, kwargs = mock_ps.await_args
+    assert kwargs["append_error_action"] is False
+    assert kwargs["append_convert_to_json"] is False
+    assert result.scopeName == "Cluster-A Management"
+    assert str(result.scope) == "10.20.30.0"
+    assert str(result.subnetMask) == "255.255.255.0"
+    assert result.leaseDurationDays == 8
+    assert str(result.gateway) == "10.20.30.1"
+    assert [str(ip) for ip in result.dnsServers] == ["10.0.0.53", "10.0.0.54"]
+    assert result.dnsDomain == "lab.local"
+    assert len(result.exclusions) == 1
+    assert str(result.exclusions[0].startAddress) == "10.20.30.1"
+    assert result.failover is not None
+    assert result.failover.relationshipName == "mce1-failover"
+    assert result.failover.maxClientLeadTimeMinutes == 60
+
+
+@pytest.mark.asyncio
+async def test_assemble_scope_no_failover(
+    mock_ps_scope_raw, mock_ps_options_raw, mock_ps_exclusions_raw
+):
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(
+            return_value=_scope_state(
+                mock_ps_scope_raw,
+                mock_ps_options_raw,
+                mock_ps_exclusions_raw,
+                None,
+            )
+        ),
+    ):
+        result = await assemble_scope_state("10.20.30.0")
+
+    assert result.failover is None
+
+
+@pytest.mark.asyncio
+async def test_assemble_scope_empty_exclusions(mock_ps_scope_raw, mock_ps_options_raw):
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(return_value=_scope_state(mock_ps_scope_raw, mock_ps_options_raw)),
+    ):
+        result = await assemble_scope_state("10.20.30.0")
+
+    assert result.exclusions == []
+
+
+@pytest.mark.asyncio
+async def test_exclusions_sorted_by_ip(mock_ps_scope_raw, mock_ps_options_raw):
+    """Exclusions must come out sorted by IP numeric order regardless of PS output order."""
+    unsorted_exclusions = [
+        {"StartRange": "10.20.30.201", "EndRange": "10.20.30.254"},
+        {"StartRange": "10.20.30.1", "EndRange": "10.20.30.99"},
+    ]
+
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(
+            return_value=_scope_state(
+                mock_ps_scope_raw,
+                mock_ps_options_raw,
+                unsorted_exclusions,
+                None,
+            )
+        ),
+    ):
+        result = await assemble_scope_state("10.20.30.0")
+
+    assert str(result.exclusions[0].startAddress) == "10.20.30.1"
+    assert str(result.exclusions[1].startAddress) == "10.20.30.201"
+
+
+@pytest.mark.asyncio
+async def test_assemble_scope_no_exclusions_and_no_failover(mock_ps_scope_raw, mock_ps_options_raw):
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(return_value=_scope_state(mock_ps_scope_raw, mock_ps_options_raw)),
+    ):
+        result = await assemble_scope_state("10.20.30.0")
+
+    assert result.exclusions == []
+    assert result.failover is None
+
+
+@pytest.mark.asyncio
+async def test_unexpected_exclusion_error_still_raises():
+    err = PowerShellError("Get-DhcpServerv4ExclusionRange", "Access denied", 5)
+    with patch("app.services.ps_parsers.run_ps", new=AsyncMock(side_effect=err)):
+        with pytest.raises(PowerShellError):
+            await assemble_scope_state("10.20.30.0")
+
+
+@pytest.mark.asyncio
+async def test_unexpected_failover_error_still_raises():
+    err = PowerShellError("Get-DhcpServerv4Failover", "RPC server unavailable", 1722)
+    with patch("app.services.ps_parsers.run_ps", new=AsyncMock(side_effect=err)):
+        with pytest.raises(PowerShellError):
+            await assemble_scope_state("10.20.30.0")
+
+
+def test_single_option_object_is_normalized_to_list(mock_ps_scope_raw, mock_ps_exclusions_raw):
+    state = normalize_get_scope_state(
+        _scope_state(
+            mock_ps_scope_raw,
+            {"OptionId": 3, "Value": ["10.20.30.1"]},
+            mock_ps_exclusions_raw,
+        )
+    )
+    assert state["options"] == [{"OptionId": 3, "Value": ["10.20.30.1"]}]
+
+
+def test_single_exclusion_object_is_normalized_to_list(mock_ps_scope_raw, mock_ps_options_raw):
+    state = normalize_get_scope_state(
+        _scope_state(
+            mock_ps_scope_raw,
+            mock_ps_options_raw,
+            {"StartRange": "10.20.30.1", "EndRange": "10.20.30.99"},
+        )
+    )
+    assert state["exclusions"] == [{"StartRange": "10.20.30.1", "EndRange": "10.20.30.99"}]
+
+
+def test_returned_payload_comparable_with_post_put_body(
+    mock_ps_scope_raw, mock_ps_options_raw, mock_ps_exclusions_raw
+):
+    state = normalize_get_scope_state(
+        _scope_state(mock_ps_scope_raw, mock_ps_options_raw, mock_ps_exclusions_raw)
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+
+    assert result.model_dump(mode="json") == {
+        "scope": "10.20.30.0",
+        "scopeName": "Cluster-A Management",
+        "subnetMask": "255.255.255.0",
+        "startRange": "10.20.30.100",
+        "endRange": "10.20.30.200",
+        "leaseDurationDays": 8,
+        "description": "Cluster A management network",
+        "gateway": "10.20.30.1",
+        "dnsServers": ["10.0.0.53", "10.0.0.54"],
+        "dnsDomain": "lab.local",
+        "nextServer": "",
+        "bootFile": "",
+        "exclusions": [{"startAddress": "10.20.30.1", "endAddress": "10.20.30.99"}],
+        "failover": None,
+    }
+
+
+def test_build_payload_parses_boot_options(mock_ps_scope_raw, mock_ps_exclusions_raw):
+    """Options 66/67 come back through the generic extractor — no bespoke parsing."""
+    options = [
+        {"OptionId": 6, "Value": ["10.0.0.53"]},
+        {"OptionId": 66, "Value": ["boot.lab.local"], "Name": "Boot Server Host Name"},
+        {"OptionId": 67, "Value": ["snponly.efi"], "Name": "Bootfile Name"},
+    ]
+    state = normalize_get_scope_state(
+        _scope_state(mock_ps_scope_raw, options, mock_ps_exclusions_raw)
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.nextServer == "boot.lab.local"
+    assert result.bootFile == "snponly.efi"
+
+
+def test_build_payload_without_boot_options_returns_empty_strings(
+    mock_ps_scope_raw, mock_ps_exclusions_raw
+):
+    """An absent pair must read back as ""/"" — the same value the desired body carries,
+    or the drift check in §9 never converges for the overwhelmingly common no-PXE scope.
+    """
+    state = normalize_get_scope_state(
+        _scope_state(
+            mock_ps_scope_raw,
+            [{"OptionId": 6, "Value": ["10.0.0.53"]}],
+            mock_ps_exclusions_raw,
+        )
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.nextServer == ""
+    assert result.bootFile == ""
+
+
+def test_build_payload_without_gateway_returns_null(mock_ps_scope_raw, mock_ps_exclusions_raw):
+    state = normalize_get_scope_state(
+        _scope_state(
+            mock_ps_scope_raw,
+            [{"OptionId": 6, "Value": ["10.0.0.53"]}],
+            mock_ps_exclusions_raw,
+        )
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+
+    assert result.gateway is None
+    assert result.model_dump(mode="json")["gateway"] is None
+
+
+def test_build_payload_without_dns_servers_is_invalid_managed_state(mock_ps_scope_raw):
+    state = normalize_get_scope_state(
+        _scope_state(
+            mock_ps_scope_raw,
+            [{"OptionId": 3, "Value": ["10.20.30.1"]}],
+        )
+    )
+    with pytest.raises(DhcpConflictError):
+        build_payload_from_scope_state("10.20.30.0", state)
+
+
+def test_invalid_or_unsafe_scope_id_cannot_inject_powershell():
+    with pytest.raises(InvalidScopeError):
+        build_get_scope_state_script("10.20.30.0'; Remove-DhcpServerv4Scope -Force; '")
+
+
+def test_ps_single_quote_escapes_embedded_single_quote():
+    assert ps_single_quote("a'b") == "'a''b'"
+
+
+def test_get_scope_state_script_contains_depth_10_and_single_scope_literal():
+    script = build_get_scope_state_script("10.20.30.0")
+    assert "$ScopeId = '10.20.30.0'" in script
+    assert "ConvertTo-Json -Depth 10 -Compress" in script
+    assert "Get-DhcpServerv4Scope -ScopeId $ScopeId -ErrorAction Stop" in script
+
+
+def test_get_scope_state_script_rethrows_unexpected_optional_errors():
+    script = build_get_scope_state_script("10.20.30.0")
+    assert "Test-DhcpNoOptions" in script
+    assert "Test-DhcpNoExclusions" in script
+    # Aggregate failover approach does not need Test-DhcpNoFailover
+    assert "Test-DhcpNoFailover" not in script
+    assert script.count("throw") == 2
+
+
+def test_get_scope_state_script_uses_aggregate_failover_lookup():
+    """Failover must be resolved via server-level aggregate, never per-scope -ScopeId flag."""
+    script = build_get_scope_state_script("10.20.30.0")
+    # Aggregate fetch (no -ScopeId on failover cmdlet)
+    assert "Get-DhcpServerv4Failover -ErrorAction Stop" in script
+    # No per-scope failover lookup that would throw for scopes without failover
+    assert "Get-DhcpServerv4Failover -ScopeId" not in script
+
+
+# ─── build_get_all_scopes_script ──────────────────────────────────────────────
+
+def test_all_scopes_script_contains_required_cmdlets():
+    script = build_get_all_scopes_script()
+    assert "Get-DhcpServerv4Scope" in script
+    assert "Get-DhcpServerv4OptionValue" in script
+    assert "Get-DhcpServerv4ExclusionRange" in script
+    assert "Get-DhcpServerv4Failover" in script
+    assert "ConvertTo-Json -Depth 10 -Compress" in script
+
+
+def test_all_scopes_script_has_no_scope_id_literal():
+    """The all-scopes script must not hard-code a scope ID — it iterates all scopes."""
+    script = build_get_all_scopes_script()
+    assert "10.20.30.0" not in script
+    assert "$ScopeId =" not in script
+
+
+def test_all_scopes_script_handles_missing_optional_objects():
+    """Options and exclusions use pattern-matched helpers; failover uses aggregate lookup."""
+    script = build_get_all_scopes_script()
+    assert "Test-DhcpNoOptions" in script
+    assert "Test-DhcpNoExclusions" in script
+    assert "Test-DhcpNoFailover" not in script
+    assert script.count("throw") == 2
+
+
+def test_all_scopes_script_uses_aggregate_failover_lookup():
+    """Failover must be fetched once before the loop (O(1) PS process for fleet)."""
+    script = build_get_all_scopes_script()
+    assert "Get-DhcpServerv4Failover -ErrorAction Stop" in script
+    assert "Get-DhcpServerv4Failover -ScopeId" not in script
+
+
+def test_failover_scope_ids_are_null_guarded():
+    """A relationship with no scopes has a null ScopeId, and @($null) yields [$null].
+
+    Calling .ToString() on that element fails the whole script with
+    InvokeMethodOnNull, so every scope id must pass a null filter first.
+    """
+    for script in (build_get_scope_state_script("10.20.30.0"), build_get_all_scopes_script()):
+        assert "Where-Object { $null -ne $_ } | ForEach-Object { $_.ToString() }" in script
+
+
+def test_all_scopes_script_uses_list_accumulator():
+    """The all-scopes script must use a List accumulator and foreach loop."""
+    script = build_get_all_scopes_script()
+    assert "foreach" in script
+    assert "$result" in script
+
+
+# ─── parse_failover robustness ────────────────────────────────────────────────
+
+def test_parse_failover_nominal(mock_ps_failover_raw):
+    """Nominal HotStandby failover parses without error."""
+    result = parse_failover(mock_ps_failover_raw)
+    assert result.relationshipName == "mce1-failover"
+    assert result.partnerServer == "dhcp02.lab.local"
+    assert result.mode == "HotStandby"
+    assert result.serverRole == "Active"
+    assert result.reservePercent == 5
+    assert result.maxClientLeadTimeMinutes == 60
+
+
+def test_parse_failover_maxclientleadtime_as_dict():
+    """MaxClientLeadTime serialized as a JSON TimeSpan object is parsed via TotalMinutes."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": 5,
+        "LoadBalancePercent": 0,
+        "MaxClientLeadTime": {
+            "Ticks": 36000000000,
+            "Days": 0,
+            "Hours": 1,
+            "Minutes": 0,
+            "Seconds": 0,
+            "TotalMinutes": 60.0,
+            "TotalSeconds": 3600.0,
+        },
+    }
+    result = parse_failover(raw)
+    assert result.maxClientLeadTimeMinutes == 60
+
+
+def test_parse_failover_maxclientleadtime_dict_fallback_without_totalminutes():
+    """If TotalMinutes is absent, Days/Hours/Minutes are used."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": 5,
+        "LoadBalancePercent": 0,
+        "MaxClientLeadTime": {"Days": 0, "Hours": 1, "Minutes": 30},
+    }
+    result = parse_failover(raw)
+    assert result.maxClientLeadTimeMinutes == 90
+
+
+def test_parse_failover_maxclientleadtime_as_numeric():
+    """MaxClientLeadTime as a bare integer (minutes) is parsed directly."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": 5,
+        "LoadBalancePercent": 0,
+        "MaxClientLeadTime": 90,
+    }
+    result = parse_failover(raw)
+    assert result.maxClientLeadTimeMinutes == 90
+
+
+def test_parse_failover_maxclientleadtime_none_uses_default():
+    """Absent MaxClientLeadTime defaults to 60 minutes (1 hour)."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": 5,
+        "LoadBalancePercent": None,
+        "MaxClientLeadTime": None,
+    }
+    result = parse_failover(raw)
+    assert result.maxClientLeadTimeMinutes == 60
+
+
+def test_parse_failover_null_reserve_percent_becomes_zero():
+    """None ReservePercent must not raise TypeError — normalizes to 0."""
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": "Active",
+        "ReservePercent": None,
+        "LoadBalancePercent": None,
+        "MaxClientLeadTime": "1:00:00",
+    }
+    result = parse_failover(raw)
+    assert result.reservePercent == 0
+
+
+def test_parse_failover_null_server_role_hotstandby_raises():
+    """None serverRole for HotStandby must raise (model enforces it) — invalid DHCP state."""
+    from pydantic import ValidationError
+    raw = {
+        "Name": "rel1",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "HotStandby",
+        "ServerRole": None,
+        "ReservePercent": 5,
+        "LoadBalancePercent": 0,
+        "MaxClientLeadTime": "1:00:00",
+    }
+    with pytest.raises(ValidationError, match="serverRole"):
+        parse_failover(raw)
+
+
+def test_parse_failover_loadbalance_mode():
+    """LoadBalance failover parses correctly; serverRole is normalized to 'Active'."""
+    raw = {
+        "Name": "lb-rel",
+        "PartnerServer": "dhcp02.lab.local",
+        "Mode": "LoadBalance",
+        "ServerRole": None,
+        "ReservePercent": 0,
+        "LoadBalancePercent": 60,
+        "MaxClientLeadTime": "1:00:00",
+    }
+    result = parse_failover(raw)
+    assert result.mode == "LoadBalance"
+    assert result.serverRole == "Active"
+    assert result.loadBalancePercent == 60
+    assert result.reservePercent == 0
+
+
+# ─── TimeSpan helpers ─────────────────────────────────────────────────────────
+
+def test_parse_timespan_as_days_with_string():
+    from app.services.ps_parsers import _parse_timespan_as_days
+    assert _parse_timespan_as_days("8.00:00:00") == 8
+
+
+def test_parse_timespan_as_days_with_dict():
+    from app.services.ps_parsers import _parse_timespan_as_days
+    assert _parse_timespan_as_days({"Days": 14, "Hours": 0}) == 14
+
+
+def test_parse_timespan_as_days_with_int():
+    from app.services.ps_parsers import _parse_timespan_as_days
+    assert _parse_timespan_as_days(8) == 8
+
+
+def test_parse_timespan_as_days_with_none_returns_default():
+    from app.services.ps_parsers import _parse_timespan_as_days
+    assert _parse_timespan_as_days(None, default=8) == 8
+
+
+def test_parse_timespan_as_minutes_with_string():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes("1:30:00") == 90
+
+
+def test_parse_timespan_as_minutes_with_dict_totalminutes():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes({"TotalMinutes": 90.0}) == 90
+
+
+def test_parse_timespan_as_minutes_with_dict_components():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes({"Days": 1, "Hours": 0, "Minutes": 0}) == 1440
+
+
+def test_parse_timespan_as_minutes_with_int():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes(90) == 90
+
+
+def test_parse_timespan_as_minutes_with_none_returns_default():
+    from app.services.ps_parsers import _parse_timespan_as_minutes
+    assert _parse_timespan_as_minutes(None, default=60) == 60
+
+
+# ─── LeaseDuration as JSON object in build_payload_from_scope_state ───────────
+
+def test_build_payload_leaseduration_as_dict(mock_ps_scope_raw, mock_ps_options_raw):
+    """LeaseDuration serialized as a JSON TimeSpan dict is parsed via Days field."""
+    scope_with_dict_lease = dict(mock_ps_scope_raw)
+    scope_with_dict_lease["LeaseDuration"] = {"Days": 14, "Hours": 0, "Minutes": 0}
+    state = normalize_get_scope_state(
+        {"scope": scope_with_dict_lease, "options": mock_ps_options_raw,
+         "exclusions": [], "failover": None}
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.leaseDurationDays == 14
+
+
+def test_build_payload_leaseduration_as_int(mock_ps_scope_raw, mock_ps_options_raw):
+    """LeaseDuration as a bare integer is parsed directly as days."""
+    scope_with_int_lease = dict(mock_ps_scope_raw)
+    scope_with_int_lease["LeaseDuration"] = 8
+    state = normalize_get_scope_state(
+        {"scope": scope_with_int_lease, "options": mock_ps_options_raw,
+         "exclusions": [], "failover": None}
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.leaseDurationDays == 8
+
+
+def test_build_payload_leaseduration_none_uses_default(mock_ps_scope_raw, mock_ps_options_raw):
+    """Absent LeaseDuration defaults to 8 days."""
+    scope_no_lease = {k: v for k, v in mock_ps_scope_raw.items() if k != "LeaseDuration"}
+    state = normalize_get_scope_state(
+        {"scope": scope_no_lease, "options": mock_ps_options_raw,
+         "exclusions": [], "failover": None}
+    )
+    result = build_payload_from_scope_state("10.20.30.0", state)
+    assert result.leaseDurationDays == 8
+
+
+# ─── options absent (scope with no DHCP options configured) ───────────────────
+
+@pytest.mark.asyncio
+async def test_assemble_scope_no_options_raises_conflict_for_missing_dns(mock_ps_scope_raw):
+    """A scope with zero options configured → empty options → DhcpConflictError for DNS."""
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(
+            return_value={"scope": mock_ps_scope_raw, "options": [], "exclusions": [], "failover": None}
+        ),
+    ):
+        with pytest.raises(DhcpConflictError, match="DNS servers"):
+            await assemble_scope_state("10.20.30.0")
+
+
+@pytest.mark.asyncio
+async def test_assemble_scope_options_missing_gateway_returns_null_gateway(mock_ps_scope_raw):
+    """Scope missing only the gateway option returns gateway: null — not an error."""
+    options_no_gateway = [
+        {"OptionId": 6, "Value": ["10.0.0.53"]},
+        {"OptionId": 15, "Value": ["lab.local"]},
+    ]
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(
+            return_value={"scope": mock_ps_scope_raw, "options": options_no_gateway,
+                          "exclusions": [], "failover": None}
+        ),
+    ):
+        result = await assemble_scope_state("10.20.30.0")
+    assert result.gateway is None
+
+
+@pytest.mark.asyncio
+async def test_assemble_scope_options_missing_domain_returns_empty_string(mock_ps_scope_raw):
+    """Scope missing domain option (15) returns dnsDomain: '' — not an error."""
+    options_no_domain = [
+        {"OptionId": 3, "Value": ["10.20.30.1"]},
+        {"OptionId": 6, "Value": ["10.0.0.53"]},
+    ]
+    with patch(
+        "app.services.ps_parsers.run_ps",
+        new=AsyncMock(
+            return_value={"scope": mock_ps_scope_raw, "options": options_no_domain,
+                          "exclusions": [], "failover": None}
+        ),
+    ):
+        result = await assemble_scope_state("10.20.30.0")
+    assert result.dnsDomain == ""
+
+
+# ─── script wraps options fetch with error handling ───────────────────────────
+
+def test_get_scope_state_script_has_options_try_catch():
+    """The get-scope script must guard Get-DhcpServerv4OptionValue with try/catch."""
+    script = build_get_scope_state_script("10.20.30.0")
+    assert "Test-DhcpNoOptions" in script
+    # The options fetch must be inside a try block
+    assert "Get-DhcpServerv4OptionValue -ScopeId $ScopeId -ErrorAction Stop" in script
+
+
+def test_all_scopes_script_has_options_try_catch():
+    """The all-scopes script must guard Get-DhcpServerv4OptionValue with try/catch."""
+    script = build_get_all_scopes_script()
+    assert "Test-DhcpNoOptions" in script
+    assert "Get-DhcpServerv4OptionValue -ScopeId $s.ScopeId -ErrorAction Stop" in script
